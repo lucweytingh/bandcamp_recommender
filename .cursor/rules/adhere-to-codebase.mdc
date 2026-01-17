@@ -1,0 +1,5 @@
+---
+alwaysApply: true
+---
+
+Adhere to the code style and structure present in the current codebase. Before making edits, think of abstractions that can support future expansion, and don't write duplicate code when that is not necessary. 

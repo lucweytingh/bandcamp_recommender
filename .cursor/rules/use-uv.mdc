@@ -1,0 +1,8 @@
+---
+alwaysApply: true
+---
+use uv for package management
+that means using `uv run python <filename>` to execute scripts
+and `uv add <package_name>` to add a file. 
+
+use `export PYTHONPATH=$(pwd)` before running python if it's not yet set
