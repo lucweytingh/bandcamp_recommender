@@ -674,6 +674,299 @@ class SupporterRecommender:
         """
         return self._driver_manager.get_driver_pool(pool_size)
 
+    def get_random_items(
+        self,
+        item_url: str,
+        num_items: int,
+        num_supporters: int = 20,
+        use_wishlist: bool = False,
+        min_overlap: Optional[int] = None,
+        use_fallback: bool = False,
+        progress_callback: Optional[Callable] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get random items from random supporters' collections.
+        
+        Args:
+            item_url: URL of the Bandcamp item to get supporters from
+            num_items: Number of random items to return
+            num_supporters: Number of random supporters to check (default: 20)
+            use_wishlist: If True, use wishlist items instead of purchases (default: False)
+            min_overlap: Only select items found in at least N supporters' collections (default: None, i.e., any item)
+            use_fallback: If True and min_overlap is set, automatically reduce min_overlap if not enough items found
+            progress_callback: Optional callback function(status, current, total, estimated_seconds)
+            
+        Returns:
+            List of item dictionaries with item_title, band_name, item_url, tags, and overlap_count
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        
+        # Get supporters from the album
+        if progress_callback:
+            progress_callback("Extracting supporters from album page...", 0, 0, 0)
+        supporters = extract_supporters(item_url)
+        
+        if not supporters:
+            if progress_callback:
+                progress_callback("No supporters found.", 0, 0, 0)
+            return []
+        
+        if progress_callback:
+            progress_callback(f"Found {len(supporters)} supporters", len(supporters), len(supporters), 0)
+        
+        # Select random supporters
+        if len(supporters) > num_supporters:
+            selected_supporters = random.sample(supporters, num_supporters)
+        else:
+            selected_supporters = supporters
+        
+        if progress_callback:
+            progress_callback(f"Checking {len(selected_supporters)} random supporters...", len(selected_supporters), len(selected_supporters), 0)
+        
+        # Get items from selected supporters
+        all_items = []
+        start_time = time.time()
+        total_supporters = len(selected_supporters)
+        completed_count = 0
+        completed_lock = Lock()
+        
+        # Initialize driver pool
+        pool_size = min(15, total_supporters)
+        if progress_callback:
+            progress_callback("Initializing driver pool (this may take a moment)...", 0, total_supporters, 0)
+        driver_pool = self._driver_manager.get_driver_pool(pool_size)
+        if progress_callback:
+            progress_callback(f"Driver pool ready. Fetching items from {total_supporters} supporters...", 0, total_supporters, 0)
+        
+        def fetch_supporter_items(supporter):
+            """Fetch items (purchases or wishlist) for a single supporter (thread-safe)."""
+            driver = None
+            try:
+                driver = driver_pool.get(timeout=30)
+                if use_wishlist:
+                    items = self._get_supporter_wishlist_with_driver(supporter, driver, extract_tags_flag=False)
+                else:
+                    items = self._get_supporter_purchases_with_driver(supporter, driver, extract_tags_flag=False)
+                return items, supporter
+            except Exception:
+                return [], supporter
+            finally:
+                if driver:
+                    try:
+                        driver_pool.put_nowait(driver)
+                    except Exception:
+                        try:
+                            driver_pool.put(driver, timeout=2)
+                        except Exception:
+                            pass
+        
+        # Use ThreadPoolExecutor for parallel processing
+        max_workers = min(15, total_supporters)
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_supporter = {
+                executor.submit(fetch_supporter_items, supporter): supporter
+                for supporter in selected_supporters
+            }
+            
+            # Use manual polling to avoid indefinite blocking
+            pending_futures = dict(future_to_supporter)
+            future_start_times = {f: time.time() for f in pending_futures.keys()}
+            max_future_time = 30  # Max seconds per future
+            
+            while pending_futures:
+                completed_this_round = []
+                
+                for future, supporter in list(pending_futures.items()):
+                    # Check if future is done
+                    if future.done():
+                        completed_this_round.append(future)
+                        try:
+                            items, supporter = future.result(timeout=1)
+                            with completed_lock:
+                                all_items.extend(items)
+                                completed_count += 1
+                                
+                                if progress_callback:
+                                    elapsed = time.time() - start_time
+                                    avg_time = elapsed / completed_count if completed_count > 0 else 2.0
+                                    remaining = total_supporters - completed_count
+                                    estimated_seconds = avg_time * remaining
+                                    item_type = "wishlist items" if use_wishlist else "purchases"
+                                    progress_callback(
+                                        f"Fetched {len(items)} {item_type} from {supporter} ({completed_count}/{total_supporters})...",
+                                        completed_count,
+                                        total_supporters,
+                                        int(estimated_seconds)
+                                    )
+                        except Exception:
+                            with completed_lock:
+                                completed_count += 1
+                                if progress_callback:
+                                    progress_callback(
+                                        f"Error from {supporter} ({completed_count}/{total_supporters})...",
+                                        completed_count,
+                                        total_supporters,
+                                        0
+                                    )
+                    # Check for timeout
+                    elif time.time() - future_start_times[future] > max_future_time:
+                        completed_this_round.append(future)
+                        future.cancel()
+                        with completed_lock:
+                            completed_count += 1
+                            if progress_callback:
+                                progress_callback(
+                                    f"Timeout from {supporter} ({completed_count}/{total_supporters})...",
+                                    completed_count,
+                                    total_supporters,
+                                    0
+                                )
+                
+                # Remove completed futures
+                for future in completed_this_round:
+                    pending_futures.pop(future, None)
+                    future_start_times.pop(future, None)
+                
+                # If no futures completed, wait a bit before checking again
+                if not completed_this_round and pending_futures:
+                    time.sleep(0.5)  # Small sleep to avoid busy-waiting
+        
+        if not all_items:
+            if progress_callback:
+                progress_callback("No items found.", total_supporters, total_supporters, 0)
+            return []
+        
+        # Get original item ID to exclude it
+        original_item_id = extract_item_id(item_url)
+        
+        # Count item occurrences (for min_overlap filtering)
+        item_counts = Counter(all_items)
+        
+        # Remove the original item from counts
+        if original_item_id and original_item_id in item_counts:
+            item_counts.pop(original_item_id)
+        
+        # Filter by min_overlap if specified, with fallback if enabled
+        final_overlap = None
+        if min_overlap is not None and min_overlap > 1:
+            current_overlap = min_overlap
+            filtered_items = {}
+            
+            # Try progressively lower overlap requirements if fallback is enabled
+            while current_overlap >= 1:
+                filtered_items = {
+                    item_id: count
+                    for item_id, count in item_counts.items()
+                    if count >= current_overlap
+                }
+                
+                # Check if we have enough items at this overlap level
+                if filtered_items and len(filtered_items) >= num_items:
+                    # Found enough items with current overlap requirement
+                    final_overlap = current_overlap
+                    if current_overlap < min_overlap and progress_callback:
+                        progress_callback(
+                            f"Found {len(filtered_items)} items with overlap >= {current_overlap} (fallback from {min_overlap})",
+                            total_supporters,
+                            total_supporters,
+                            0
+                        )
+                    break
+                
+                # Not enough items found, try lower overlap if fallback enabled
+                if use_fallback and current_overlap > 1:
+                    if filtered_items:
+                        # Some items found but not enough
+                        if progress_callback:
+                            progress_callback(
+                                f"Found {len(filtered_items)} items with overlap >= {current_overlap} (need {num_items}), trying overlap >= {current_overlap - 1}...",
+                                total_supporters,
+                                total_supporters,
+                                0
+                            )
+                    else:
+                        # No items found at this level
+                        if progress_callback:
+                            progress_callback(
+                                f"No items with overlap >= {current_overlap}, trying overlap >= {current_overlap - 1}...",
+                                total_supporters,
+                                total_supporters,
+                                0
+                            )
+                    current_overlap -= 1
+                else:
+                    # No fallback or reached minimum
+                    final_overlap = current_overlap
+                    if filtered_items:
+                        # Some items found but not enough and fallback disabled
+                        if progress_callback:
+                            progress_callback(
+                                f"Found {len(filtered_items)} items with overlap >= {min_overlap} (need {num_items}).",
+                                total_supporters,
+                                total_supporters,
+                                0
+                            )
+                        # Use what we have (will return fewer items than requested)
+                        break
+                    else:
+                        # No items found
+                        if progress_callback:
+                            progress_callback(
+                                f"No items found in at least {min_overlap} collections.",
+                                total_supporters,
+                                total_supporters,
+                                0
+                            )
+                        return []
+            
+            item_counts = filtered_items
+        elif min_overlap == 1:
+            final_overlap = 1
+        
+        # Select random items
+        unique_items = list(item_counts.keys())
+        if len(unique_items) > num_items:
+            selected_item_ids = random.sample(unique_items, num_items)
+        else:
+            selected_item_ids = unique_items
+        
+        if progress_callback:
+            if final_overlap is not None and final_overlap != min_overlap:
+                progress_callback(
+                    f"Selected {len(selected_item_ids)} random items (using overlap >= {final_overlap}, requested >= {min_overlap}).",
+                    total_supporters,
+                    total_supporters,
+                    0
+                )
+            else:
+                progress_callback(f"Selected {len(selected_item_ids)} random items.", total_supporters, total_supporters, 0)
+        
+        # Build result list with metadata
+        results = []
+        for item_id in selected_item_ids:
+            item_info = self._get_item_info_from_id(item_id)
+            if item_info:
+                item_info['overlap_count'] = item_counts.get(item_id, 0)
+                if final_overlap is not None:
+                    item_info['final_overlap'] = final_overlap
+                results.append(item_info)
+            else:
+                # Fallback if metadata not in cache
+                result_item = {
+                    'item_id': item_id,
+                    'item_title': 'Unknown Title',
+                    'band_name': 'Unknown Artist',
+                    'item_url': f"https://bandcamp.com/album/{item_id}",
+                    'tags': [],
+                    'overlap_count': item_counts.get(item_id, 0),
+                }
+                if final_overlap is not None:
+                    result_item['final_overlap'] = final_overlap
+                results.append(result_item)
+        
+        return results
+
     def close(self):
         """Close the webdriver and cleanup driver pool."""
         self._driver_manager.close()

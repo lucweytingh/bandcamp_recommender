@@ -104,6 +104,50 @@ The codebase is organized into modular components:
 - Automatically detects Chrome/Chromium/Brave/Arc browsers
 - Modular architecture for maintainability
 
+## Using as a Package
+
+This package can be imported and used in other Python projects on the same computer.
+
+### Installation
+
+Add to your project's `pyproject.toml`:
+```toml
+[project]
+dependencies = [
+    "bandcamp-recommender @ file:///Users/lucw/Documents/bandcamp_recommender",
+]
+```
+
+Or with `uv`:
+```bash
+uv add --editable /Users/lucw/Documents/bandcamp_recommender
+```
+
+### Usage
+
+```python
+from src.recommendations import SupporterRecommender
+
+# Collaborative filtering
+with SupporterRecommender() as recommender:
+    recs = recommender.get_recommendations(
+        wishlist_item_url="https://artist.bandcamp.com/album/name",
+        max_recommendations=10
+    )
+
+# Random items with overlap filtering
+with SupporterRecommender() as recommender:
+    items = recommender.get_random_items(
+        item_url="https://artist.bandcamp.com/album/name",
+        num_items=10,
+        num_supporters=15,
+        min_overlap=3,
+        use_fallback=True
+    )
+```
+
+See `USAGE_AS_PACKAGE.md` for complete documentation.
+
 ## Requirements
 
 - Python >=3.10
