@@ -14,14 +14,14 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .api import (
+from bandcamp_recommender.recommendations.api import (
     fetch_collection_items_api,
     get_cookies_from_driver,
     get_fan_id_from_page,
 )
-from .driver_manager import DriverManager
-from .scraper import extract_item_id, extract_supporters, extract_tags
-from .tags import calculate_tag_similarity, normalize_tag
+from bandcamp_recommender.recommendations.driver_manager import DriverManager
+from bandcamp_recommender.recommendations.scraper import extract_item_id, extract_supporters, extract_tags
+from bandcamp_recommender.recommendations.tags import calculate_tag_similarity, normalize_tag
 
 
 class SupporterRecommender:

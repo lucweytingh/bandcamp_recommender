@@ -229,3 +229,4 @@ def extract_tags(item_url: str) -> List[str]:
         print(f"Error extracting tags from {item_url}: {e}")
         return []
 
+

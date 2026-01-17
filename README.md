@@ -53,7 +53,7 @@ uv run python scripts/get_similar.py "https://artist.bandcamp.com/album/name" 10
 ### Python Module
 
 ```python
-from src.recommendations import SupporterRecommender
+from bandcamp_recommender.recommendations import SupporterRecommender
 
 with SupporterRecommender() as recommender:
     # Collaborative filtering
@@ -75,11 +75,11 @@ with SupporterRecommender() as recommender:
 
 The codebase is organized into modular components:
 
-- `src/recommendations/supporter_recommender.py` - Main recommendation engine
-- `src/recommendations/driver_manager.py` - Selenium WebDriver management & pooling
-- `src/recommendations/scraper.py` - Web scraping utilities (curl, BeautifulSoup)
-- `src/recommendations/api.py` - Bandcamp API interaction utilities
-- `src/recommendations/tags.py` - Tag extraction & similarity calculation
+- `bandcamp_recommender/recommendations/supporter_recommender.py` - Main recommendation engine
+- `bandcamp_recommender/recommendations/driver_manager.py` - Selenium WebDriver management & pooling
+- `bandcamp_recommender/recommendations/scraper.py` - Web scraping utilities (curl, BeautifulSoup)
+- `bandcamp_recommender/recommendations/api.py` - Bandcamp API interaction utilities
+- `bandcamp_recommender/recommendations/tags.py` - Tag extraction & similarity calculation
 
 ## How It Works
 
@@ -126,7 +126,7 @@ uv add --editable /path/to/bandcamp_recommender
 ### Usage
 
 ```python
-from src.recommendations import SupporterRecommender
+from bandcamp_recommender.recommendations import SupporterRecommender
 
 # Collaborative filtering
 with SupporterRecommender() as recommender:

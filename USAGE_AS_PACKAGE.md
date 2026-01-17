@@ -33,7 +33,7 @@ from pathlib import Path
 # Add bandcamp_recommender to path
 sys.path.insert(0, str(Path("/path/to/bandcamp_recommender").resolve()))
 
-from src.recommendations import SupporterRecommender
+from bandcamp_recommender.recommendations import SupporterRecommender
 ```
 
 ### Option 3: Install in Development Mode
@@ -47,7 +47,7 @@ uv pip install -e .
 ## Basic Usage
 
 ```python
-from src.recommendations import SupporterRecommender
+from bandcamp_recommender.recommendations import SupporterRecommender
 
 # Always use as context manager to ensure proper cleanup
 with SupporterRecommender() as recommender:
@@ -62,7 +62,7 @@ with SupporterRecommender() as recommender:
 Finds items purchased by multiple supporters of the original item.
 
 ```python
-from src.recommendations import SupporterRecommender
+from bandcamp_recommender.recommendations import SupporterRecommender
 
 with SupporterRecommender() as recommender:
     recommendations = recommender.get_recommendations(
@@ -99,7 +99,7 @@ with SupporterRecommender() as recommender:
 Finds items with similar tags to the original item using TF-IDF weighted Jaccard similarity.
 
 ```python
-from src.recommendations import SupporterRecommender
+from bandcamp_recommender.recommendations import SupporterRecommender
 
 with SupporterRecommender() as recommender:
     similar = recommender.get_tag_similar_recommendations(
@@ -140,7 +140,7 @@ with SupporterRecommender() as recommender:
 Gets random items from random supporters' collections, with optional overlap filtering.
 
 ```python
-from src.recommendations import SupporterRecommender
+from bandcamp_recommender.recommendations import SupporterRecommender
 
 with SupporterRecommender() as recommender:
     random_items = recommender.get_random_items(
@@ -218,7 +218,7 @@ with SupporterRecommender() as recommender:
 ## Complete Example
 
 ```python
-from src.recommendations import SupporterRecommender
+from bandcamp_recommender.recommendations import SupporterRecommender
 
 # Example: Get random items with overlap filtering and fallback
 with SupporterRecommender() as recommender:

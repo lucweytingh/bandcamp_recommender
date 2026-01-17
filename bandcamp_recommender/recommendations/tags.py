@@ -4,7 +4,7 @@ from collections import Counter
 from math import log
 from typing import Dict, List, Optional
 
-from .scraper import extract_tags
+from bandcamp_recommender.recommendations.scraper import extract_tags
 
 
 def normalize_tag(tag: str) -> str:
@@ -95,4 +95,5 @@ def calculate_tag_similarity(
             return 0.6 * jaccard + 0.4 * weighted_jaccard
     
     return jaccard
+
 

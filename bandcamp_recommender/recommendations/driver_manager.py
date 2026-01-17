@@ -134,3 +134,4 @@ class DriverManager:
                     pass
             self._driver_pool = None
 
+

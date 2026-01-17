@@ -5,10 +5,10 @@ import argparse
 from pathlib import Path
 import sys
 
-# Add src to path
+# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.recommendations import SupporterRecommender
+from bandcamp_recommender.recommendations import SupporterRecommender
 
 
 def format_time(seconds):
