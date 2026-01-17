@@ -263,7 +263,7 @@ class SupporterRecommender:
             return all_item_ids
 
         except Exception as e:
-            print(f"Error getting purchases for {username}: {e}")
+            # Silently handle errors (timeouts, network issues, etc.)
             return []
 
     def _get_supporter_wishlist_with_driver(
@@ -355,7 +355,7 @@ class SupporterRecommender:
             return all_item_ids
 
         except Exception as e:
-            print(f"Error getting wishlist for {username}: {e}")
+            # Silently handle errors (timeouts, network issues, etc.)
             return []
 
     def _store_item_metadata(
