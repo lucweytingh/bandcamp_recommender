@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Get random items (purchases or wishlist) from random supporters."""
 
-import sys
+import argparse
 import random
+import sys
 import time
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.recommendations import SupporterRecommender
+from src.recommendations.scraper import extract_item_id
 
 
 def format_time(seconds):
@@ -44,27 +47,52 @@ def progress_callback(status, current, total, estimated_seconds):
 
 def main():
     """Main function to get random items from supporters."""
-    # Parse arguments
-    use_wishlist = False
-    args = []
+    parser = argparse.ArgumentParser(
+        description="Get random items (purchases or wishlist) from random supporters.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s https://artist.bandcamp.com/album/name 10
+  %(prog)s https://artist.bandcamp.com/album/name 10 --num-supporters 30
+  %(prog)s https://artist.bandcamp.com/album/name 5 --wishlist
+  %(prog)s https://artist.bandcamp.com/album/name 10 --min-overlap 2
+        """
+    )
+    parser.add_argument(
+        "url",
+        help="Bandcamp item URL (album or track) to get supporters from"
+    )
+    parser.add_argument(
+        "num_items",
+        type=int,
+        help="Number of random items to return"
+    )
+    parser.add_argument(
+        "--num-supporters",
+        type=int,
+        default=20,
+        help="Number of random supporters to check (default: 20)"
+    )
+    parser.add_argument(
+        "--wishlist",
+        action="store_true",
+        help="Use wishlist items instead of purchases (default: purchases)"
+    )
+    parser.add_argument(
+        "--min-overlap",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Only select items found in at least N supporters' collections (default: 1, i.e., any item)"
+    )
     
-    for arg in sys.argv[1:]:
-        if arg == "--wishlist":
-            use_wishlist = True
-        else:
-            args.append(arg)
+    args = parser.parse_args()
     
-    if len(args) < 2:
-        print("Usage: python get_random.py <bandcamp_item_url> <num_items> [num_supporters] [--wishlist]")
-        print("  bandcamp_item_url: URL to get supporters from")
-        print("  num_items: Number of random items to return")
-        print("  num_supporters: Number of random supporters to check (default: 20)")
-        print("  --wishlist: Use wishlist items instead of purchases (default: purchases)")
-        sys.exit(1)
-
-    item_url = args[0]
-    num_items = int(args[1])
-    num_supporters = int(args[2]) if len(args) > 2 else 20
+    item_url = args.url
+    num_items = args.num_items
+    num_supporters = args.num_supporters
+    use_wishlist = args.wishlist
+    min_overlap = args.min_overlap
     
     item_type = "wishlist" if use_wishlist else "purchase"
     item_type_plural = "wishlist items" if use_wishlist else "purchases"
@@ -208,27 +236,61 @@ def main():
             print(f"\nNo {item_type_plural} found.")
             return
         
-        # Remove duplicates while preserving some randomness
-        unique_items = list(set(all_items))
-        print(f"\nFound {len(unique_items)} unique {item_type_plural}")
+        # Get original item ID to exclude it
+        original_item_id = extract_item_id(item_url)
         
-        # Select random items
-        if len(unique_items) > num_items:
-            selected_items = random.sample(unique_items, num_items)
+        # Count item occurrences (for min_overlap filtering)
+        item_counts = Counter(all_items)
+        
+        # Remove the original item from counts
+        if original_item_id and original_item_id in item_counts:
+            item_counts.pop(original_item_id)
+            print(f"\nFound {len(item_counts)} unique {item_type_plural}")
         else:
-            selected_items = unique_items
+            print(f"\nFound {len(item_counts)} unique {item_type_plural}")
+        
+        # Filter by min_overlap if specified
+        if min_overlap is not None and min_overlap > 1:
+            filtered_items = [
+                item_id for item_id, count in item_counts.items()
+                if count >= min_overlap
+            ]
+            print(f"Items found in at least {min_overlap} collections: {len(filtered_items)}")
+            
+            if not filtered_items:
+                print(f"\nNo items found in at least {min_overlap} collections.")
+                return
+            
+            # Select random items from filtered list
+            if len(filtered_items) > num_items:
+                selected_items = random.sample(filtered_items, num_items)
+            else:
+                selected_items = filtered_items
+        else:
+            # Select random items from all unique items
+            unique_items = list(item_counts.keys())
+            if len(unique_items) > num_items:
+                selected_items = random.sample(unique_items, num_items)
+            else:
+                selected_items = unique_items
         
         print(f"\nSelected {len(selected_items)} random items:\n")
         
         for i, item_id in enumerate(selected_items, 1):
             item_info = recommender._get_item_info_from_id(item_id)
             if item_info:
+                overlap_count = item_counts.get(item_id, 0)
                 print(f"{i}. {item_info['band_name']} - {item_info['item_title']}")
                 print(f"   URL: {item_info['item_url']}")
+                if min_overlap is not None and min_overlap > 1:
+                    print(f"   Found in {overlap_count} collection(s)")
                 if item_info.get('tags'):
                     print(f"   Tags: {', '.join(item_info['tags'])}")
             else:
+                overlap_count = item_counts.get(item_id, 0)
                 print(f"{i}. Item ID: {item_id} (metadata not available)")
+                if min_overlap is not None and min_overlap > 1:
+                    print(f"   Found in {overlap_count} collection(s)")
             print()
 
 

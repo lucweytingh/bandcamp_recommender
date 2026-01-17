@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Get Bandcamp recommendations based on supporter overlap (collaborative filtering)."""
 
-import sys
+import argparse
 from pathlib import Path
+import sys
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -40,13 +41,38 @@ def progress_callback(status, current, total, estimated_seconds):
 
 def main():
     """Main function to demonstrate usage."""
-    if len(sys.argv) < 2:
-        print("Usage: python get_overlap.py <bandcamp_item_url> [max_recommendations] [min_supporters]")
-        sys.exit(1)
-
-    item_url = sys.argv[1]
-    max_recommendations = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-    min_supporters = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+    parser = argparse.ArgumentParser(
+        description="Get Bandcamp recommendations based on supporter overlap (collaborative filtering).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s https://artist.bandcamp.com/album/name
+  %(prog)s https://artist.bandcamp.com/album/name --max-recommendations 20
+  %(prog)s https://artist.bandcamp.com/album/name --max-recommendations 10 --min-supporters 3
+        """
+    )
+    parser.add_argument(
+        "url",
+        help="Bandcamp item URL (album or track)"
+    )
+    parser.add_argument(
+        "--max-recommendations",
+        type=int,
+        default=10,
+        help="Maximum number of recommendations to return (default: 10)"
+    )
+    parser.add_argument(
+        "--min-supporters",
+        type=int,
+        default=2,
+        help="Minimum number of supporters who must have purchased an item (default: 2)"
+    )
+    
+    args = parser.parse_args()
+    
+    item_url = args.url
+    max_recommendations = args.max_recommendations
+    min_supporters = args.min_supporters
 
     print(f"Getting recommendations for: {item_url}")
     print(f"Max recommendations: {max_recommendations}, Min supporters: {min_supporters}")
