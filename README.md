@@ -1,6 +1,6 @@
 # Bandcamp Recommender
 
-A Python package that generates Bandcamp recommendations using collaborative filtering and tag-based similarity. Finds items that multiple supporters of a given album also purchased, or recommends items with similar tags.
+A Python package that generates Bandcamp recommendations using collaborative filtering. Finds items that multiple supporters of a given album also purchased.
 
 ## Installation
 
@@ -14,7 +14,7 @@ uv sync
 
 ### Command Line Scripts
 
-Three recommendation modes are available:
+Two recommendation modes are available:
 
 #### 1. Collaborative Filtering (Overlap)
 Finds items purchased by multiple supporters of the original item:
@@ -40,16 +40,6 @@ uv run python scripts/get_random.py "https://artist.bandcamp.com/album/name" 10 
 uv run python scripts/get_random.py "https://artist.bandcamp.com/album/name" 5 20 --wishlist
 ```
 
-#### 3. Tag Similarity
-Finds items with similar tags to the original item:
-
-```bash
-uv run python scripts/get_similar.py <bandcamp_url> [max_recommendations] [min_similarity] [max_supporters]
-
-# Example
-uv run python scripts/get_similar.py "https://artist.bandcamp.com/album/name" 10 0.1 20
-```
-
 ### Python Module
 
 ```python
@@ -62,13 +52,6 @@ with SupporterRecommender() as recommender:
         max_recommendations=10,
         min_supporters=2
     )
-    
-    # Tag-based similarity
-    similar = recommender.get_tag_similar_recommendations(
-        item_url="https://example.bandcamp.com/album/example",
-        max_recommendations=10,
-        min_similarity=0.1
-    )
 ```
 
 ## Architecture
@@ -79,7 +62,7 @@ The codebase is organized into modular components:
 - `bandcamp_recommender/recommendations/driver_manager.py` - Selenium WebDriver management & pooling
 - `bandcamp_recommender/recommendations/scraper.py` - Web scraping utilities (curl, BeautifulSoup)
 - `bandcamp_recommender/recommendations/api.py` - Bandcamp API interaction utilities
-- `bandcamp_recommender/recommendations/tags.py` - Tag extraction & similarity calculation
+- `bandcamp_recommender/recommendations/tags.py` - Tag extraction utilities
 
 ## How It Works
 
@@ -88,12 +71,6 @@ The codebase is organized into modular components:
 2. Fetches each supporter's collection (using pagedata + API)
 3. Counts item occurrences and ranks by popularity
 4. Returns top recommendations with metadata
-
-### Tag Similarity
-1. Extracts tags from the original item
-2. Fetches items from supporters' collections
-3. Calculates TF-IDF weighted Jaccard similarity between tag sets
-4. Returns items ranked by similarity score
 
 ## Technical Details
 
