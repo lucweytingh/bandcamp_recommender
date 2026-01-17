@@ -11,7 +11,7 @@ In your other project's `pyproject.toml`, add:
 ```toml
 [project]
 dependencies = [
-    "bandcamp-recommender @ file:///Users/lucw/Documents/bandcamp_recommender",
+    "bandcamp-recommender @ file:///path/to/bandcamp_recommender",
 ]
 ```
 
@@ -19,7 +19,7 @@ Or if using `uv` directly:
 
 ```bash
 cd /path/to/your/other/project
-uv add --editable /Users/lucw/Documents/bandcamp_recommender
+uv add --editable /path/to/bandcamp_recommender
 ```
 
 ### Option 2: Add to PYTHONPATH (Simplest)
@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 
 # Add bandcamp_recommender to path
-sys.path.insert(0, str(Path("/Users/lucw/Documents/bandcamp_recommender").resolve()))
+sys.path.insert(0, str(Path("/path/to/bandcamp_recommender").resolve()))
 
 from src.recommendations import SupporterRecommender
 ```
@@ -226,7 +226,7 @@ with SupporterRecommender() as recommender:
     # Only items found in at least 3 collections
     # If not enough, automatically try lower overlap levels
     items = recommender.get_random_items(
-        item_url="https://templeofsound.bandcamp.com/album/never-too-late",
+        item_url="https://artist.bandcamp.com/album/name",
         num_items=10,
         num_supporters=15,
         min_overlap=3,

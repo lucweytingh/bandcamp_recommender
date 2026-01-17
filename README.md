@@ -114,13 +114,13 @@ Add to your project's `pyproject.toml`:
 ```toml
 [project]
 dependencies = [
-    "bandcamp-recommender @ file:///Users/lucw/Documents/bandcamp_recommender",
+    "bandcamp-recommender @ file:///path/to/bandcamp_recommender",
 ]
 ```
 
 Or with `uv`:
 ```bash
-uv add --editable /Users/lucw/Documents/bandcamp_recommender
+uv add --editable /path/to/bandcamp_recommender
 ```
 
 ### Usage
