@@ -53,7 +53,7 @@ uv run python scripts/get_similar.py "https://artist.bandcamp.com/album/name" 10
 ### Python Module
 
 ```python
-from bandcamp_recommender.recommendations import SupporterRecommender
+from bandcamp_recommender import SupporterRecommender
 
 with SupporterRecommender() as recommender:
     # Collaborative filtering
@@ -126,7 +126,7 @@ uv add --editable /path/to/bandcamp_recommender
 ### Usage
 
 ```python
-from bandcamp_recommender.recommendations import SupporterRecommender
+from bandcamp_recommender import SupporterRecommender
 
 # Collaborative filtering
 with SupporterRecommender() as recommender:

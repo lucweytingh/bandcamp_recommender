@@ -8,7 +8,7 @@ import sys
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from bandcamp_recommender.recommendations import SupporterRecommender
+from bandcamp_recommender import SupporterRecommender
 
 
 def format_time(seconds):
