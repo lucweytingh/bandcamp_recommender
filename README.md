@@ -16,10 +16,10 @@ uv sync
 
 ```bash
 export PYTHONPATH=$(pwd)
-uv run python scripts/get_recommendations.py <bandcamp_url> [max_recommendations] [min_supporters]
+uv run python scripts/get_overlap.py <bandcamp_url> [max_recommendations] [min_supporters]
 
 # Example
-uv run python scripts/get_recommendations.py "https://artist.bandcamp.com/album/name" 10 2
+uv run python scripts/get_overlap.py "https://artist.bandcamp.com/album/name" 10 2
 ```
 
 ### Python Module

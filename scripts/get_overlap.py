@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Example script to get Bandcamp recommendations."""
+"""Get Bandcamp recommendations based on supporter overlap (collaborative filtering)."""
 
 import sys
 from pathlib import Path
@@ -41,7 +41,7 @@ def progress_callback(status, current, total, estimated_seconds):
 def main():
     """Main function to demonstrate usage."""
     if len(sys.argv) < 2:
-        print("Usage: python get_recommendations.py <bandcamp_item_url> [max_recommendations] [min_supporters]")
+        print("Usage: python get_overlap.py <bandcamp_item_url> [max_recommendations] [min_supporters]")
         sys.exit(1)
 
     item_url = sys.argv[1]
@@ -77,6 +77,8 @@ def main():
             print(f"{i}. {rec['band_name']} - {rec['item_title']}")
             print(f"   URL: {rec['item_url']}")
             print(f"   Supported by {rec['supporters_count']} people who also bought the original")
+            if rec.get('tags'):
+                print(f"   Tags: {', '.join(rec['tags'])}")
             print()
 
 
