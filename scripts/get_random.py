@@ -114,9 +114,9 @@ def main():
             try:
                 driver = driver_pool.get(timeout=30)
                 if use_wishlist:
-                    items = recommender._get_supporter_wishlist_with_driver(supporter, driver, extract_tags=False)
+                    items = recommender._get_supporter_wishlist_with_driver(supporter, driver, extract_tags_flag=False)
                 else:
-                    items = recommender._get_supporter_purchases_with_driver(supporter, driver, extract_tags=False)
+                    items = recommender._get_supporter_purchases_with_driver(supporter, driver, extract_tags_flag=False)
                 return items, supporter
             except Exception as e:
                 return [], supporter
