@@ -94,48 +94,7 @@ with SupporterRecommender() as recommender:
 
 ---
 
-### 2. `get_tag_similar_recommendations()` - Tag-Based Similarity
-
-Finds items with similar tags to the original item using TF-IDF weighted Jaccard similarity.
-
-```python
-from bandcamp_recommender import SupporterRecommender
-
-with SupporterRecommender() as recommender:
-    similar = recommender.get_tag_similar_recommendations(
-        item_url="https://artist.bandcamp.com/album/name",
-        max_recommendations=10,
-        min_similarity=0.1,
-        max_supporters=None,  # None = all supporters
-        progress_callback=None
-    )
-    
-    # Returns: List[Dict] with keys:
-    # - 'item_title': str
-    # - 'band_name': str
-    # - 'item_url': str
-    # - 'tags': List[str]
-    # - 'similarity_score': float (0.0 to 1.0)
-    # - 'supporters_count': int
-    
-    for item in similar:
-        print(f"{item['band_name']} - {item['item_title']}")
-        print(f"  Similarity: {item['similarity_score']:.3f}")
-        print(f"  Tags: {', '.join(item['tags'])}")
-```
-
-**Parameters:**
-- `item_url` (str): URL of the Bandcamp item
-- `max_recommendations` (int, default=10): Maximum number of recommendations
-- `min_similarity` (float, default=0.1): Minimum similarity score (0.0 to 1.0)
-- `max_supporters` (int, optional): Maximum number of supporters to fetch from (None = all)
-- `progress_callback` (Callable, optional): Function(status, current, total, estimated_seconds)
-
-**Returns:** `List[Dict[str, Any]]`
-
----
-
-### 3. `get_random_items()` - Random Items from Supporters
+### 2. `get_random_items()` - Random Items from Supporters
 
 Gets random items from random supporters' collections, with optional overlap filtering.
 
