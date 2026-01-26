@@ -94,7 +94,7 @@ class DriverManager:
         if self.driver is None:
             self.init_driver()
 
-    def get_driver_pool(self, pool_size: int = 15, progress_callback=None) -> Queue:
+    def get_driver_pool(self, pool_size: int = 10, progress_callback=None) -> Queue:
         """Get or create a driver pool for parallel processing.
         
         Args:

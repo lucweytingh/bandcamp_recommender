@@ -463,7 +463,7 @@ class SupporterRecommender:
         completed_lock = Lock()
 
         # Initialize driver pool
-        pool_size = min(15, total_supporters)
+        pool_size = min(10, total_supporters)
         if progress_callback:
             progress_callback("Initializing driver pool (this may take a moment)...", 0, total_supporters, 0)
 
@@ -661,7 +661,7 @@ class SupporterRecommender:
         """
         return extract_supporters(item_url)
 
-    def _get_driver_pool(self, pool_size: int = 15):
+    def _get_driver_pool(self, pool_size: int = 10):
         """Get or create a driver pool for parallel processing.
         
         Wrapper method for backward compatibility with scripts.
@@ -731,7 +731,7 @@ class SupporterRecommender:
         completed_lock = Lock()
         
         # Initialize driver pool
-        pool_size = min(15, total_supporters)
+        pool_size = min(10, total_supporters)
         if progress_callback:
             progress_callback("Initializing driver pool (this may take a moment)...", 0, total_supporters, 0)
         driver_pool = self._driver_manager.get_driver_pool(pool_size)
