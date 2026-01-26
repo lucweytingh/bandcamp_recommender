@@ -1,5 +1,10 @@
 """Selenium WebDriver management for Bandcamp scraping."""
 
+import contextlib
+import io
+import logging
+import sys
+import time
 import warnings
 from queue import Queue
 from threading import Lock
@@ -12,6 +17,21 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 # Suppress selenium-wire RuntimeWarnings (harmless coroutine warnings)
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="seleniumwire")
+
+# Suppress mitmproxy connection errors (harmless proxy initialization errors)
+# These occur when multiple drivers initialize simultaneously and are safe to ignore
+logging.getLogger("seleniumwire.thirdparty.mitmproxy").setLevel(logging.ERROR)
+
+
+@contextlib.contextmanager
+def suppress_stderr():
+    """Context manager to suppress stderr output (for mitmproxy traceback suppression)."""
+    original_stderr = sys.stderr
+    sys.stderr = io.StringIO()
+    try:
+        yield
+    finally:
+        sys.stderr = original_stderr
 
 
 class DriverManager:
@@ -65,7 +85,9 @@ class DriverManager:
         """
         options = self.get_driver_options()
         service = Service(ChromeDriverManager().install())
-        self.driver = wire_webdriver.Chrome(service=service, options=options)
+        # Suppress stderr during driver creation to hide harmless mitmproxy errors
+        with suppress_stderr():
+            self.driver = wire_webdriver.Chrome(service=service, options=options)
 
     def ensure_driver(self):
         """Ensure driver is initialized (lazy initialization)."""
@@ -94,7 +116,18 @@ class DriverManager:
                 options = self.get_driver_options()
                 for i in range(pool_size):
                     try:
-                        driver = wire_webdriver.Chrome(service=self._chrome_service, options=options)
+                        # Add small delay between driver creations to reduce concurrent
+                        # proxy connection attempts (mitigates mitmproxy socket errors)
+                        if i > 0:
+                            time.sleep(0.1)
+                        
+                        # Suppress stderr during driver creation to hide harmless
+                        # mitmproxy connection errors that occur during initialization
+                        with suppress_stderr():
+                            driver = wire_webdriver.Chrome(
+                                service=self._chrome_service,
+                                options=options
+                            )
                         self._driver_pool.put(driver)
                         if progress_callback:
                             progress_callback(f"Initialized driver {i+1}/{pool_size}...")
@@ -116,7 +149,12 @@ class DriverManager:
         options = self.get_driver_options()
         if self._chrome_service is None:
             self._chrome_service = Service(ChromeDriverManager().install())
-        return wire_webdriver.Chrome(service=self._chrome_service, options=options)
+        # Suppress stderr during driver creation to hide harmless mitmproxy errors
+        with suppress_stderr():
+            return wire_webdriver.Chrome(
+                service=self._chrome_service,
+                options=options
+            )
 
     def close(self):
         """Close the webdriver and cleanup driver pool."""
