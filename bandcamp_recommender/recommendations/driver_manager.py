@@ -3,6 +3,7 @@
 import contextlib
 import io
 import logging
+import os
 import sys
 import time
 import warnings
@@ -63,18 +64,24 @@ class DriverManager:
         options.add_experimental_option('useAutomationExtension', False)
 
         # Auto-detect Chrome binary
+        import shutil
         chrome_paths = [
+            # Linux
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            # macOS
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
             "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
             "/Applications/Arc.app/Contents/MacOS/Arc",
         ]
         for path in chrome_paths:
-            try:
-                options.binary_location = path
+            resolved = shutil.which(path) if "/" not in path else path
+            if resolved and os.path.isfile(resolved):
+                options.binary_location = resolved
                 break
-            except Exception:
-                continue
 
         return options
 
