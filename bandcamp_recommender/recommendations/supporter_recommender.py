@@ -249,7 +249,7 @@ class SupporterRecommender:
             if last_token and first_page_count < item_count:
                 cookies = get_cookies_from_driver(driver)
                 wishlist_url = f"https://bandcamp.com/{username}/wishlist"
-                items = fetch_collection_items_api(fan_id, last_token, cookies, wishlist_url)
+                items = fetch_collection_items_api(fan_id, last_token, cookies, wishlist_url, driver=driver)
 
                 # Extract tralbum_id from API response and store metadata
                 for item in items:
@@ -341,7 +341,7 @@ class SupporterRecommender:
                 fan_id = get_fan_id_from_page(driver, username)
                 if fan_id:
                     cookies = get_cookies_from_driver(driver)
-                    items = fetch_collection_items_api(fan_id, last_token, cookies, wishlist_url)
+                    items = fetch_collection_items_api(fan_id, last_token, cookies, wishlist_url, driver=driver)
 
                     # Extract tralbum_id from API response and store metadata
                     for item in items:
