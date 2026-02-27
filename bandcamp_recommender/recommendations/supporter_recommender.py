@@ -18,6 +18,7 @@ from bandcamp_recommender.recommendations.api import (
     fetch_collection_items_api,
     get_cookies_from_driver,
     get_fan_id_from_page,
+    get_fan_page_data_via_curl,
 )
 from bandcamp_recommender.recommendations.driver_manager import DriverManager
 from bandcamp_recommender.recommendations.scraper import extract_item_id, extract_supporters, extract_tags
@@ -80,52 +81,106 @@ class SupporterRecommender:
         completed_count = 0
         completed_lock = Lock()
 
-        # Initialize driver pool
-        pool_size = min(10, total_supporters)
-        driver_pool = self._driver_manager.get_driver_pool(pool_size)
+        # Try Selenium-based approach first
+        use_selenium = True
+        try:
+            pool_size = min(10, total_supporters)
+            driver_pool = self._driver_manager.get_driver_pool(pool_size)
+        except Exception as e:
+            print(f"Warning: Failed to initialize driver pool: {e}")
+            use_selenium = False
 
-        def fetch_supporter_purchases(supporter):
-            """Fetch purchases for a single supporter (thread-safe)."""
-            driver = driver_pool.get()
-            try:
-                purchases = self._get_supporter_purchases_with_driver(supporter, driver)
-                return purchases, supporter
-            finally:
-                driver_pool.put(driver)
-
-        # Use ThreadPoolExecutor for parallel processing
-        max_workers = min(15, total_supporters)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_supporter = {
-                executor.submit(fetch_supporter_purchases, supporter): supporter
-                for supporter in supporters
-            }
-
-            # Process completed tasks as they finish
-            for future in future_to_supporter:
+        if use_selenium:
+            def fetch_supporter_purchases(supporter):
+                """Fetch purchases for a single supporter (thread-safe)."""
+                driver = driver_pool.get()
                 try:
-                    purchases, supporter = future.result()
-                    with completed_lock:
-                        all_purchases.extend(purchases)
-                        completed_count += 1
+                    purchases = self._get_supporter_purchases_with_driver(supporter, driver)
+                    return purchases, supporter
+                finally:
+                    driver_pool.put(driver)
 
-                        if progress_callback:
-                            elapsed = time.time() - start_time
-                            avg_time_per_supporter = elapsed / completed_count if completed_count > 0 else 2.0
-                            remaining = total_supporters - completed_count
-                            estimated_seconds = avg_time_per_supporter * remaining
-                            progress_callback(
-                                f"Fetching purchases from supporter {completed_count}/{total_supporters} ({supporter})...",
-                                completed_count,
-                                total_supporters,
-                                int(estimated_seconds)
-                            )
-                except Exception as e:
-                    supporter = future_to_supporter[future]
-                    print(f"Error processing {supporter}: {e}")
-                    with completed_lock:
-                        completed_count += 1
+            # Use ThreadPoolExecutor for parallel processing
+            max_workers = min(15, total_supporters)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_supporter = {
+                    executor.submit(fetch_supporter_purchases, supporter): supporter
+                    for supporter in supporters
+                }
+
+                # Process completed tasks as they finish
+                for future in future_to_supporter:
+                    try:
+                        purchases, supporter = future.result()
+                        with completed_lock:
+                            all_purchases.extend(purchases)
+                            completed_count += 1
+
+                            if progress_callback:
+                                elapsed = time.time() - start_time
+                                avg_time_per_supporter = elapsed / completed_count if completed_count > 0 else 2.0
+                                remaining = total_supporters - completed_count
+                                estimated_seconds = avg_time_per_supporter * remaining
+                                progress_callback(
+                                    f"Fetching purchases from supporter {completed_count}/{total_supporters} ({supporter})...",
+                                    completed_count,
+                                    total_supporters,
+                                    int(estimated_seconds)
+                                )
+                    except Exception as e:
+                        supporter = future_to_supporter[future]
+                        print(f"Error processing {supporter}: {e}")
+                        with completed_lock:
+                            completed_count += 1
+
+        # Fallback: if Selenium returned no purchases, try curl-based approach
+        if len(all_purchases) == 0:
+            if progress_callback:
+                progress_callback(
+                    "Selenium returned no purchases, trying curl-based fallback...",
+                    0,
+                    total_supporters,
+                    0
+                )
+            completed_count = 0
+            start_time = time.time()
+
+            def fetch_purchases_curl(supporter):
+                """Fetch purchases via curl (no Selenium)."""
+                return self._get_supporter_purchases_via_curl(supporter), supporter
+
+            max_workers = min(15, total_supporters)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_supporter = {
+                    executor.submit(fetch_purchases_curl, supporter): supporter
+                    for supporter in supporters
+                }
+
+                for future in future_to_supporter:
+                    try:
+                        purchases, supporter = future.result()
+                        with completed_lock:
+                            all_purchases.extend(purchases)
+                            completed_count += 1
+
+                            if progress_callback:
+                                elapsed = time.time() - start_time
+                                avg_time_per_supporter = elapsed / completed_count if completed_count > 0 else 2.0
+                                remaining = total_supporters - completed_count
+                                estimated_seconds = avg_time_per_supporter * remaining
+                                progress_callback(
+                                    f"[curl] Fetching purchases from supporter {completed_count}/{total_supporters} ({supporter})...",
+                                    completed_count,
+                                    total_supporters,
+                                    int(estimated_seconds)
+                                )
+                    except Exception as e:
+                        supporter = future_to_supporter[future]
+                        print(f"Error processing {supporter} via curl: {e}")
+                        with completed_lock:
+                            completed_count += 1
 
         # Count purchases and filter
         purchase_counter = Counter(all_purchases)
@@ -264,6 +319,74 @@ class SupporterRecommender:
 
         except Exception as e:
             # Silently handle errors (timeouts, network issues, etc.)
+            return []
+
+    def _get_supporter_purchases_via_curl(
+        self,
+        username: str,
+        extract_tags_flag: bool = True
+    ) -> List[str]:
+        """Get purchases for a supporter using curl (no Selenium needed).
+
+        Fallback method that uses curl to fetch the profile page and API.
+
+        Args:
+            username: Supporter username
+            extract_tags_flag: If False, skip tag extraction (faster but no tag data)
+
+        Returns:
+            List of item IDs (tralbum_id) that the supporter purchased
+        """
+        try:
+            pagedata = get_fan_page_data_via_curl(username)
+            if not pagedata:
+                return []
+
+            fan_id = pagedata.get("fan_data", {}).get("fan_id")
+            if not fan_id:
+                return []
+
+            collection_data = pagedata.get("collection_data", {})
+            item_cache = pagedata.get("item_cache", {}).get("collection", {})
+
+            sequence = collection_data.get("sequence", [])
+            pending_sequence = collection_data.get("pending_sequence", [])
+            first_page_item_ids = []
+
+            for item_key in sequence + pending_sequence:
+                item_data = item_cache.get(item_key)
+                if item_data:
+                    tralbum_id = item_data.get("tralbum_id")
+                    if tralbum_id:
+                        first_page_item_ids.append(str(tralbum_id))
+                        self._store_item_metadata(
+                            str(tralbum_id),
+                            item_data,
+                            extract_tags_flag
+                        )
+
+            all_item_ids = list(first_page_item_ids)
+
+            last_token = collection_data.get("last_token", "")
+            item_count = collection_data.get("item_count", 0)
+            first_page_count = len(first_page_item_ids)
+
+            if last_token and first_page_count < item_count:
+                items = fetch_collection_items_api(
+                    fan_id, last_token, {},
+                    f"https://bandcamp.com/{username}",
+                )
+                for item in items:
+                    tralbum_id = item.get("tralbum_id")
+                    if tralbum_id:
+                        item_id_str = str(tralbum_id)
+                        if item_id_str not in all_item_ids:
+                            all_item_ids.append(item_id_str)
+                            self._store_item_metadata(item_id_str, item, extract_tags_flag)
+
+            return all_item_ids
+
+        except Exception:
             return []
 
     def _get_supporter_wishlist_with_driver(
@@ -462,7 +585,8 @@ class SupporterRecommender:
         completed_count = 0
         completed_lock = Lock()
 
-        # Initialize driver pool
+        # Try Selenium-based approach first
+        use_selenium = True
         pool_size = min(10, total_supporters)
         if progress_callback:
             progress_callback("Initializing driver pool (this may take a moment)...", 0, total_supporters, 0)
@@ -471,119 +595,167 @@ class SupporterRecommender:
             driver_pool = self._driver_manager.get_driver_pool(pool_size)
         except Exception as e:
             if progress_callback:
-                progress_callback(f"Error initializing driver pool: {e}", 0, total_supporters, 0)
-            return []
+                progress_callback(f"Driver pool failed, using curl fallback...", 0, total_supporters, 0)
+            use_selenium = False
 
-        if progress_callback:
-            progress_callback(
-                f"Driver pool ready. Fetching items from {total_supporters} supporters...",
-                0,
-                total_supporters,
-                0
-            )
+        if use_selenium:
+            if progress_callback:
+                progress_callback(
+                    f"Driver pool ready. Fetching items from {total_supporters} supporters...",
+                    0,
+                    total_supporters,
+                    0
+                )
 
-        def fetch_supporter_items(supporter):
-            """Fetch items for a single supporter (thread-safe)."""
-            driver = None
-            try:
+            def fetch_supporter_items(supporter):
+                """Fetch items for a single supporter (thread-safe)."""
+                driver = None
                 try:
-                    driver = driver_pool.get(timeout=30)
-                except Exception as e:
-                    return [], supporter, f"Timeout getting driver: {str(e)[:50]}"
-
-                try:
-                    items = self._get_supporter_purchases_with_driver(supporter, driver)
-                    return items, supporter, None
-                except Exception as e:
-                    return [], supporter, f"Error fetching items: {str(e)[:50]}"
-            finally:
-                if driver:
                     try:
-                        driver_pool.put_nowait(driver)
-                    except Exception:
+                        driver = driver_pool.get(timeout=30)
+                    except Exception as e:
+                        return [], supporter, f"Timeout getting driver: {str(e)[:50]}"
+
+                    try:
+                        items = self._get_supporter_purchases_with_driver(supporter, driver)
+                        return items, supporter, None
+                    except Exception as e:
+                        return [], supporter, f"Error fetching items: {str(e)[:50]}"
+                finally:
+                    if driver:
                         try:
-                            driver_pool.put(driver, timeout=2)
+                            driver_pool.put_nowait(driver)
                         except Exception:
-                            pass
+                            try:
+                                driver_pool.put(driver, timeout=2)
+                            except Exception:
+                                pass
 
-        max_workers = min(15, total_supporters)
+            max_workers = min(15, total_supporters)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_supporter = {
-                executor.submit(fetch_supporter_items, supporter): supporter
-                for supporter in supporters
-            }
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_supporter = {
+                    executor.submit(fetch_supporter_items, supporter): supporter
+                    for supporter in supporters
+                }
 
-            # Process futures with manual polling to avoid indefinite blocking
-            pending_futures = dict(future_to_supporter)
-            future_start_times = {f: time.time() for f in pending_futures.keys()}
-            max_future_time = 30  # Max seconds per future
+                # Process futures with manual polling to avoid indefinite blocking
+                pending_futures = dict(future_to_supporter)
+                future_start_times = {f: time.time() for f in pending_futures.keys()}
+                max_future_time = 30  # Max seconds per future
 
-            while pending_futures:
-                completed_this_round = []
+                while pending_futures:
+                    completed_this_round = []
 
-                for future, supporter in list(pending_futures.items()):
-                    # Check if future is done
-                    if future.done():
-                        completed_this_round.append(future)
-                        try:
-                            items, supporter, error = future.result(timeout=1)
-                            with completed_lock:
-                                if error:
+                    for future, supporter in list(pending_futures.items()):
+                        # Check if future is done
+                        if future.done():
+                            completed_this_round.append(future)
+                            try:
+                                items, supporter, error = future.result(timeout=1)
+                                with completed_lock:
+                                    if error:
+                                        if progress_callback:
+                                            progress_callback(
+                                                f"Error from {supporter}: {error[:30]}... ({completed_count + 1}/{total_supporters})",
+                                                completed_count + 1,
+                                                total_supporters,
+                                                0
+                                            )
+                                    else:
+                                        all_items.extend(items)
+                                        if progress_callback:
+                                            elapsed = time.time() - start_time
+                                            avg_time = elapsed / completed_count if completed_count > 0 else 2.0
+                                            remaining = total_supporters - completed_count
+                                            estimated_seconds = avg_time * remaining
+                                            progress_callback(
+                                                f"Fetched {len(items)} items from {supporter} ({completed_count + 1}/{total_supporters})...",
+                                                completed_count + 1,
+                                                total_supporters,
+                                                int(estimated_seconds)
+                                            )
+                                    completed_count += 1
+                            except Exception as e:
+                                with completed_lock:
+                                    completed_count += 1
                                     if progress_callback:
+                                        error_msg = str(e)[:50] if str(e) else "Unknown error"
                                         progress_callback(
-                                            f"Error from {supporter}: {error[:30]}... ({completed_count + 1}/{total_supporters})",
-                                            completed_count + 1,
+                                            f"Error from {supporter}: {error_msg}... ({completed_count}/{total_supporters})",
+                                            completed_count,
                                             total_supporters,
                                             0
                                         )
-                                else:
-                                    all_items.extend(items)
-                                    if progress_callback:
-                                        elapsed = time.time() - start_time
-                                        avg_time = elapsed / completed_count if completed_count > 0 else 2.0
-                                        remaining = total_supporters - completed_count
-                                        estimated_seconds = avg_time * remaining
-                                        progress_callback(
-                                            f"Fetched {len(items)} items from {supporter} ({completed_count + 1}/{total_supporters})...",
-                                            completed_count + 1,
-                                            total_supporters,
-                                            int(estimated_seconds)
-                                        )
-                                completed_count += 1
-                        except Exception as e:
+                        # Check for timeout
+                        elif time.time() - future_start_times[future] > max_future_time:
+                            completed_this_round.append(future)
+                            future.cancel()
                             with completed_lock:
                                 completed_count += 1
                                 if progress_callback:
-                                    error_msg = str(e)[:50] if str(e) else "Unknown error"
                                     progress_callback(
-                                        f"Error from {supporter}: {error_msg}... ({completed_count}/{total_supporters})",
+                                        f"Timeout from {supporter} ({completed_count}/{total_supporters})...",
                                         completed_count,
                                         total_supporters,
                                         0
                                     )
-                    # Check for timeout
-                    elif time.time() - future_start_times[future] > max_future_time:
-                        completed_this_round.append(future)
-                        future.cancel()
+
+                    # Remove completed futures
+                    for future in completed_this_round:
+                        pending_futures.pop(future, None)
+                        future_start_times.pop(future, None)
+
+                    # If no futures completed, wait a bit before checking again
+                    if not completed_this_round and pending_futures:
+                        time.sleep(0.5)  # Small sleep to avoid busy-waiting
+
+        # Fallback: if Selenium returned no items, try curl-based approach
+        if len(all_items) == 0:
+            if progress_callback:
+                progress_callback(
+                    "Selenium returned no items, trying curl-based fallback...",
+                    0,
+                    total_supporters,
+                    0
+                )
+            completed_count = 0
+            start_time = time.time()
+
+            def fetch_items_curl(supporter):
+                return self._get_supporter_purchases_via_curl(supporter), supporter
+
+            max_workers = min(15, total_supporters)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_supporter = {
+                    executor.submit(fetch_items_curl, supporter): supporter
+                    for supporter in supporters
+                }
+
+                for future in future_to_supporter:
+                    try:
+                        items, supporter = future.result()
                         with completed_lock:
+                            all_items.extend(items)
                             completed_count += 1
+
                             if progress_callback:
+                                elapsed = time.time() - start_time
+                                avg_time = elapsed / completed_count if completed_count > 0 else 2.0
+                                remaining = total_supporters - completed_count
+                                estimated_seconds = avg_time * remaining
                                 progress_callback(
-                                    f"Timeout from {supporter} ({completed_count}/{total_supporters})...",
+                                    f"[curl] Fetched {len(items)} items from {supporter} ({completed_count}/{total_supporters})...",
                                     completed_count,
                                     total_supporters,
-                                    0
+                                    int(estimated_seconds)
                                 )
-
-                # Remove completed futures
-                for future in completed_this_round:
-                    pending_futures.pop(future, None)
-                    future_start_times.pop(future, None)
-
-                # If no futures completed, wait a bit before checking again
-                if not completed_this_round and pending_futures:
-                    time.sleep(0.5)  # Small sleep to avoid busy-waiting
+                    except Exception as e:
+                        supporter = future_to_supporter[future]
+                        print(f"Error processing {supporter} via curl: {e}")
+                        with completed_lock:
+                            completed_count += 1
 
         if progress_callback:
             progress_callback("Calculating tag similarities...", total_supporters, total_supporters, 0)
@@ -729,109 +901,162 @@ class SupporterRecommender:
         total_supporters = len(selected_supporters)
         completed_count = 0
         completed_lock = Lock()
-        
-        # Initialize driver pool
+
+        # Try Selenium-based approach first
+        use_selenium = True
         pool_size = min(10, total_supporters)
         if progress_callback:
             progress_callback("Initializing driver pool (this may take a moment)...", 0, total_supporters, 0)
-        driver_pool = self._driver_manager.get_driver_pool(pool_size)
-        if progress_callback:
-            progress_callback(f"Driver pool ready. Fetching items from {total_supporters} supporters...", 0, total_supporters, 0)
-        
-        def fetch_supporter_items(supporter):
-            """Fetch items (purchases or wishlist) for a single supporter (thread-safe)."""
-            driver = None
-            try:
-                driver = driver_pool.get(timeout=30)
-                if use_wishlist:
-                    items = self._get_supporter_wishlist_with_driver(supporter, driver, extract_tags_flag=False)
-                else:
-                    items = self._get_supporter_purchases_with_driver(supporter, driver, extract_tags_flag=False)
-                return items, supporter
-            except Exception:
-                return [], supporter
-            finally:
-                if driver:
-                    try:
-                        driver_pool.put_nowait(driver)
-                    except Exception:
+        try:
+            driver_pool = self._driver_manager.get_driver_pool(pool_size)
+        except Exception:
+            use_selenium = False
+
+        if use_selenium:
+            if progress_callback:
+                progress_callback(f"Driver pool ready. Fetching items from {total_supporters} supporters...", 0, total_supporters, 0)
+
+            def fetch_supporter_items(supporter):
+                """Fetch items (purchases or wishlist) for a single supporter (thread-safe)."""
+                driver = None
+                try:
+                    driver = driver_pool.get(timeout=30)
+                    if use_wishlist:
+                        items = self._get_supporter_wishlist_with_driver(supporter, driver, extract_tags_flag=False)
+                    else:
+                        items = self._get_supporter_purchases_with_driver(supporter, driver, extract_tags_flag=False)
+                    return items, supporter
+                except Exception:
+                    return [], supporter
+                finally:
+                    if driver:
                         try:
-                            driver_pool.put(driver, timeout=2)
+                            driver_pool.put_nowait(driver)
                         except Exception:
-                            pass
-        
-        # Use ThreadPoolExecutor for parallel processing
-        max_workers = min(15, total_supporters)
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_supporter = {
-                executor.submit(fetch_supporter_items, supporter): supporter
-                for supporter in selected_supporters
-            }
-            
-            # Use manual polling to avoid indefinite blocking
-            pending_futures = dict(future_to_supporter)
-            future_start_times = {f: time.time() for f in pending_futures.keys()}
-            max_future_time = 30  # Max seconds per future
-            
-            while pending_futures:
-                completed_this_round = []
-                
-                for future, supporter in list(pending_futures.items()):
-                    # Check if future is done
-                    if future.done():
-                        completed_this_round.append(future)
-                        try:
-                            items, supporter = future.result(timeout=1)
+                            try:
+                                driver_pool.put(driver, timeout=2)
+                            except Exception:
+                                pass
+
+            # Use ThreadPoolExecutor for parallel processing
+            max_workers = min(15, total_supporters)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_supporter = {
+                    executor.submit(fetch_supporter_items, supporter): supporter
+                    for supporter in selected_supporters
+                }
+
+                # Use manual polling to avoid indefinite blocking
+                pending_futures = dict(future_to_supporter)
+                future_start_times = {f: time.time() for f in pending_futures.keys()}
+                max_future_time = 30  # Max seconds per future
+
+                while pending_futures:
+                    completed_this_round = []
+
+                    for future, supporter in list(pending_futures.items()):
+                        # Check if future is done
+                        if future.done():
+                            completed_this_round.append(future)
+                            try:
+                                items, supporter = future.result(timeout=1)
+                                with completed_lock:
+                                    all_items.extend(items)
+                                    completed_count += 1
+
+                                    if progress_callback:
+                                        elapsed = time.time() - start_time
+                                        avg_time = elapsed / completed_count if completed_count > 0 else 2.0
+                                        remaining = total_supporters - completed_count
+                                        estimated_seconds = avg_time * remaining
+                                        item_type = "wishlist items" if use_wishlist else "purchases"
+                                        progress_callback(
+                                            f"Fetched {len(items)} {item_type} from {supporter} ({completed_count}/{total_supporters})...",
+                                            completed_count,
+                                            total_supporters,
+                                            int(estimated_seconds)
+                                        )
+                            except Exception:
+                                with completed_lock:
+                                    completed_count += 1
+                                    if progress_callback:
+                                        progress_callback(
+                                            f"Error from {supporter} ({completed_count}/{total_supporters})...",
+                                            completed_count,
+                                            total_supporters,
+                                            0
+                                        )
+                        # Check for timeout
+                        elif time.time() - future_start_times[future] > max_future_time:
+                            completed_this_round.append(future)
+                            future.cancel()
                             with completed_lock:
-                                all_items.extend(items)
-                                completed_count += 1
-                                
-                                if progress_callback:
-                                    elapsed = time.time() - start_time
-                                    avg_time = elapsed / completed_count if completed_count > 0 else 2.0
-                                    remaining = total_supporters - completed_count
-                                    estimated_seconds = avg_time * remaining
-                                    item_type = "wishlist items" if use_wishlist else "purchases"
-                                    progress_callback(
-                                        f"Fetched {len(items)} {item_type} from {supporter} ({completed_count}/{total_supporters})...",
-                                        completed_count,
-                                        total_supporters,
-                                        int(estimated_seconds)
-                                    )
-                        except Exception:
-                            with completed_lock:
                                 completed_count += 1
                                 if progress_callback:
                                     progress_callback(
-                                        f"Error from {supporter} ({completed_count}/{total_supporters})...",
+                                        f"Timeout from {supporter} ({completed_count}/{total_supporters})...",
                                         completed_count,
                                         total_supporters,
                                         0
                                     )
-                    # Check for timeout
-                    elif time.time() - future_start_times[future] > max_future_time:
-                        completed_this_round.append(future)
-                        future.cancel()
+
+                    # Remove completed futures
+                    for future in completed_this_round:
+                        pending_futures.pop(future, None)
+                        future_start_times.pop(future, None)
+
+                    # If no futures completed, wait a bit before checking again
+                    if not completed_this_round and pending_futures:
+                        time.sleep(0.5)  # Small sleep to avoid busy-waiting
+
+        # Fallback: if Selenium returned no items, try curl-based approach
+        if not all_items:
+            if progress_callback:
+                progress_callback(
+                    "Selenium returned no items, trying curl-based fallback...",
+                    0,
+                    total_supporters,
+                    0
+                )
+            completed_count = 0
+            start_time = time.time()
+
+            def fetch_items_curl(supporter):
+                return self._get_supporter_purchases_via_curl(supporter, extract_tags_flag=False), supporter
+
+            max_workers = min(15, total_supporters)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_supporter = {
+                    executor.submit(fetch_items_curl, supporter): supporter
+                    for supporter in selected_supporters
+                }
+
+                for future in future_to_supporter:
+                    try:
+                        items, supporter = future.result()
                         with completed_lock:
+                            all_items.extend(items)
                             completed_count += 1
+
                             if progress_callback:
+                                elapsed = time.time() - start_time
+                                avg_time = elapsed / completed_count if completed_count > 0 else 2.0
+                                remaining = total_supporters - completed_count
+                                estimated_seconds = avg_time * remaining
                                 progress_callback(
-                                    f"Timeout from {supporter} ({completed_count}/{total_supporters})...",
+                                    f"[curl] Fetched {len(items)} items from {supporter} ({completed_count}/{total_supporters})...",
                                     completed_count,
                                     total_supporters,
-                                    0
+                                    int(estimated_seconds)
                                 )
-                
-                # Remove completed futures
-                for future in completed_this_round:
-                    pending_futures.pop(future, None)
-                    future_start_times.pop(future, None)
-                
-                # If no futures completed, wait a bit before checking again
-                if not completed_this_round and pending_futures:
-                    time.sleep(0.5)  # Small sleep to avoid busy-waiting
-        
+                    except Exception as e:
+                        supporter = future_to_supporter[future]
+                        print(f"Error processing {supporter} via curl: {e}")
+                        with completed_lock:
+                            completed_count += 1
+
         if not all_items:
             if progress_callback:
                 progress_callback("No items found.", total_supporters, total_supporters, 0)

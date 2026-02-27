@@ -2,7 +2,7 @@
 
 import json
 import subprocess
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from bs4 import BeautifulSoup
 from selenium.webdriver.remote.webdriver import WebDriver
@@ -10,14 +10,16 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+from bandcamp_recommender.recommendations.scraper import fetch_page_html
+
 
 def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
     """Get fan_id from a supporter's page.
-    
+
     Args:
         driver: Selenium WebDriver instance
         username: Supporter username
-        
+
     Returns:
         fan_id as integer, or None if not found
     """
@@ -26,7 +28,7 @@ def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
         # (wishlist/profile pages have fan_data, /music page doesn't)
         wishlist_url = f"https://bandcamp.com/{username}/wishlist"
         driver.get(wishlist_url)
-        
+
         # Wait for pagedata element
         try:
             WebDriverWait(driver, 3).until(
@@ -49,14 +51,45 @@ def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
             return None
 
         pagedata = json.loads(pagedata_elem.get("data-blob", "{}"))
-        
+
         # Get fan_id for API call
         fan_data = pagedata.get("fan_data", {})
         fan_id = fan_data.get("fan_id")
-        
+
         return fan_id
     except Exception:
         return None
+
+
+def get_fan_page_data_via_curl(username: str) -> Optional[Dict[str, Any]]:
+    """Get pagedata from a supporter's page using curl (no Selenium needed).
+
+    Tries the profile page first (has collection_data with populated sequence),
+    falls back to wishlist page.
+
+    Args:
+        username: Supporter username
+
+    Returns:
+        Parsed pagedata dict, or None if not found
+    """
+    for url in [
+        f"https://bandcamp.com/{username}",
+        f"https://bandcamp.com/{username}/wishlist",
+    ]:
+        html = fetch_page_html(url)
+        if not html:
+            continue
+        try:
+            soup = BeautifulSoup(html, features="html.parser")
+            pagedata_elem = soup.find(id="pagedata")
+            if pagedata_elem:
+                pagedata = json.loads(pagedata_elem.get("data-blob", "{}"))
+                if pagedata.get("fan_data", {}).get("fan_id"):
+                    return pagedata
+        except Exception:
+            continue
+    return None
 
 
 def get_cookies_from_driver(driver: WebDriver) -> Dict[str, str]:
