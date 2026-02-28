@@ -1,8 +1,11 @@
 """Web scraping utilities for Bandcamp pages."""
 
 import json
+import os
 import re
+import shutil
 import subprocess
+import time
 from typing import List, Optional
 
 from bs4 import BeautifulSoup
@@ -143,6 +146,12 @@ def extract_supporters(item_url: str) -> List[str]:
                             if username and username not in excluded:
                                 supporters.append(username)
 
+    # Selenium fallback if curl returned no supporters (e.g. datacenter IP blocked by Bandcamp)
+    if not supporters:
+        selenium_html = _fetch_page_with_selenium(item_url)
+        if selenium_html:
+            supporters = _parse_supporters_from_html(selenium_html)
+
     # Remove duplicates while preserving order
     seen = set()
     unique_supporters = []
@@ -152,6 +161,74 @@ def extract_supporters(item_url: str) -> List[str]:
             unique_supporters.append(supporter)
 
     return unique_supporters
+
+
+def _parse_supporters_from_html(html: str) -> List[str]:
+    """Parse supporter usernames from raw HTML."""
+    soup = BeautifulSoup(html, features="html.parser")
+    supporters = []
+
+    collectors_data = soup.find("div", id="collectors-data")
+    if collectors_data:
+        data_blob = collectors_data.get("data-blob")
+        if data_blob:
+            try:
+                collectors_json = json.loads(data_blob)
+                for thumb in collectors_json.get("thumbs", []):
+                    username = thumb.get("username")
+                    if username:
+                        supporters.append(username)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    if not supporters:
+        fan_links = soup.find_all("a", class_=re.compile("fan.*pic|pic.*fan"))
+        for link in fan_links:
+            href = link.get("href", "")
+            match = re.search(r"bandcamp\.com/([^/?]+)", href)
+            if match:
+                username = match.group(1)
+                if username and username != "compliments":
+                    supporters.append(username)
+
+    return supporters
+
+
+def _fetch_page_with_selenium(url: str) -> Optional[str]:
+    """Fetch page HTML using Selenium. Fallback for when curl is blocked (e.g. datacenter IPs)."""
+    try:
+        from selenium.webdriver.chrome.options import Options
+        from selenium.webdriver.chrome.service import Service
+        from seleniumwire import webdriver
+
+        options = Options()
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-dev-shm-usage")
+
+        for path in ["/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome",
+                     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]:
+            if os.path.isfile(path):
+                options.binary_location = path
+                break
+
+        chromedriver_path = shutil.which("chromedriver")
+        if chromedriver_path:
+            service = Service(chromedriver_path)
+        else:
+            from webdriver_manager.chrome import ChromeDriverManager
+            service = Service(ChromeDriverManager().install())
+
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.get(url)
+        time.sleep(3)
+        html = driver.page_source
+        driver.quit()
+        return html
+    except Exception as e:
+        print(f"Selenium fallback failed: {e}")
+        return None
 
 
 def extract_item_id(item_url: str) -> Optional[str]:

@@ -81,7 +81,7 @@ class SupporterRecommender:
         completed_lock = Lock()
 
         # Initialize driver pool
-        pool_size = min(10, total_supporters)
+        pool_size = min(3, total_supporters)
         driver_pool = self._driver_manager.get_driver_pool(pool_size)
 
         def fetch_supporter_purchases(supporter):
@@ -463,7 +463,7 @@ class SupporterRecommender:
         completed_lock = Lock()
 
         # Initialize driver pool
-        pool_size = min(10, total_supporters)
+        pool_size = min(3, total_supporters)
         if progress_callback:
             progress_callback("Initializing driver pool (this may take a moment)...", 0, total_supporters, 0)
 
@@ -731,7 +731,7 @@ class SupporterRecommender:
         completed_lock = Lock()
         
         # Initialize driver pool
-        pool_size = min(10, total_supporters)
+        pool_size = min(3, total_supporters)
         if progress_callback:
             progress_callback("Initializing driver pool (this may take a moment)...", 0, total_supporters, 0)
         driver_pool = self._driver_manager.get_driver_pool(pool_size)
