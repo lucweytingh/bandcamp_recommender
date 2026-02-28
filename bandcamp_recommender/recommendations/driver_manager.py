@@ -1,38 +1,15 @@
 """Selenium WebDriver management for Bandcamp scraping."""
 
-import contextlib
-import io
-import logging
 import os
-import sys
 import time
-import warnings
 from queue import Queue
 from threading import Lock
 from typing import Optional
 
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from seleniumwire import webdriver as wire_webdriver
+from selenium import webdriver
 from webdriver_manager.chrome import ChromeDriverManager
-
-# Suppress selenium-wire RuntimeWarnings (harmless coroutine warnings)
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="seleniumwire")
-
-# Suppress mitmproxy connection errors (harmless proxy initialization errors)
-# These occur when multiple drivers initialize simultaneously and are safe to ignore
-logging.getLogger("seleniumwire.thirdparty.mitmproxy").setLevel(logging.ERROR)
-
-
-@contextlib.contextmanager
-def suppress_stderr():
-    """Context manager to suppress stderr output (for mitmproxy traceback suppression)."""
-    original_stderr = sys.stderr
-    sys.stderr = io.StringIO()
-    try:
-        yield
-    finally:
-        sys.stderr = original_stderr
 
 
 class DriverManager:
@@ -40,14 +17,14 @@ class DriverManager:
 
     def __init__(self):
         """Initialize the driver manager."""
-        self.driver: Optional[wire_webdriver.Chrome] = None
+        self.driver: Optional[webdriver.Chrome] = None
         self._driver_pool: Optional[Queue] = None
         self._driver_pool_lock = Lock()
         self._chrome_service: Optional[Service] = None
 
     def get_driver_options(self) -> Options:
         """Get optimized driver options (reusable).
-        
+
         Returns:
             Configured Chrome Options object
         """
@@ -87,14 +64,12 @@ class DriverManager:
 
     def init_driver(self):
         """Initialize the Selenium webdriver with appropriate options.
-        
+
         Only initialized when needed (for collection pages that require cookies).
         """
         options = self.get_driver_options()
         service = Service(ChromeDriverManager().install())
-        # Suppress stderr during driver creation to hide harmless mitmproxy errors
-        with suppress_stderr():
-            self.driver = wire_webdriver.Chrome(service=service, options=options)
+        self.driver = webdriver.Chrome(service=service, options=options)
 
     def ensure_driver(self):
         """Ensure driver is initialized (lazy initialization)."""
@@ -103,11 +78,11 @@ class DriverManager:
 
     def get_driver_pool(self, pool_size: int = 10, progress_callback=None) -> Queue:
         """Get or create a driver pool for parallel processing.
-        
+
         Args:
             pool_size: Number of drivers to create in the pool
             progress_callback: Optional callback for progress updates
-            
+
         Returns:
             Queue of driver instances
         """
@@ -123,18 +98,12 @@ class DriverManager:
                 options = self.get_driver_options()
                 for i in range(pool_size):
                     try:
-                        # Add small delay between driver creations to reduce concurrent
-                        # proxy connection attempts (mitigates mitmproxy socket errors)
                         if i > 0:
                             time.sleep(0.1)
-                        
-                        # Suppress stderr during driver creation to hide harmless
-                        # mitmproxy connection errors that occur during initialization
-                        with suppress_stderr():
-                            driver = wire_webdriver.Chrome(
-                                service=self._chrome_service,
-                                options=options
-                            )
+                        driver = webdriver.Chrome(
+                            service=self._chrome_service,
+                            options=options
+                        )
                         self._driver_pool.put(driver)
                         if progress_callback:
                             progress_callback(f"Initialized driver {i+1}/{pool_size}...")
@@ -145,23 +114,21 @@ class DriverManager:
 
         return self._driver_pool
 
-    def create_driver(self) -> wire_webdriver.Chrome:
+    def create_driver(self) -> webdriver.Chrome:
         """Create a new driver instance (for parallel processing).
-        
+
         Note: Prefer using driver pool for better performance.
-        
+
         Returns:
             New Chrome WebDriver instance
         """
         options = self.get_driver_options()
         if self._chrome_service is None:
             self._chrome_service = Service(ChromeDriverManager().install())
-        # Suppress stderr during driver creation to hide harmless mitmproxy errors
-        with suppress_stderr():
-            return wire_webdriver.Chrome(
-                service=self._chrome_service,
-                options=options
-            )
+        return webdriver.Chrome(
+            service=self._chrome_service,
+            options=options
+        )
 
     def close(self):
         """Close the webdriver and cleanup driver pool."""
@@ -178,5 +145,3 @@ class DriverManager:
                 except Exception:
                     pass
             self._driver_pool = None
-
-
