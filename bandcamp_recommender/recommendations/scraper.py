@@ -197,35 +197,14 @@ def _parse_supporters_from_html(html: str) -> List[str]:
 def _fetch_page_with_selenium(url: str) -> Optional[str]:
     """Fetch page HTML using Selenium. Fallback for when curl is blocked (e.g. datacenter IPs)."""
     try:
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.chrome.service import Service
-        from selenium import webdriver
+        from .driver_manager import DriverManager
 
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--disable-dev-shm-usage")
-
-        for path in ["/snap/chromium/current/usr/lib/chromium-browser/chrome",
-                     "/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome",
-                     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]:
-            if os.path.isfile(path):
-                options.binary_location = path
-                break
-
-        chromedriver_path = shutil.which("chromedriver")
-        if chromedriver_path:
-            service = Service(chromedriver_path)
-        else:
-            from webdriver_manager.chrome import ChromeDriverManager
-            service = Service(ChromeDriverManager().install())
-
-        driver = webdriver.Chrome(service=service, options=options)
-        driver.get(url)
+        dm = DriverManager()
+        dm.init_driver()
+        dm.driver.get(url)
         time.sleep(3)
-        html = driver.page_source
-        driver.quit()
+        html = dm.driver.page_source
+        dm.close()
         return html
     except Exception as e:
         print(f"Selenium fallback failed: {e}")

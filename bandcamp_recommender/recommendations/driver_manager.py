@@ -63,9 +63,9 @@ class DriverManager:
             return options
 
         # Auto-detect Chrome binary
+        # Note: snap chromedriver finds its own Chrome automatically,
+        # so we don't list the raw snap binary here (it needs snap confinement).
         chrome_paths = [
-            # Linux (snap)
-            "/snap/chromium/current/usr/lib/chromium-browser/chrome",
             # Linux (apt)
             "google-chrome",
             "google-chrome-stable",
