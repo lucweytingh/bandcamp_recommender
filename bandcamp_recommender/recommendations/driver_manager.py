@@ -1,6 +1,7 @@
 """Selenium WebDriver management for Bandcamp scraping."""
 
 import os
+import shutil
 import time
 from queue import Queue
 from threading import Lock
@@ -22,6 +23,21 @@ class DriverManager:
         self._driver_pool_lock = Lock()
         self._chrome_service: Optional[Service] = None
 
+    def _get_chromedriver_service(self) -> Service:
+        """Get a ChromeDriver Service, preferring env var or system binary over webdriver_manager."""
+        # 1. Check CHROMEDRIVER env var
+        chromedriver_env = os.environ.get("CHROMEDRIVER", "")
+        if chromedriver_env and os.path.exists(chromedriver_env):
+            return Service(chromedriver_env)
+
+        # 2. Check system chromedriver on PATH
+        system_chromedriver = shutil.which("chromedriver")
+        if system_chromedriver:
+            return Service(system_chromedriver)
+
+        # 3. Fall back to webdriver_manager auto-download
+        return Service(ChromeDriverManager().install())
+
     def get_driver_options(self) -> Options:
         """Get optimized driver options (reusable).
 
@@ -40,8 +56,13 @@ class DriverManager:
         options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
 
+        # Check CHROME_BINARY env var first
+        chrome_binary = os.environ.get("CHROME_BINARY", "")
+        if chrome_binary and os.path.exists(chrome_binary):
+            options.binary_location = chrome_binary
+            return options
+
         # Auto-detect Chrome binary
-        import shutil
         chrome_paths = [
             # Linux (snap)
             "/snap/chromium/current/usr/lib/chromium-browser/chrome",
@@ -70,7 +91,7 @@ class DriverManager:
         Only initialized when needed (for collection pages that require cookies).
         """
         options = self.get_driver_options()
-        service = Service(ChromeDriverManager().install())
+        service = self._get_chromedriver_service()
         self.driver = webdriver.Chrome(service=service, options=options)
 
     def ensure_driver(self):
@@ -94,7 +115,7 @@ class DriverManager:
 
                 # Pre-create ChromeDriver service (expensive operation, do once)
                 if self._chrome_service is None:
-                    self._chrome_service = Service(ChromeDriverManager().install())
+                    self._chrome_service = self._get_chromedriver_service()
 
                 # Pre-create drivers (this can take a while, but we do it once)
                 options = self.get_driver_options()
@@ -126,7 +147,7 @@ class DriverManager:
         """
         options = self.get_driver_options()
         if self._chrome_service is None:
-            self._chrome_service = Service(ChromeDriverManager().install())
+            self._chrome_service = self._get_chromedriver_service()
         return webdriver.Chrome(
             service=self._chrome_service,
             options=options
