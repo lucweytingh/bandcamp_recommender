@@ -56,32 +56,14 @@ class DriverManager:
         options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
 
-        # Check CHROME_BINARY env var first
+        # Set Chrome binary only if explicitly configured via env var.
+        # Otherwise let chromedriver find Chrome itself (works for both
+        # snap and apt installs; auto-detection via shutil.which is fragile
+        # because wrapper scripts like /usr/bin/google-chrome may exist but
+        # not be functional Chrome binaries).
         chrome_binary = os.environ.get("CHROME_BINARY", "")
         if chrome_binary and os.path.exists(chrome_binary):
             options.binary_location = chrome_binary
-            return options
-
-        # Auto-detect Chrome binary
-        # Note: snap chromedriver finds its own Chrome automatically,
-        # so we don't list the raw snap binary here (it needs snap confinement).
-        chrome_paths = [
-            # Linux (apt)
-            "google-chrome",
-            "google-chrome-stable",
-            "chromium",
-            "chromium-browser",
-            # macOS
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-            "/Applications/Arc.app/Contents/MacOS/Arc",
-        ]
-        for path in chrome_paths:
-            resolved = shutil.which(path) if "/" not in path else path
-            if resolved and os.path.isfile(resolved):
-                options.binary_location = resolved
-                break
 
         return options
 
