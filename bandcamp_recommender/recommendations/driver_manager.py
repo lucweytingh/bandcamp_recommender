@@ -43,7 +43,9 @@ class DriverManager:
         # Auto-detect Chrome binary
         import shutil
         chrome_paths = [
-            # Linux
+            # Linux (snap)
+            "/snap/chromium/current/usr/lib/chromium-browser/chrome",
+            # Linux (apt)
             "google-chrome",
             "google-chrome-stable",
             "chromium",

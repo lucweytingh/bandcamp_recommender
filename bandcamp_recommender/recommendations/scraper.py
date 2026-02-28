@@ -207,7 +207,8 @@ def _fetch_page_with_selenium(url: str) -> Optional[str]:
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-dev-shm-usage")
 
-        for path in ["/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome",
+        for path in ["/snap/chromium/current/usr/lib/chromium-browser/chrome",
+                     "/usr/bin/chromium-browser", "/usr/bin/chromium", "/usr/bin/google-chrome",
                      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]:
             if os.path.isfile(path):
                 options.binary_location = path
