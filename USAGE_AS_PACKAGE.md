@@ -210,3 +210,74 @@ with SupporterRecommender() as recommender:
 - Collections may be private and require authentication (most common reason for empty results)
 - Tag extraction can be slow; it's automatically skipped in `get_random_items()` for performance
 - Driver pool is automatically managed for parallel processing (up to 15 concurrent workers)
+
+---
+
+## Updating to a New Version (for agents in consumer repos)
+
+**Current version: `0.2.0`** (was `0.1.1`). The public API is unchanged — `SupporterRecommender`, `get_recommendations`, `get_random_items`, and `get_tag_similar_recommendations` all keep the same signatures and return shapes. Internally, supporter fetches now go through `curl` first and only fall back to Selenium if blocked, which is ~40% faster on `get_random.py` and avoids spawning Chrome on healthy runs.
+
+### Pick the right command based on how the package was installed
+
+Check the consumer's `pyproject.toml` for a `bandcamp-recommender` entry to determine the install style.
+
+**1. Editable install (`uv add --editable /path/...` or `bandcamp-recommender @ file:///...` with `[tool.uv.sources] bandcamp-recommender = { path = "...", editable = true }`):**
+
+The consumer points at the source tree directly. Just pull the source:
+```bash
+cd /path/to/bandcamp_recommender   # the path the consumer points at
+git pull --ff-only origin master
+```
+No `uv sync` needed — next Python process picks up the new code.
+
+**2. Non-editable file-URL install (`bandcamp-recommender @ file:///path/to/bandcamp_recommender` with no editable flag):**
+
+`uv` caches the built wheel against the version string, so a behavior change without a version bump would silently use the old code. Since this update bumps `0.1.1 → 0.2.0`, force a refresh in the consumer repo:
+```bash
+cd /path/to/consumer/project
+uv lock --upgrade-package bandcamp-recommender
+uv sync
+```
+
+**3. PYTHONPATH / sys.path insert (Option 2 in this doc):**
+
+Just pull. No package metadata involved.
+```bash
+cd /path/to/bandcamp_recommender
+git pull --ff-only origin master
+```
+
+### Verify the upgrade succeeded
+
+From the consumer repo, after updating:
+```bash
+uv run python -c "import bandcamp_recommender, importlib.metadata as m; print(m.version('bandcamp-recommender'))"
+```
+Expected output: `0.2.0`.
+
+Also confirm the new curl-first path is wired in (only present in 0.2.0+):
+```bash
+uv run python -c "from bandcamp_recommender import SupporterRecommender; assert hasattr(SupporterRecommender, '_get_supporter_items_curl_first'); print('OK')"
+```
+
+### What the consumer code needs to change
+
+Nothing — this is a drop-in replacement. The two new env-var knobs are optional:
+
+- `BANDCAMP_DRIVER_POOL=N` — cap the Selenium fallback pool size (default 5; lower if RAM is tight).
+- `BANDCAMP_DISABLE_JS=1` — disable JavaScript in Chrome for extra speed in the fallback path. Off by default because it disables the in-browser `fetch()` used by the collection API; only safe if curl works for the collection API on your network.
+
+### If the upgrade misbehaves
+
+Pin back to `0.1.1` in the consumer's `pyproject.toml`:
+```toml
+dependencies = [
+    "bandcamp-recommender @ file:///path/to/bandcamp_recommender",
+]
+```
+And in `bandcamp_recommender`, check out the prior commit:
+```bash
+cd /path/to/bandcamp_recommender
+git checkout <commit-before-curl-first>
+```
+Then `uv sync --reinstall-package bandcamp-recommender` in the consumer.
