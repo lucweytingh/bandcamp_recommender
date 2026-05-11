@@ -51,7 +51,15 @@ class DriverManager:
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-images")  # Don't load images - faster page loads
+        # Skip images. --blink-settings is the canonical flag; --disable-images
+        # was deprecated upstream and silently ignored in newer Chromium.
+        options.add_argument("--blink-settings=imagesEnabled=false")
+        # Opt-in: disable JS for collection-page fetches. pagedata is in the
+        # initial HTML so this is safe for read-only page loads, but it
+        # breaks api.py:_fetch_via_driver (which uses execute_async_script).
+        # Default off to preserve the curl-403 fallback path.
+        if os.environ.get("BANDCAMP_DISABLE_JS") == "1":
+            options.add_argument("--disable-javascript")
         options.page_load_strategy = "eager"  # Don't wait for all resources to load
         options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)

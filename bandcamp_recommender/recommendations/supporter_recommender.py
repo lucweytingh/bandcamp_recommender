@@ -1,12 +1,29 @@
 """Main recommendation engine for Bandcamp based on supporter purchases."""
 
 import json
+import os
 import random
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
+
+
+_DEFAULT_DRIVER_POOL = 5
+_DEFAULT_TAG_WORKERS = 6
+
+
+def _resolve_pool_size(total_supporters: int) -> int:
+    """Pool size = min(BANDCAMP_DRIVER_POOL || 5, total_supporters)."""
+    try:
+        cap = int(os.environ.get("BANDCAMP_DRIVER_POOL", _DEFAULT_DRIVER_POOL))
+    except ValueError:
+        cap = _DEFAULT_DRIVER_POOL
+    cap = max(1, cap)
+    if total_supporters <= 0:
+        return cap
+    return min(cap, total_supporters)
 
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
@@ -20,7 +37,12 @@ from bandcamp_recommender.recommendations.api import (
     get_fan_id_from_page,
 )
 from bandcamp_recommender.recommendations.driver_manager import DriverManager
-from bandcamp_recommender.recommendations.scraper import extract_item_id, extract_supporters, extract_tags
+from bandcamp_recommender.recommendations.scraper import (
+    extract_item_id,
+    extract_supporters,
+    extract_tags,
+    fetch_page_html,
+)
 from bandcamp_recommender.recommendations.tags import calculate_tag_similarity, normalize_tag
 
 
@@ -80,20 +102,18 @@ class SupporterRecommender:
         completed_count = 0
         completed_lock = Lock()
 
-        # Initialize driver pool
-        pool_size = min(3, total_supporters)
-        driver_pool = self._driver_manager.get_driver_pool(pool_size)
-
+        # Curl-first: no driver pool init up front. Workers spin up Chrome
+        # lazily only if curl falls over for a specific supporter.
         def fetch_supporter_purchases(supporter):
             """Fetch purchases for a single supporter (thread-safe)."""
-            driver = driver_pool.get()
-            try:
-                purchases = self._get_supporter_purchases_with_driver(supporter, driver)
-                return purchases, supporter
-            finally:
-                driver_pool.put(driver)
+            purchases = self._get_supporter_items_curl_first(
+                supporter, "collection_data"
+            )
+            return purchases, supporter
 
-        # Use ThreadPoolExecutor for parallel processing
+        # Use ThreadPoolExecutor for parallel processing. Cap at 15 to avoid
+        # hammering Bandcamp; curl handshakes are cheap so this is the limit
+        # set by politeness, not by laptop resources.
         max_workers = min(15, total_supporters)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -162,6 +182,11 @@ class SupporterRecommender:
 
         if progress_callback:
             progress_callback("Building recommendations...", total_supporters, total_supporters, 0)
+
+        # Hydrate tags only for the final ranked items. This is the big win
+        # vs. the old behavior where every item from every supporter triggered
+        # a separate curl call for tags.
+        self._hydrate_tags_for_items([item_id for item_id, _ in top_items])
 
         # Get item info and build recommendations
         recommendations = []
@@ -288,8 +313,10 @@ class SupporterRecommender:
             wishlist_url = f"https://bandcamp.com/{username}/wishlist"
             driver.get(wishlist_url)
 
-            # Reduced timeout for first_page_only mode
-            wait_timeout = 2 if first_page_only else 3
+            # Pagedata is in the initial HTML, so it appears within ~200ms once
+            # the page actually loads. Shorter wait = faster wall-clock when a
+            # supporter's page 404s or hangs.
+            wait_timeout = 1 if first_page_only else 1.5
             try:
                 WebDriverWait(driver, wait_timeout).until(
                     EC.presence_of_element_located((By.ID, "pagedata"))
@@ -369,22 +396,217 @@ class SupporterRecommender:
         Args:
             item_id_str: Item ID as string
             item_data: Item data dictionary
-            extract_tags_flag: Whether to extract tags
+            extract_tags_flag: Ignored. Tag extraction is now deferred to
+                _hydrate_tags_for_items so that we don't pay a curl-per-item
+                cost for items that won't appear in the final results.
         """
         with self._cache_lock:
             if item_id_str not in self.item_cache:
                 item_url = item_data.get("item_url", "")
-                # Extract tags only if extract_tags_flag is True
-                tags = []
-                if extract_tags_flag and item_url:
-                    tags = extract_tags(item_url)
-
                 self.item_cache[item_id_str] = {
                     "item_title": item_data.get("item_title", "Unknown Title"),
                     "band_name": item_data.get("band_name", "Unknown Artist"),
                     "item_url": item_url or f"https://bandcamp.com/album/{item_id_str}",
-                    "tags": tags,
+                    "tags": [],
                 }
+
+    def _parse_collection_pagedata(
+        self,
+        pagedata: Dict[str, Any],
+        data_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Extract first-page items + pagination state from a wishlist pagedata blob.
+
+        data_key is either "collection_data" (purchases) or "wishlist_data".
+        Returns None if the blob is missing the expected structure.
+        """
+        section = pagedata.get(data_key)
+        if not isinstance(section, dict):
+            return None
+        cache_key = "collection" if data_key == "collection_data" else "wishlist"
+        item_cache = pagedata.get("item_cache", {}).get(cache_key, {})
+        first_page_item_ids: List[str] = []
+        for key in section.get("sequence", []) + section.get("pending_sequence", []):
+            item_data = item_cache.get(key)
+            if not item_data:
+                continue
+            tralbum_id = item_data.get("tralbum_id")
+            if not tralbum_id:
+                continue
+            item_id_str = str(tralbum_id)
+            first_page_item_ids.append(item_id_str)
+            # extract_tags_flag is ignored downstream; pass True for API parity.
+            self._store_item_metadata(item_id_str, item_data, True)
+        return {
+            "first_page_item_ids": first_page_item_ids,
+            "last_token": section.get("last_token", "") or "",
+            "item_count": section.get("item_count", 0) or 0,
+            "fan_id": pagedata.get("fan_data", {}).get("fan_id"),
+        }
+
+    def _get_supporter_items_via_curl(
+        self,
+        username: str,
+        data_key: str,
+        first_page_only: bool = False,
+    ) -> Optional[List[str]]:
+        """Fetch a supporter's collection or wishlist using plain curl, no driver.
+
+        Returns None on failure (caller falls back to the Selenium path).
+        Returns [] if the page parsed fine but the supporter has no items.
+
+        We skip Selenium entirely when this path works, which avoids both the
+        ~1-3s per-supporter driver.get() and the up-front driver pool init.
+        """
+        wishlist_url = f"https://bandcamp.com/{username}/wishlist"
+        html = fetch_page_html(wishlist_url, timeout=15)
+        if not html:
+            return None
+        soup = BeautifulSoup(html, features="html.parser")
+        pagedata_elem = soup.find(id="pagedata")
+        if not pagedata_elem:
+            return None
+        try:
+            pagedata = json.loads(pagedata_elem.get("data-blob", "{}"))
+        except Exception:
+            return None
+
+        parsed = self._parse_collection_pagedata(pagedata, data_key)
+        if parsed is None:
+            return None
+
+        all_item_ids = list(parsed["first_page_item_ids"])
+        if first_page_only:
+            return all_item_ids
+
+        last_token = parsed["last_token"]
+        item_count = parsed["item_count"]
+        fan_id = parsed["fan_id"]
+        if last_token and fan_id and len(all_item_ids) < item_count:
+            # fetch_collection_items_api falls through to curl when no driver
+            # is supplied. Bandcamp accepts this endpoint without auth cookies
+            # for public fan collections.
+            items = fetch_collection_items_api(
+                fan_id=fan_id,
+                last_token=last_token,
+                cookies={},
+                referer_url=wishlist_url,
+            )
+            if items is None:
+                items = []
+            seen = set(all_item_ids)
+            for item in items:
+                tralbum_id = item.get("tralbum_id")
+                if not tralbum_id:
+                    continue
+                item_id_str = str(tralbum_id)
+                if item_id_str in seen:
+                    continue
+                seen.add(item_id_str)
+                all_item_ids.append(item_id_str)
+                self._store_item_metadata(item_id_str, item, True)
+
+            # Sanity check: if Bandcamp reported a non-trivial item_count and
+            # curl came back with almost nothing, treat as a soft failure so
+            # the caller falls back to Selenium. This catches the case where
+            # an IP-block or anti-bot kicks in mid-stream.
+            if item_count >= 10 and len(all_item_ids) < max(1, item_count // 4):
+                return None
+
+        return all_item_ids
+
+    def _get_supporter_items_curl_first(
+        self,
+        username: str,
+        data_key: str,
+        first_page_only: bool = False,
+    ) -> List[str]:
+        """Curl-first supporter fetch with lazy Selenium fallback.
+
+        Bandcamp's wishlist page and the collection_items API both serve the
+        full data anonymously when called from a residential IP, so we skip
+        the browser entirely when we can. Chrome only spins up if curl
+        returns None (e.g. blocked from a datacenter IP), and the driver
+        pool is created on first miss, not up front.
+        """
+        items = self._get_supporter_items_via_curl(
+            username, data_key, first_page_only=first_page_only
+        )
+        if items is not None:
+            return items
+
+        # Fallback to Selenium. Smaller pool than the old default — most
+        # supporters now go through curl, so this only handles outliers.
+        fallback_pool_size = min(3, _resolve_pool_size(0))
+        try:
+            driver_pool = self._driver_manager.get_driver_pool(fallback_pool_size)
+        except Exception:
+            return []
+        try:
+            driver = driver_pool.get(timeout=30)
+        except Exception:
+            return []
+        try:
+            if data_key == "wishlist_data":
+                return self._get_supporter_wishlist_with_driver(
+                    username, driver,
+                    first_page_only=first_page_only,
+                    extract_tags_flag=False,
+                )
+            return self._get_supporter_purchases_with_driver(
+                username, driver,
+                first_page_only=first_page_only,
+                extract_tags_flag=False,
+            )
+        except Exception:
+            return []
+        finally:
+            try:
+                driver_pool.put_nowait(driver)
+            except Exception:
+                try:
+                    driver_pool.put(driver, timeout=2)
+                except Exception:
+                    pass
+
+    def _hydrate_tags_for_items(self, item_ids: List[str]) -> None:
+        """Fetch tags for a small set of items in parallel and store in cache.
+
+        Used only on the final ranked list (top-N) or on the unique candidate
+        set in tag-similarity mode — never per supporter purchase. This is the
+        single biggest reason the recommender is faster: we don't pay a curl
+        round-trip per item, only per result we're actually going to return.
+        """
+        # Pick items that are in the cache but have no tags yet, and have a real URL.
+        targets: List[str] = []
+        with self._cache_lock:
+            for item_id in item_ids:
+                info = self.item_cache.get(item_id)
+                if info and not info.get("tags") and info.get("item_url"):
+                    # Skip placeholder URLs we synthesized in _store_item_metadata
+                    if "/album/" + item_id not in info["item_url"]:
+                        targets.append(item_id)
+
+        if not targets:
+            return
+
+        def _fetch_one(item_id: str) -> None:
+            with self._cache_lock:
+                info = self.item_cache.get(item_id)
+                url = info.get("item_url") if info else None
+            if not url:
+                return
+            tags = extract_tags(url)
+            if not tags:
+                return
+            with self._cache_lock:
+                if item_id in self.item_cache:
+                    self.item_cache[item_id]["tags"] = tags
+
+        # Small bounded pool so we don't hammer Bandcamp.
+        workers = min(_DEFAULT_TAG_WORKERS, len(targets))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_fetch_one, targets))
 
     def _get_item_info_from_id(self, item_id: str) -> Optional[Dict[str, Any]]:
         """Get item info from tralbum_id using cache.
@@ -462,21 +684,11 @@ class SupporterRecommender:
         completed_count = 0
         completed_lock = Lock()
 
-        # Initialize driver pool
-        pool_size = min(3, total_supporters)
-        if progress_callback:
-            progress_callback("Initializing driver pool (this may take a moment)...", 0, total_supporters, 0)
-
-        try:
-            driver_pool = self._driver_manager.get_driver_pool(pool_size)
-        except Exception as e:
-            if progress_callback:
-                progress_callback(f"Error initializing driver pool: {e}", 0, total_supporters, 0)
-            return []
-
+        # Curl-first: skip driver pool init. Workers fall back to Selenium
+        # only for supporters where curl fails (rare on a residential IP).
         if progress_callback:
             progress_callback(
-                f"Driver pool ready. Fetching items from {total_supporters} supporters...",
+                f"Fetching items from {total_supporters} supporters...",
                 0,
                 total_supporters,
                 0
@@ -484,27 +696,13 @@ class SupporterRecommender:
 
         def fetch_supporter_items(supporter):
             """Fetch items for a single supporter (thread-safe)."""
-            driver = None
             try:
-                try:
-                    driver = driver_pool.get(timeout=30)
-                except Exception as e:
-                    return [], supporter, f"Timeout getting driver: {str(e)[:50]}"
-
-                try:
-                    items = self._get_supporter_purchases_with_driver(supporter, driver)
-                    return items, supporter, None
-                except Exception as e:
-                    return [], supporter, f"Error fetching items: {str(e)[:50]}"
-            finally:
-                if driver:
-                    try:
-                        driver_pool.put_nowait(driver)
-                    except Exception:
-                        try:
-                            driver_pool.put(driver, timeout=2)
-                        except Exception:
-                            pass
+                items = self._get_supporter_items_curl_first(
+                    supporter, "collection_data"
+                )
+                return items, supporter, None
+            except Exception as e:
+                return [], supporter, f"Error fetching items: {str(e)[:50]}"
 
         max_workers = min(15, total_supporters)
 
@@ -514,76 +712,74 @@ class SupporterRecommender:
                 for supporter in supporters
             }
 
-            # Process futures with manual polling to avoid indefinite blocking
-            pending_futures = dict(future_to_supporter)
-            future_start_times = {f: time.time() for f in pending_futures.keys()}
-            max_future_time = 30  # Max seconds per future
+            # Block on futures.wait instead of polling+sleep. Same per-future
+            # timeout semantics (30s), but no 0.5s idle pause between batches.
+            pending = set(future_to_supporter.keys())
+            future_start_times = {f: time.time() for f in pending}
+            max_future_time = 30
 
-            while pending_futures:
-                completed_this_round = []
+            while pending:
+                done, _still_pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
 
-                for future, supporter in list(pending_futures.items()):
-                    # Check if future is done
-                    if future.done():
-                        completed_this_round.append(future)
-                        try:
-                            items, supporter, error = future.result(timeout=1)
-                            with completed_lock:
-                                if error:
-                                    if progress_callback:
-                                        progress_callback(
-                                            f"Error from {supporter}: {error[:30]}... ({completed_count + 1}/{total_supporters})",
-                                            completed_count + 1,
-                                            total_supporters,
-                                            0
-                                        )
-                                else:
-                                    all_items.extend(items)
-                                    if progress_callback:
-                                        elapsed = time.time() - start_time
-                                        avg_time = elapsed / completed_count if completed_count > 0 else 2.0
-                                        remaining = total_supporters - completed_count
-                                        estimated_seconds = avg_time * remaining
-                                        progress_callback(
-                                            f"Fetched {len(items)} items from {supporter} ({completed_count + 1}/{total_supporters})...",
-                                            completed_count + 1,
-                                            total_supporters,
-                                            int(estimated_seconds)
-                                        )
-                                completed_count += 1
-                        except Exception as e:
-                            with completed_lock:
-                                completed_count += 1
+                for future in done:
+                    supporter = future_to_supporter[future]
+                    try:
+                        items, supporter, error = future.result(timeout=1)
+                        with completed_lock:
+                            if error:
                                 if progress_callback:
-                                    error_msg = str(e)[:50] if str(e) else "Unknown error"
                                     progress_callback(
-                                        f"Error from {supporter}: {error_msg}... ({completed_count}/{total_supporters})",
-                                        completed_count,
+                                        f"Error from {supporter}: {error[:30]}... ({completed_count + 1}/{total_supporters})",
+                                        completed_count + 1,
                                         total_supporters,
                                         0
                                     )
-                    # Check for timeout
-                    elif time.time() - future_start_times[future] > max_future_time:
-                        completed_this_round.append(future)
-                        future.cancel()
+                            else:
+                                all_items.extend(items)
+                                if progress_callback:
+                                    elapsed = time.time() - start_time
+                                    avg_time = elapsed / completed_count if completed_count > 0 else 2.0
+                                    remaining = total_supporters - completed_count
+                                    estimated_seconds = avg_time * remaining
+                                    progress_callback(
+                                        f"Fetched {len(items)} items from {supporter} ({completed_count + 1}/{total_supporters})...",
+                                        completed_count + 1,
+                                        total_supporters,
+                                        int(estimated_seconds)
+                                    )
+                            completed_count += 1
+                    except Exception as e:
                         with completed_lock:
                             completed_count += 1
                             if progress_callback:
+                                error_msg = str(e)[:50] if str(e) else "Unknown error"
                                 progress_callback(
-                                    f"Timeout from {supporter} ({completed_count}/{total_supporters})...",
+                                    f"Error from {supporter}: {error_msg}... ({completed_count}/{total_supporters})",
                                     completed_count,
                                     total_supporters,
                                     0
                                 )
 
-                # Remove completed futures
-                for future in completed_this_round:
-                    pending_futures.pop(future, None)
-                    future_start_times.pop(future, None)
+                # Sweep for futures that have exceeded max_future_time.
+                now = time.time()
+                timed_out = {
+                    f for f in pending - done
+                    if now - future_start_times[f] > max_future_time
+                }
+                for future in timed_out:
+                    future.cancel()
+                    with completed_lock:
+                        completed_count += 1
+                        if progress_callback:
+                            progress_callback(
+                                f"Timeout from {future_to_supporter[future]} ({completed_count}/{total_supporters})...",
+                                completed_count,
+                                total_supporters,
+                                0
+                            )
 
-                # If no futures completed, wait a bit before checking again
-                if not completed_this_round and pending_futures:
-                    time.sleep(0.5)  # Small sleep to avoid busy-waiting
+                pending -= done
+                pending -= timed_out
 
         if progress_callback:
             progress_callback("Calculating tag similarities...", total_supporters, total_supporters, 0)
@@ -592,6 +788,19 @@ class SupporterRecommender:
         unique_items = list(set(all_items))
         if original_item_id and original_item_id in unique_items:
             unique_items.remove(original_item_id)
+
+        # Tag-similarity mode needs tags up front (they feed the score), but
+        # we still defer the fetch to right here, instead of doing it inside
+        # every per-supporter worker. Same total tag-fetches, but bounded and
+        # batched so it doesn't compete with collection scrapes for drivers.
+        if progress_callback:
+            progress_callback(
+                f"Fetching tags for {len(unique_items)} candidate items...",
+                total_supporters,
+                total_supporters,
+                0,
+            )
+        self._hydrate_tags_for_items(unique_items)
 
         # Build tag frequency map for TF-IDF weighting
         tag_frequencies: Dict[str, int] = Counter()
@@ -698,9 +907,6 @@ class SupporterRecommender:
         Returns:
             List of item dictionaries with item_title, band_name, item_url, tags, and overlap_count
         """
-        import threading
-        from concurrent.futures import ThreadPoolExecutor
-        
         # Get supporters from the album
         if progress_callback:
             progress_callback("Extracting supporters from album page...", 0, 0, 0)
@@ -730,36 +936,25 @@ class SupporterRecommender:
         completed_count = 0
         completed_lock = Lock()
         
-        # Initialize driver pool
-        pool_size = min(3, total_supporters)
+        # Curl-first: no driver pool init up front.
         if progress_callback:
-            progress_callback("Initializing driver pool (this may take a moment)...", 0, total_supporters, 0)
-        driver_pool = self._driver_manager.get_driver_pool(pool_size)
-        if progress_callback:
-            progress_callback(f"Driver pool ready. Fetching items from {total_supporters} supporters...", 0, total_supporters, 0)
-        
+            progress_callback(
+                f"Fetching items from {total_supporters} supporters...",
+                0,
+                total_supporters,
+                0,
+            )
+
+        data_key = "wishlist_data" if use_wishlist else "collection_data"
+
         def fetch_supporter_items(supporter):
-            """Fetch items (purchases or wishlist) for a single supporter (thread-safe)."""
-            driver = None
+            """Fetch items (purchases or wishlist) for a single supporter."""
             try:
-                driver = driver_pool.get(timeout=30)
-                if use_wishlist:
-                    items = self._get_supporter_wishlist_with_driver(supporter, driver, extract_tags_flag=False)
-                else:
-                    items = self._get_supporter_purchases_with_driver(supporter, driver, extract_tags_flag=False)
+                items = self._get_supporter_items_curl_first(supporter, data_key)
                 return items, supporter
             except Exception:
                 return [], supporter
-            finally:
-                if driver:
-                    try:
-                        driver_pool.put_nowait(driver)
-                    except Exception:
-                        try:
-                            driver_pool.put(driver, timeout=2)
-                        except Exception:
-                            pass
-        
+
         # Use ThreadPoolExecutor for parallel processing
         max_workers = min(15, total_supporters)
         
@@ -769,68 +964,66 @@ class SupporterRecommender:
                 for supporter in selected_supporters
             }
             
-            # Use manual polling to avoid indefinite blocking
-            pending_futures = dict(future_to_supporter)
-            future_start_times = {f: time.time() for f in pending_futures.keys()}
-            max_future_time = 30  # Max seconds per future
-            
-            while pending_futures:
-                completed_this_round = []
-                
-                for future, supporter in list(pending_futures.items()):
-                    # Check if future is done
-                    if future.done():
-                        completed_this_round.append(future)
-                        try:
-                            items, supporter = future.result(timeout=1)
-                            with completed_lock:
-                                all_items.extend(items)
-                                completed_count += 1
-                                
-                                if progress_callback:
-                                    elapsed = time.time() - start_time
-                                    avg_time = elapsed / completed_count if completed_count > 0 else 2.0
-                                    remaining = total_supporters - completed_count
-                                    estimated_seconds = avg_time * remaining
-                                    item_type = "wishlist items" if use_wishlist else "purchases"
-                                    progress_callback(
-                                        f"Fetched {len(items)} {item_type} from {supporter} ({completed_count}/{total_supporters})...",
-                                        completed_count,
-                                        total_supporters,
-                                        int(estimated_seconds)
-                                    )
-                        except Exception:
-                            with completed_lock:
-                                completed_count += 1
-                                if progress_callback:
-                                    progress_callback(
-                                        f"Error from {supporter} ({completed_count}/{total_supporters})...",
-                                        completed_count,
-                                        total_supporters,
-                                        0
-                                    )
-                    # Check for timeout
-                    elif time.time() - future_start_times[future] > max_future_time:
-                        completed_this_round.append(future)
-                        future.cancel()
+            # Block on futures.wait instead of polling+sleep. Same per-future
+            # timeout semantics (30s), but no 0.5s idle pause between batches.
+            pending = set(future_to_supporter.keys())
+            future_start_times = {f: time.time() for f in pending}
+            max_future_time = 30
+
+            while pending:
+                done, _still_pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+
+                for future in done:
+                    supporter = future_to_supporter[future]
+                    try:
+                        items, supporter = future.result(timeout=1)
+                        with completed_lock:
+                            all_items.extend(items)
+                            completed_count += 1
+
+                            if progress_callback:
+                                elapsed = time.time() - start_time
+                                avg_time = elapsed / completed_count if completed_count > 0 else 2.0
+                                remaining = total_supporters - completed_count
+                                estimated_seconds = avg_time * remaining
+                                item_type = "wishlist items" if use_wishlist else "purchases"
+                                progress_callback(
+                                    f"Fetched {len(items)} {item_type} from {supporter} ({completed_count}/{total_supporters})...",
+                                    completed_count,
+                                    total_supporters,
+                                    int(estimated_seconds)
+                                )
+                    except Exception:
                         with completed_lock:
                             completed_count += 1
                             if progress_callback:
                                 progress_callback(
-                                    f"Timeout from {supporter} ({completed_count}/{total_supporters})...",
+                                    f"Error from {supporter} ({completed_count}/{total_supporters})...",
                                     completed_count,
                                     total_supporters,
                                     0
                                 )
-                
-                # Remove completed futures
-                for future in completed_this_round:
-                    pending_futures.pop(future, None)
-                    future_start_times.pop(future, None)
-                
-                # If no futures completed, wait a bit before checking again
-                if not completed_this_round and pending_futures:
-                    time.sleep(0.5)  # Small sleep to avoid busy-waiting
+
+                # Sweep for futures that have exceeded max_future_time.
+                now = time.time()
+                timed_out = {
+                    f for f in pending - done
+                    if now - future_start_times[f] > max_future_time
+                }
+                for future in timed_out:
+                    future.cancel()
+                    with completed_lock:
+                        completed_count += 1
+                        if progress_callback:
+                            progress_callback(
+                                f"Timeout from {future_to_supporter[future]} ({completed_count}/{total_supporters})...",
+                                completed_count,
+                                total_supporters,
+                                0
+                            )
+
+                pending -= done
+                pending -= timed_out
         
         if not all_items:
             if progress_callback:

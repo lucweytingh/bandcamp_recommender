@@ -27,9 +27,11 @@ def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
         wishlist_url = f"https://bandcamp.com/{username}/wishlist"
         driver.get(wishlist_url)
         
-        # Wait for pagedata element
+        # Wait for pagedata element. Pagedata is server-rendered so it
+        # resolves quickly when the page loads at all; long timeouts mostly
+        # wait out failures.
         try:
-            WebDriverWait(driver, 3).until(
+            WebDriverWait(driver, 1.5).until(
                 EC.presence_of_element_located((By.ID, "pagedata"))
             )
         except Exception:
@@ -37,7 +39,7 @@ def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
             profile_url = f"https://bandcamp.com/{username}"
             driver.get(profile_url)
             try:
-                WebDriverWait(driver, 3).until(
+                WebDriverWait(driver, 1.5).until(
                     EC.presence_of_element_located((By.ID, "pagedata"))
                 )
             except Exception:
