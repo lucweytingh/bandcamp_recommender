@@ -67,15 +67,29 @@ Examples:
         default=2,
         help="Minimum number of supporters who must have purchased an item (default: 2)"
     )
-    
+    parser.add_argument(
+        "--bpm",
+        action="store_true",
+        help="Detect a BPM for each recommendation's first preview track. "
+             "Requires librosa (optional dependency)."
+    )
+    parser.add_argument(
+        "--bpm-method",
+        choices=("auto", "joe_sullivan", "librosa"),
+        default="auto",
+        help="BPM detection backend (default: auto = joe_sullivan with librosa fallback)."
+    )
+
     args = parser.parse_args()
-    
+
     item_url = args.url
     max_recommendations = args.max_recommendations
     min_supporters = args.min_supporters
 
     print(f"Getting recommendations for: {item_url}")
     print(f"Max recommendations: {max_recommendations}, Min supporters: {min_supporters}")
+    if args.bpm:
+        print(f"BPM detection: on ({args.bpm_method})")
     print("-" * 60)
 
     with SupporterRecommender() as recommender:
@@ -84,6 +98,8 @@ Examples:
             max_recommendations=max_recommendations,
             min_supporters=min_supporters,
             progress_callback=progress_callback,
+            include_bpm=args.bpm,
+            bpm_method=args.bpm_method,
         )
         
         # Print newline after progress updates
@@ -105,6 +121,16 @@ Examples:
             print(f"   Supported by {rec['supporters_count']} people who also bought the original")
             if rec.get('tags'):
                 print(f"   Tags: {', '.join(rec['tags'])}")
+            if rec.get('bpm'):
+                bpm_str = f"{round(rec['bpm'])} BPM"
+                conf = rec.get('bpm_confidence')
+                method = rec.get('bpm_method')
+                if conf is not None:
+                    bpm_str += f" (confidence {conf:.2f}"
+                    if method:
+                        bpm_str += f", via {method}"
+                    bpm_str += ")"
+                print(f"   {bpm_str}")
             print()
 
 

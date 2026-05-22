@@ -1,4 +1,18 @@
-"""BPM extraction utilities for Bandcamp tracks."""
+"""BPM extraction utilities for Bandcamp tracks.
+
+Two detection backends are available:
+
+* ``librosa`` — wraps ``librosa.feature.tempo``. Accurate on varied music but
+  pulls in the full librosa stack (numpy, scipy, audioread, …).
+* ``joe_sullivan`` — pure-numpy port of the algorithm used by the Bandcamp
+  BPM browser extension (Joe Sullivan). Bandpasses to the kick band
+  (100–150 Hz), peak-picks in 200 ms windows, folds intervals into a
+  90–180 BPM histogram, and returns the smoothed argmax. Much faster than
+  librosa on kick-driven music; falls back to librosa for non-kick tracks.
+
+Detection results are cached in-process keyed on the audio URL so a long
+session (or a recommendation run that revisits items) only pays once.
+"""
 
 import asyncio
 import io
@@ -6,11 +20,13 @@ import json
 import os
 import re
 import sys
+import threading
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from io import StringIO
-from typing import Any, Dict, List, Optional
-from urllib.request import urlopen
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 
@@ -347,11 +363,321 @@ async def get_all_track_bpms_async(
     
     # Detect BPM for all tracks in parallel
     bpms = await asyncio.gather(*track_tasks, return_exceptions=True)
-    
+
     # Assign BPMs to tracks
     for task_idx, bpm in enumerate(bpms):
         track_idx = track_indices[task_idx]
         if not isinstance(bpm, Exception) and bpm is not None:
             tracks[track_idx]["bpm"] = bpm
-    
+
     return tracks
+
+
+# ---------------------------------------------------------------------------
+# Joe Sullivan / Bandcamp BPM extension algorithm (kick-band peak picker).
+# Ported from .context/browser-bpm-detection.md. Numpy-only after decoding.
+# ---------------------------------------------------------------------------
+
+_BPM_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+_BPM_CACHE_LOCK = threading.Lock()
+
+
+def _download_audio_bytes(
+    audio_url: str,
+    max_bytes: int = 2_097_152,
+    timeout: int = 300,
+) -> Optional[bytes]:
+    """Fetch the first `max_bytes` of an audio URL. Returns None on failure."""
+    try:
+        req = Request(audio_url)
+        req.add_header("Range", f"bytes=0-{max_bytes - 1}")
+        with urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception:
+        try:
+            with urlopen(audio_url, timeout=timeout) as resp:
+                return resp.read(max_bytes)
+        except Exception:
+            return None
+
+
+def _decode_audio_with_librosa(
+    audio_bytes: bytes,
+    duration: float,
+) -> Optional[Tuple[Any, int]]:
+    """Decode audio bytes to (mono_samples, sample_rate) via librosa.load.
+
+    Suppresses mpg123/libsndfile stderr noise the same way the librosa
+    backend does. Returns None if librosa is unavailable or decoding fails.
+    """
+    try:
+        import librosa  # noqa: F401
+    except ImportError:
+        return None
+
+    original_stderr_fd = sys.stderr.fileno()
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    saved_stderr_fd = os.dup(original_stderr_fd)
+    try:
+        os.dup2(devnull_fd, original_stderr_fd)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                import librosa
+                samples, sr = librosa.load(
+                    io.BytesIO(audio_bytes),
+                    sr=None,
+                    duration=duration,
+                    mono=True,
+                )
+                return samples, int(sr)
+            except Exception:
+                return None
+    finally:
+        os.dup2(saved_stderr_fd, original_stderr_fd)
+        os.close(saved_stderr_fd)
+        os.close(devnull_fd)
+
+
+def detect_bpm_joe_sullivan_from_samples(
+    samples: Any,
+    sample_rate: int,
+) -> Optional[Dict[str, Any]]:
+    """Run the Joe Sullivan kick-band peak-picker on a mono numpy array.
+
+    Returns ``{"bpm": int|None, "confidence": float, "peaks": int}`` or
+    ``None`` if numpy is unavailable / samples are empty.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if samples is None or len(samples) < sample_rate:
+        return None
+
+    n = len(samples)
+    # FFT-domain bandpass to 100–150 Hz — equivalent to the JS LP150+HP100
+    # biquad cascade for the purposes of kick-driven peak picking, and
+    # avoids depending on scipy.signal.
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    spectrum = np.fft.rfft(samples)
+    spectrum[(freqs < 100) | (freqs > 150)] = 0
+    filtered = np.abs(np.fft.irfft(spectrum, n=n))
+
+    global_max = float(filtered.max())
+    if global_max <= 0:
+        return {"bpm": None, "confidence": 0.0, "peaks": 0}
+    threshold = 0.9 * global_max
+    window_size = max(1, int(sample_rate * 0.2))
+    min_spacing = sample_rate * 0.15
+
+    peaks: List[int] = []
+    for start in range(0, n, window_size):
+        end = min(start + window_size, n)
+        chunk = filtered[start:end]
+        if chunk.size == 0:
+            break
+        local_max = float(chunk.max())
+        if local_max < threshold:
+            continue
+        local_idx = start + int(chunk.argmax())
+        if peaks and local_idx - peaks[-1] < min_spacing:
+            continue
+        peaks.append(local_idx)
+
+    if len(peaks) < 8:
+        return {"bpm": None, "confidence": 0.0, "peaks": len(peaks)}
+
+    histogram: Dict[int, int] = {}
+    for i in range(len(peaks)):
+        for j in range(i + 1, min(i + 11, len(peaks))):
+            dt = (peaks[j] - peaks[i]) / sample_rate
+            if dt <= 0:
+                continue
+            bpm = 60.0 / dt
+            while bpm < 90:
+                bpm *= 2
+            while bpm > 180:
+                bpm /= 2
+            bucket = int(round(bpm))
+            histogram[bucket] = histogram.get(bucket, 0) + 1
+
+    if not histogram:
+        return {"bpm": None, "confidence": 0.0, "peaks": len(peaks)}
+
+    total_votes = sum(histogram.values())
+    best_bucket = -1
+    best_score = -1
+    for bucket, count in histogram.items():
+        # ±1 neighbourhood smooths quantisation jitter at fractional BPMs.
+        score = (
+            count
+            + histogram.get(bucket - 1, 0)
+            + histogram.get(bucket + 1, 0)
+        )
+        if score > best_score:
+            best_score = score
+            best_bucket = bucket
+    confidence = best_score / total_votes if total_votes > 0 else 0.0
+    return {
+        "bpm": best_bucket,
+        "confidence": confidence,
+        "peaks": len(peaks),
+    }
+
+
+def detect_bpm_joe_sullivan(
+    audio_url: str,
+    duration: float = 60.0,
+    timeout: int = 300,
+) -> Optional[Dict[str, Any]]:
+    """Joe Sullivan BPM detection from an audio URL.
+
+    Downloads the first ~2 MB of audio, decodes via librosa.load, and runs
+    the kick-band peak picker. Returns the same shape as
+    :func:`detect_bpm_joe_sullivan_from_samples`, or ``None`` if the audio
+    could not be fetched or decoded.
+    """
+    audio_bytes = _download_audio_bytes(audio_url, timeout=timeout)
+    if not audio_bytes:
+        return None
+    decoded = _decode_audio_with_librosa(audio_bytes, duration)
+    if decoded is None:
+        return None
+    samples, sr = decoded
+    return detect_bpm_joe_sullivan_from_samples(samples, sr)
+
+
+def detect_bpm(
+    audio_url: str,
+    method: str = "auto",
+    duration: float = 60.0,
+    use_cache: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Detect BPM for an audio URL using a chosen backend.
+
+    Args:
+        audio_url: Direct URL to the audio file (e.g. a bcbits.com preview).
+        method: ``"joe_sullivan"``, ``"librosa"``, or ``"auto"``.
+            ``"auto"`` tries Joe Sullivan first and falls back to librosa
+            when the result is missing or low-confidence.
+        duration: Seconds of audio to analyse (first N seconds).
+        use_cache: Whether to consult and populate the process-level cache
+            keyed on ``(method, audio_url)``.
+
+    Returns:
+        ``{"bpm": float, "confidence": float, "method": str}`` or ``None``
+        if no backend produced a usable result.
+    """
+    if method not in ("auto", "joe_sullivan", "librosa"):
+        raise ValueError(f"Unknown BPM method: {method!r}")
+
+    cache_key = f"{method}::{audio_url}"
+    if use_cache:
+        with _BPM_CACHE_LOCK:
+            if cache_key in _BPM_CACHE:
+                return _BPM_CACHE[cache_key]
+
+    result: Optional[Dict[str, Any]] = None
+
+    if method in ("joe_sullivan", "auto"):
+        js = detect_bpm_joe_sullivan(audio_url, duration=duration)
+        if js and js.get("bpm"):
+            result = {
+                "bpm": float(js["bpm"]),
+                "confidence": float(js.get("confidence", 0.0)),
+                "method": "joe_sullivan",
+            }
+
+    if method == "librosa" or (method == "auto" and (result is None or result["confidence"] < 0.05)):
+        librosa_bpm = detect_bpm_from_audio_url(audio_url, duration=duration)
+        if librosa_bpm:
+            # librosa's tempo tracker doesn't expose a confidence score, so we
+            # report 1.0 when it returns *anything* and let callers decide
+            # whether to trust it.
+            result = {
+                "bpm": float(librosa_bpm),
+                "confidence": 1.0,
+                "method": "librosa",
+            }
+
+    if use_cache:
+        with _BPM_CACHE_LOCK:
+            _BPM_CACHE[cache_key] = result
+    return result
+
+
+def clear_bpm_cache() -> None:
+    """Clear the in-process BPM cache."""
+    with _BPM_CACHE_LOCK:
+        _BPM_CACHE.clear()
+
+
+def get_audio_url_for_item(
+    item_url: str,
+    track_index: int = 0,
+) -> Optional[str]:
+    """Return the preview audio URL for a Bandcamp item.
+
+    Defaults to the first track. Returns ``None`` if the page exposes no
+    playable preview (e.g. a tracks-only release that isn't streamable).
+    """
+    tracks = extract_track_info(item_url)
+    if not tracks or track_index >= len(tracks):
+        return None
+    return tracks[track_index].get("audio_path")
+
+
+def attach_bpms(
+    items: List[Dict[str, Any]],
+    method: str = "auto",
+    duration: float = 60.0,
+    max_workers: int = 3,
+    progress_callback: Optional[Callable] = None,
+) -> List[Dict[str, Any]]:
+    """Attach BPM information to each item with an ``item_url``.
+
+    Items are mutated in place and also returned for chaining. Mutations:
+
+    * ``bpm`` — detected tempo (float).
+    * ``bpm_confidence`` — detector confidence in 0..1.
+    * ``bpm_method`` — which backend produced the value.
+
+    Items without a streamable preview are left untouched (no ``bpm`` key).
+
+    ``progress_callback`` follows the recommender convention:
+    ``(status, current, total, estimated_seconds)``.
+    """
+    targets = [item for item in items if item.get("item_url")]
+    total = len(targets)
+    if total == 0:
+        return items
+
+    done = 0
+    lock = threading.Lock()
+
+    def _process(item: Dict[str, Any]) -> None:
+        nonlocal done
+        audio_url = get_audio_url_for_item(item["item_url"])
+        if audio_url:
+            result = detect_bpm(audio_url, method=method, duration=duration)
+            if result and result.get("bpm"):
+                item["bpm"] = result["bpm"]
+                item["bpm_confidence"] = result.get("confidence", 0.0)
+                item["bpm_method"] = result.get("method", method)
+        with lock:
+            done += 1
+            current = done
+        if progress_callback:
+            progress_callback(
+                f"Detected BPM for {current}/{total} items",
+                current,
+                total,
+                0,
+            )
+
+    workers = max(1, min(max_workers, total))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_process, targets))
+
+    return items
