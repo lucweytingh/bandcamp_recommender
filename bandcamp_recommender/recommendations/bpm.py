@@ -594,6 +594,42 @@ def clear_bpm_cache() -> None:
         _BPM_CACHE.clear()
 
 
+_SEED_BPM_CACHE: Dict[Tuple[str, str, float], Optional[Dict[str, Any]]] = {}
+_SEED_BPM_CACHE_LOCK = threading.Lock()
+
+
+def get_seed_bpm(
+    item_url: str,
+    method: str = "auto",
+    duration: float = 60.0,
+) -> Optional[Dict[str, Any]]:
+    """Detect (and cache) the BPM for a seed Bandcamp item URL.
+
+    Resolves the first playable preview via ``get_audio_url_for_item`` and
+    hands off to :func:`detect_bpm`. Results are cached on
+    ``(item_url, method, duration)`` so re-running the recommender in the
+    same process doesn't re-fetch the album page.
+    """
+    cache_key = (item_url, method, float(duration))
+    with _SEED_BPM_CACHE_LOCK:
+        if cache_key in _SEED_BPM_CACHE:
+            return _SEED_BPM_CACHE[cache_key]
+    audio_url = get_audio_url_for_item(item_url)
+    if not audio_url:
+        result = None
+    else:
+        result = detect_bpm(audio_url, method=method, duration=duration)
+    with _SEED_BPM_CACHE_LOCK:
+        _SEED_BPM_CACHE[cache_key] = result
+    return result
+
+
+def clear_seed_bpm_cache() -> None:
+    """Clear the process-level seed BPM cache."""
+    with _SEED_BPM_CACHE_LOCK:
+        _SEED_BPM_CACHE.clear()
+
+
 def get_audio_url_for_item(
     item_url: str,
     track_index: int = 0,
