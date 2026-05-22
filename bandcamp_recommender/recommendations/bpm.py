@@ -439,6 +439,28 @@ def _decode_audio_with_librosa(
         os.close(devnull_fd)
 
 
+def _load_audio_segment(
+    audio_url: str,
+    duration: float = 60.0,
+    timeout: int = 300,
+    max_bytes: int = 2_097_152,
+) -> Optional[Tuple[Any, int]]:
+    """Download + decode the first `duration` seconds of an audio URL.
+
+    Single-shot helper for callers that want a decoded mono numpy array and
+    sample rate. Returns ``None`` if the audio cannot be fetched or decoded
+    (network failure, librosa missing, unsupported format).
+
+    Both ``bpm.detect_bpm_joe_sullivan`` and ``intensity.score_intensity``
+    route through this helper so a track downloaded for one detector can be
+    decoded once and reused by the other (see ``intensity.attach_audio_features``).
+    """
+    audio_bytes = _download_audio_bytes(audio_url, max_bytes=max_bytes, timeout=timeout)
+    if not audio_bytes:
+        return None
+    return _decode_audio_with_librosa(audio_bytes, duration)
+
+
 def detect_bpm_joe_sullivan_from_samples(
     samples: Any,
     sample_rate: int,
