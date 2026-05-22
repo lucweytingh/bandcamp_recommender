@@ -79,6 +79,12 @@ Examples:
         default="auto",
         help="BPM detection backend (default: auto = joe_sullivan with librosa fallback)."
     )
+    parser.add_argument(
+        "--intensity",
+        action="store_true",
+        help="Attach a 0..1 audio intensity score to each recommendation "
+             "(display only, no filtering). Requires librosa."
+    )
 
     args = parser.parse_args()
 
@@ -90,6 +96,8 @@ Examples:
     print(f"Max recommendations: {max_recommendations}, Min supporters: {min_supporters}")
     if args.bpm:
         print(f"BPM detection: on ({args.bpm_method})")
+    if args.intensity:
+        print("Intensity scoring: on")
     print("-" * 60)
 
     with SupporterRecommender() as recommender:
@@ -100,6 +108,7 @@ Examples:
             progress_callback=progress_callback,
             include_bpm=args.bpm,
             bpm_method=args.bpm_method,
+            include_intensity=args.intensity,
         )
         
         # Print newline after progress updates
@@ -131,6 +140,8 @@ Examples:
                         bpm_str += f", via {method}"
                     bpm_str += ")"
                 print(f"   {bpm_str}")
+            if rec.get('intensity') is not None:
+                print(f"   Intensity: {rec['intensity']:.2f}")
             print()
 
 
