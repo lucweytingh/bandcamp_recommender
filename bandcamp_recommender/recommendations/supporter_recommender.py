@@ -294,9 +294,8 @@ class SupporterRecommender:
                 # detection and just trim to the requested size.
                 recommendations = recommendations[:max_recommendations]
             else:
-                # When include_bpm already ran above, this call still walks every item
-                # and calls get_audio_url_for_item again — but detect_bpm short-circuits
-                # via the audio-URL cache, so no redundant download/decode happens.
+                # attach_bpms is idempotent — items with `bpm` already set (from the
+                # include_bpm pass above) are skipped without a page fetch.
                 if progress_callback:
                     progress_callback(
                         "Detecting BPMs for expanded candidate pool...",
@@ -314,7 +313,7 @@ class SupporterRecommender:
                 alpha = _resolve_bpm_rerank_alpha()
                 for rec in recommendations:
                     cand_bpm = rec.get("bpm")
-                    if cand_bpm:
+                    if cand_bpm is not None:
                         rec["bpm_distance"] = octave_tolerant_bpm_distance(
                             seed_bpm, float(cand_bpm)
                         )

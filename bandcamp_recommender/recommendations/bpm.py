@@ -675,6 +675,20 @@ def attach_bpms(
 
     def _process(item: Dict[str, Any]) -> None:
         nonlocal done
+        if item.get("bpm") is not None:
+            # Already detected by a prior call (e.g. include_bpm before
+            # bpm_match). Skip the page-fetch + decode round-trip entirely.
+            with lock:
+                done += 1
+                current = done
+            if progress_callback:
+                progress_callback(
+                    f"Detected BPM for {current}/{total} items",
+                    current,
+                    total,
+                    0,
+                )
+            return
         audio_url = get_audio_url_for_item(item["item_url"])
         if audio_url:
             result = detect_bpm(audio_url, method=method, duration=duration)

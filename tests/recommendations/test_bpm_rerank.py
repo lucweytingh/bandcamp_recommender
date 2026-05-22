@@ -301,5 +301,25 @@ class BpmMatchRecommendationsTests(unittest.TestCase):
             self.assertIsNone(r["bpm_distance"])
 
 
+class AttachBpmsIdempotencyTests(unittest.TestCase):
+    def test_skips_items_with_bpm_already_set(self):
+        items = [
+            {"item_url": "https://x/already", "bpm": 128.0},
+            {"item_url": "https://x/fresh"},
+        ]
+        audio_calls: List[str] = []
+
+        def fake_audio(url, track_index=0):
+            audio_calls.append(url)
+            return None  # → no bpm set for "fresh"
+
+        with patch.object(bpm_module, "get_audio_url_for_item", side_effect=fake_audio):
+            bpm_module.attach_bpms(items)
+
+        self.assertEqual(audio_calls, ["https://x/fresh"])
+        self.assertEqual(items[0]["bpm"], 128.0)
+        self.assertNotIn("bpm", items[1])
+
+
 if __name__ == "__main__":
     unittest.main()
