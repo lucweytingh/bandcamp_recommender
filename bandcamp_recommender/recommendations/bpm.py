@@ -330,6 +330,20 @@ async def get_all_track_bpms_async(
 # Ported from .context/browser-bpm-detection.md. Numpy-only after decoding.
 # ---------------------------------------------------------------------------
 
+
+def octave_tolerant_bpm_distance(seed_bpm: float, candidate_bpm: float) -> float:
+    """Distance between two BPMs that treats half/double-time as near.
+
+    Returns ``min(|seed - cand|, |seed - 2*cand|, |2*seed - cand|)``.
+    Both inputs must be positive floats; callers are responsible for
+    guarding against ``None``.
+    """
+    delta = abs(seed_bpm - candidate_bpm)
+    half = abs(seed_bpm - 2.0 * candidate_bpm)
+    double = abs(2.0 * seed_bpm - candidate_bpm)
+    return float(min(delta, half, double))
+
+
 _BPM_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 _BPM_CACHE_LOCK = threading.Lock()
 
