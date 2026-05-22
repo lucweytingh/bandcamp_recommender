@@ -79,6 +79,14 @@ Examples:
         default="auto",
         help="BPM detection backend (default: auto = joe_sullivan with librosa fallback)."
     )
+    parser.add_argument(
+        "--bpm-match",
+        action="store_true",
+        help="Expand the candidate pool, detect BPM for each candidate, and "
+             "re-rank by supporters_count - α * octave-tolerant BPM distance "
+             "from the seed track. α defaults to 0.05 (set BANDCAMP_BPM_RERANK_ALPHA "
+             "to override). Implies --bpm."
+    )
 
     args = parser.parse_args()
 
@@ -88,8 +96,9 @@ Examples:
 
     print(f"Getting recommendations for: {item_url}")
     print(f"Max recommendations: {max_recommendations}, Min supporters: {min_supporters}")
-    if args.bpm:
-        print(f"BPM detection: on ({args.bpm_method})")
+    if args.bpm or args.bpm_match:
+        mode = "match+rerank" if args.bpm_match else "on"
+        print(f"BPM detection: {mode} ({args.bpm_method})")
     print("-" * 60)
 
     with SupporterRecommender() as recommender:
@@ -98,8 +107,9 @@ Examples:
             max_recommendations=max_recommendations,
             min_supporters=min_supporters,
             progress_callback=progress_callback,
-            include_bpm=args.bpm,
+            include_bpm=args.bpm or args.bpm_match,
             bpm_method=args.bpm_method,
+            bpm_match=args.bpm_match,
         )
         
         # Print newline after progress updates
@@ -131,6 +141,8 @@ Examples:
                         bpm_str += f", via {method}"
                     bpm_str += ")"
                 print(f"   {bpm_str}")
+            if rec.get('bpm_distance') is not None:
+                print(f"   BPM distance from seed: {rec['bpm_distance']:.1f}")
             print()
 
 
