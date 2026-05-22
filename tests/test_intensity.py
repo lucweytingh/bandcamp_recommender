@@ -8,7 +8,6 @@ librosa.onset.onset_detect) rather than supplying real audio.
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pytest
 
 from bandcamp_recommender.recommendations import intensity
 
@@ -51,7 +50,7 @@ def test_party_exemplar_high_intensity():
     samples[::sr // 4] = 0.9
 
     mock_librosa = _mock_librosa(
-        rms_values=[0.28, 0.30, 0.32, 0.29],       # near max
+        rms_values=[0.29, 0.31, 0.33, 0.30],       # near max
         centroid_value=3800.0,                      # bright
         onsets=list(range(0, sr * 10, sr // 8)),    # ~8 onsets/sec
     )
