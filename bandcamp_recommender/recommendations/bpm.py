@@ -380,6 +380,7 @@ async def get_all_track_bpms_async(
 
 _BPM_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 _BPM_CACHE_LOCK = threading.Lock()
+_STDERR_REDIRECT_LOCK = threading.Lock()
 
 
 def _download_audio_bytes(
@@ -415,28 +416,32 @@ def _decode_audio_with_librosa(
     except ImportError:
         return None
 
-    original_stderr_fd = sys.stderr.fileno()
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    saved_stderr_fd = os.dup(original_stderr_fd)
-    try:
-        os.dup2(devnull_fd, original_stderr_fd)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            try:
-                import librosa
-                samples, sr = librosa.load(
-                    io.BytesIO(audio_bytes),
-                    sr=None,
-                    duration=duration,
-                    mono=True,
-                )
-                return samples, int(sr)
-            except Exception:
-                return None
-    finally:
-        os.dup2(saved_stderr_fd, original_stderr_fd)
-        os.close(saved_stderr_fd)
-        os.close(devnull_fd)
+    # Serialise the fd swap because stderr (fd 2) is process-global. Two
+    # concurrent decodes could otherwise restore each other's fds or
+    # leave stderr permanently redirected to devnull.
+    with _STDERR_REDIRECT_LOCK:
+        original_stderr_fd = sys.stderr.fileno()
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_stderr_fd = os.dup(original_stderr_fd)
+        try:
+            os.dup2(devnull_fd, original_stderr_fd)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                try:
+                    import librosa
+                    samples, sr = librosa.load(
+                        io.BytesIO(audio_bytes),
+                        sr=None,
+                        duration=duration,
+                        mono=True,
+                    )
+                    return samples, int(sr)
+                except Exception:
+                    return None
+        finally:
+            os.dup2(saved_stderr_fd, original_stderr_fd)
+            os.close(saved_stderr_fd)
+            os.close(devnull_fd)
 
 
 def _load_audio_segment(

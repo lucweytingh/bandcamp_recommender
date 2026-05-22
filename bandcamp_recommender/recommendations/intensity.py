@@ -65,6 +65,7 @@ _INTENSITY_CACHE_LOCK = threading.Lock()
 
 
 def _normalize(value: float, lo: float, hi: float) -> float:
+    """Clamp (value - lo) / (hi - lo) to [0, 1]; returns 0.0 when hi <= lo."""
     if hi <= lo:
         return 0.0
     return max(0.0, min(1.0, (value - lo) / (hi - lo)))
@@ -136,6 +137,11 @@ def score_intensity(
     Downloads the first ``duration`` seconds of ``audio_url``, decodes via
     librosa, and runs :func:`score_intensity_from_samples`. Returns
     ``None`` if the audio can't be fetched/decoded or librosa is missing.
+
+    ``audio_url`` must be a direct CDN URL to the audio file (e.g. a
+    ``https://*.bcbits.com/...`` preview), not a Bandcamp album/track page.
+    Use ``bpm.get_audio_url_for_item`` to resolve a page URL first.
+
     Results are cached per-URL in-process so the radio can call this
     lazily without paying twice.
     """
