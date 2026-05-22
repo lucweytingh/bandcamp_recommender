@@ -23,8 +23,6 @@ import sys
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr
-from io import StringIO
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
