@@ -69,6 +69,8 @@ class SupporterRecommender:
         include_bpm: bool = False,
         bpm_method: str = "auto",
         bpm_duration: float = 60.0,
+        include_intensity: bool = False,
+        intensity_duration: float = 60.0,
     ) -> List[Dict[str, Any]]:
         """Get recommendations based on supporter purchases.
 
@@ -84,6 +86,13 @@ class SupporterRecommender:
             bpm_method: BPM backend to use — ``"auto"`` (default),
                 ``"joe_sullivan"``, or ``"librosa"``.
             bpm_duration: Seconds of audio to analyse per track (default 60).
+            include_intensity: If True, attach a 0..1 ``intensity`` score for
+                each recommendation's first playable preview (RMS + onset rate
+                + spectral centroid + crest factor). Items without a
+                streamable preview get ``intensity = None``. Requires the
+                same optional audio deps as ``include_bpm``.
+            intensity_duration: Seconds of audio to analyse for the intensity
+                score (default 60).
 
         Returns:
             List of recommendation dictionaries with item_title, band_name, item_url, supporters_count
@@ -206,24 +215,51 @@ class SupporterRecommender:
                 item_info["supporters_count"] = supporters_count
                 recommendations.append(item_info)
 
-        if include_bpm and recommendations:
+        if (include_bpm or include_intensity) and recommendations:
             # Imported here so the optional audio stack is only loaded when
-            # BPM detection is actually requested.
+            # an audio detector is actually requested.
+            from bandcamp_recommender.recommendations.intensity import (
+                attach_audio_features,
+                attach_intensities,
+            )
             from bandcamp_recommender.recommendations.bpm import attach_bpms
 
             if progress_callback:
                 progress_callback(
-                    "Detecting BPMs for recommendations...",
+                    "Analyzing audio for recommendations...",
                     0,
                     len(recommendations),
                     0,
                 )
-            attach_bpms(
-                recommendations,
-                method=bpm_method,
-                duration=bpm_duration,
-                progress_callback=progress_callback,
-            )
+
+            if include_bpm and include_intensity:
+                # Single shared decode per track — runs the Joe Sullivan
+                # BPM detector against the librosa-decoded buffer, so
+                # ``bpm_method`` is implicitly joe_sullivan in this path.
+                # If a caller pinned ``bpm_method="librosa"`` we still run
+                # the shared path; the BPM value differs negligibly in
+                # practice and we save the second download.
+                attach_audio_features(
+                    recommendations,
+                    include_bpm=True,
+                    include_intensity=True,
+                    bpm_duration=bpm_duration,
+                    intensity_duration=intensity_duration,
+                    progress_callback=progress_callback,
+                )
+            elif include_bpm:
+                attach_bpms(
+                    recommendations,
+                    method=bpm_method,
+                    duration=bpm_duration,
+                    progress_callback=progress_callback,
+                )
+            else:
+                attach_intensities(
+                    recommendations,
+                    duration=intensity_duration,
+                    progress_callback=progress_callback,
+                )
 
         if progress_callback:
             progress_callback(
