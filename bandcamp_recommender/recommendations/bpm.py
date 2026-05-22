@@ -451,9 +451,9 @@ def _load_audio_segment(
     sample rate. Returns ``None`` if the audio cannot be fetched or decoded
     (network failure, librosa missing, unsupported format).
 
-    Both ``bpm.detect_bpm_joe_sullivan`` and ``intensity.score_intensity``
-    route through this helper so a track downloaded for one detector can be
-    decoded once and reused by the other (see ``intensity.attach_audio_features``).
+    Intended for callers (notably ``intensity.score_intensity`` and
+    ``intensity.attach_audio_features``) that want both BPM and intensity
+    features off a single shared decode per track.
     """
     audio_bytes = _download_audio_bytes(audio_url, max_bytes=max_bytes, timeout=timeout)
     if not audio_bytes:
