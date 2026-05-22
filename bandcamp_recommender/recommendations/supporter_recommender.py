@@ -66,6 +66,9 @@ class SupporterRecommender:
         max_recommendations: int = 10,
         min_supporters: int = 2,
         progress_callback: Optional[Callable] = None,
+        include_bpm: bool = False,
+        bpm_method: str = "auto",
+        bpm_duration: float = 60.0,
     ) -> List[Dict[str, Any]]:
         """Get recommendations based on supporter purchases.
 
@@ -74,6 +77,13 @@ class SupporterRecommender:
             max_recommendations: Maximum number of recommendations to return
             min_supporters: Minimum number of supporters who must have purchased an item
             progress_callback: Optional callback function(status, current, total, estimated_seconds)
+            include_bpm: If True, detect a BPM for each recommendation's first
+                playable preview and attach ``bpm`` / ``bpm_confidence`` /
+                ``bpm_method`` keys. Requires optional audio deps (e.g. librosa);
+                items without a streamable preview are left without a BPM.
+            bpm_method: BPM backend to use — ``"auto"`` (default),
+                ``"joe_sullivan"``, or ``"librosa"``.
+            bpm_duration: Seconds of audio to analyse per track (default 60).
 
         Returns:
             List of recommendation dictionaries with item_title, band_name, item_url, supporters_count
@@ -195,6 +205,25 @@ class SupporterRecommender:
             if item_info:
                 item_info["supporters_count"] = supporters_count
                 recommendations.append(item_info)
+
+        if include_bpm and recommendations:
+            # Imported here so the optional audio stack is only loaded when
+            # BPM detection is actually requested.
+            from bandcamp_recommender.recommendations.bpm import attach_bpms
+
+            if progress_callback:
+                progress_callback(
+                    "Detecting BPMs for recommendations...",
+                    0,
+                    len(recommendations),
+                    0,
+                )
+            attach_bpms(
+                recommendations,
+                method=bpm_method,
+                duration=bpm_duration,
+                progress_callback=progress_callback,
+            )
 
         if progress_callback:
             progress_callback(
