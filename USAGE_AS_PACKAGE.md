@@ -203,6 +203,47 @@ with SupporterRecommender() as recommender:
 
 ---
 
+## Audio Intensity Score (for radio-style consumers)
+
+When the caller passes `include_intensity=True`, each recommendation gets
+an `intensity` key in `[0.0, 1.0]` (or `None` if no preview was available).
+The score blends RMS energy, onset rate, spectral centroid, and crest
+factor — see `bandcamp_recommender/recommendations/intensity.py` for the
+normalisation constants and weights.
+
+Typical use from a downstream radio that switches between "chill" and
+"party" modes:
+
+```python
+from bandcamp_recommender import SupporterRecommender
+
+with SupporterRecommender() as recommender:
+    recs = recommender.get_recommendations(
+        wishlist_item_url="https://artist.bandcamp.com/album/name",
+        max_recommendations=30,
+        include_bpm=True,
+        include_intensity=True,
+    )
+
+# Sort low → high for a chill set, high → low for a party set.
+chill = sorted(
+    (r for r in recs if r.get("intensity") is not None),
+    key=lambda r: r["intensity"],
+)
+party = list(reversed(chill))
+
+# Or switch modes by threshold.
+mode = "party" if user_mode == "party" else "chill"
+target = 0.75 if mode == "party" else 0.25
+recs.sort(key=lambda r: abs((r.get("intensity") or 0.5) - target))
+```
+
+When both `include_bpm` and `include_intensity` are True, each track's
+preview audio is downloaded and decoded once and shared between the two
+detectors, so enabling both costs roughly the same as enabling either.
+
+---
+
 ## Notes
 
 - Always use `SupporterRecommender` as a context manager (`with` statement) to ensure proper cleanup
