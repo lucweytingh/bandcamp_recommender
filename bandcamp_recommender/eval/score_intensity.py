@@ -31,9 +31,11 @@ def _score_one(item: Dict) -> tuple[str, Optional[float]]:
     return item_id, 2.0 * raw - 1.0
 
 
-def score_items(items: List[Dict], max_workers: int = 6) -> Dict[str, Optional[float]]:
-    """Parallel intensity scoring. ~1–2s per track on a 60s preview, so
-    a 77-item wishlist with 6 workers is ~20–30s wall clock."""
+def score_items(items: List[Dict], max_workers: int = 2) -> Dict[str, Optional[float]]:
+    """Lightly-parallel intensity scoring (default workers=2, matches
+    ``score_bpm`` since both paths share the librosa decode lock).
+    Higher worker counts only overlap downloads — the actual decode
+    is serialized inside :mod:`bpm._decode_audio_with_librosa`."""
     out: Dict[str, Optional[float]] = {}
     targets = [i for i in items if i.get("item_id")]
     if not targets:
@@ -52,7 +54,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--in", dest="inp", required=True, type=Path)
     p.add_argument("--out", dest="out", required=True, type=Path)
-    p.add_argument("--workers", type=int, default=6)
+    p.add_argument("--workers", type=int, default=2)
     args = p.parse_args()
 
     items = json.loads(args.inp.read_text())

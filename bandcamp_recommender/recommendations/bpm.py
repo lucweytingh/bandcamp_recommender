@@ -439,35 +439,22 @@ def _load_audio_segment(
     timeout: int = 300,
     max_bytes: int = 2_097_152,
 ) -> Optional[Tuple[Any, int]]:
-    """Download + decode the first `duration` seconds of an audio URL.
+    """Download + decode the first ``duration`` seconds of an audio URL.
 
-    Single-shot helper for callers that want a decoded mono numpy array and
-    sample rate. Returns ``None`` if the audio cannot be fetched or decoded
-    (network failure, librosa missing, unsupported format).
+    Single-shot helper that returns ``(mono_samples, sample_rate)`` as a
+    numpy array + int, or ``None`` if the URL could not be fetched or
+    decoded (network failure, librosa missing, unsupported format).
+    Shared by every BPM backend, the intensity feature extractor, and
+    ``attach_audio_features`` so a single network + decode round-trip
+    can feed multiple analyses.
 
-    Intended for callers (notably ``intensity.score_intensity`` and
-    ``intensity.attach_audio_features``) that want both BPM and intensity
-    features off a single shared decode per track.
+    ``max_bytes`` controls the upper bound of the HTTP range fetch; the
+    default (~2 MiB) is enough to cover ~60s of a 256 kbps preview while
+    keeping the network footprint small.
     """
-    audio_bytes = _download_audio_bytes(audio_url, max_bytes=max_bytes, timeout=timeout)
-    if not audio_bytes:
-        return None
-    return _decode_audio_with_librosa(audio_bytes, duration)
-
-
-def _load_audio_segment(
-    audio_url: str,
-    duration: float = 60.0,
-    timeout: int = 300,
-) -> Optional[Tuple[Any, int]]:
-    """Download and decode the first ``duration`` seconds of ``audio_url``.
-
-    Returns ``(mono_samples, sample_rate)`` as a numpy array and int, or
-    ``None`` if the URL could not be fetched or decoded. Shared by every
-    BPM backend (and by callers in Prompts B/C) so a single network +
-    decode round-trip can feed multiple analyses.
-    """
-    audio_bytes = _download_audio_bytes(audio_url, timeout=timeout)
+    audio_bytes = _download_audio_bytes(
+        audio_url, max_bytes=max_bytes, timeout=timeout
+    )
     if not audio_bytes:
         return None
     return _decode_audio_with_librosa(audio_bytes, duration)

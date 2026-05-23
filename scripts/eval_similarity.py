@@ -341,13 +341,26 @@ HTML_TEMPLATE = """<!doctype html>
 
 
 def _esc(s: Any) -> str:
-    return str(s or "").replace("<", "&lt;")
+    """HTML-escape a value for use in text content or an attribute.
+
+    Covers ``&`` first (so it doesn't double-escape the entities we add
+    next), then ``<``/``>`` for text content, and ``"``/``'`` so the
+    same helper is safe inside attribute values like ``href="..."``.
+    """
+    return (
+        str(s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
 
 
 def _audio_html(url: Optional[str]) -> str:
     if not url:
         return ""
-    return f'<audio controls preload="none" src="{url}"></audio>'
+    return f'<audio controls preload="none" src="{_esc(url)}"></audio>'
 
 
 def _format_value(key: str, value: Optional[float]) -> str:
@@ -383,8 +396,8 @@ def _row_html(rank: int, ranked_row: Dict[str, Any], pool_by_id: Dict[str, Dict[
     item = pool_by_id.get(ranked_row["item_id"], {})
     title = _esc(item.get("item_title") or "Unknown")
     artist = _esc(item.get("band_name") or "Unknown")
-    url = item.get("item_url") or "#"
-    audio = item.get("audio_url")
+    url = _esc(item.get("item_url") or "#")
+    audio = _esc(item.get("audio_url")) if item.get("audio_url") else None
     tags = item.get("tags") or []
     tags_html = f'<div class="tg">{_esc(", ".join(tags[:6]))}</div>' if tags else ""
     dist = ranked_row.get("distance")
@@ -429,7 +442,7 @@ def render_html(data: Dict[str, Any]) -> str:
     src_mood_str = f"{src_mood:+.2f}" if src_mood is not None else "·"
     return HTML_TEMPLATE.format(
         n_pool=len(data["pool"]),
-        source_url=source.get("item_url", "#"),
+        source_url=_esc(source.get("item_url") or "#"),
         source_title=_esc(source.get("item_title") or "Unknown"),
         source_artist=_esc(source.get("band_name") or "Unknown"),
         source_tags_html=src_tags_html,

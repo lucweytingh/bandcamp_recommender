@@ -25,9 +25,8 @@ from typing import Dict, List, Optional
 from bandcamp_recommender.recommendations.bpm import detect_bpm
 
 
-_BPM_CHILL = 60.0   # → -1
-_BPM_PIVOT = 110.0  # →  0
-_BPM_PARTY = 160.0  # → +1
+_BPM_PIVOT = 110.0  # mood = 0 here
+_BPM_PARTY = 160.0  # mood = +1 here; chill side mirrors as 60 BPM
 
 
 def _bpm_to_mood(bpm: float) -> float:
@@ -46,11 +45,12 @@ def _score_one(item: Dict) -> tuple[str, Optional[float]]:
     return item_id, _bpm_to_mood(float(result["bpm"]))
 
 
-def score_items(items: List[Dict], max_workers: int = 1) -> Dict[str, Optional[float]]:
-    """Serial BPM scoring. librosa / audioread aren't thread-safe on
-    macOS — even workers=2 sometimes crashes with SIGBUS. workers=1 is
-    slower but reliable. Most decode time is spent inside Joe Sullivan
-    (NumPy, GIL-released) so the parallelism win is small anyway."""
+def score_items(items: List[Dict], max_workers: int = 2) -> Dict[str, Optional[float]]:
+    """Lightly-parallel BPM scoring (default workers=2 to match
+    ``score_intensity``). librosa decode is serialized by
+    ``_STDERR_REDIRECT_LOCK`` in :mod:`bpm`, so workers>1 effectively
+    overlaps downloads only — that's enough on residential networks
+    without risking the macOS SIGBUS we used to hit at workers=6."""
     out: Dict[str, Optional[float]] = {}
     targets = [i for i in items if i.get("item_id")]
     if not targets:
@@ -69,7 +69,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--in", dest="inp", required=True, type=Path)
     p.add_argument("--out", dest="out", required=True, type=Path)
-    p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--workers", type=int, default=2)
     args = p.parse_args()
 
     items = json.loads(args.inp.read_text())
