@@ -25,6 +25,34 @@ def _resolve_pool_size(total_supporters: int) -> int:
         return cap
     return min(cap, total_supporters)
 
+_DEFAULT_BPM_RERANK_ALPHA = 0.05
+
+
+def _resolve_bpm_rerank_alpha() -> float:
+    """Resolve α for the BPM re-rank score from the env, defaulting to 0.05."""
+    raw = os.environ.get("BANDCAMP_BPM_RERANK_ALPHA")
+    if raw is None:
+        return _DEFAULT_BPM_RERANK_ALPHA
+    try:
+        return float(raw)
+    except ValueError:
+        return _DEFAULT_BPM_RERANK_ALPHA
+
+
+def _bpm_rerank_score(
+    supporters_count: int,
+    bpm_distance: Optional[float],
+    alpha: float,
+) -> float:
+    """Combined re-rank score: ``supporters_count - α * bpm_distance``.
+
+    Items with no detectable BPM (``bpm_distance is None``) receive no
+    penalty so they keep their natural supporter-count ranking.
+    """
+    penalty = alpha * bpm_distance if bpm_distance is not None else 0.0
+    return supporters_count - penalty
+
+
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webdriver import WebDriver
@@ -69,6 +97,7 @@ class SupporterRecommender:
         include_bpm: bool = False,
         bpm_method: str = "auto",
         bpm_duration: float = 60.0,
+        bpm_match: bool = False,
     ) -> List[Dict[str, Any]]:
         """Get recommendations based on supporter purchases.
 
@@ -84,6 +113,15 @@ class SupporterRecommender:
             bpm_method: BPM backend to use — ``"auto"`` (default),
                 ``"joe_sullivan"``, or ``"librosa"``.
             bpm_duration: Seconds of audio to analyse per track (default 60).
+            bpm_match: If True, expand the candidate pool to
+                ``max(50, max_recommendations * 3)``, detect BPM for each
+                candidate, and re-rank by
+                ``supporters_count - α * octave_tolerant_bpm_distance``
+                (α from ``BANDCAMP_BPM_RERANK_ALPHA``, default 0.05).
+                Each returned dict gains a ``bpm_distance`` field (None
+                when no BPM could be detected for that item, or when this
+                flag is False). Implies ``include_bpm`` behavior for the
+                returned items.
 
         Returns:
             List of recommendation dictionaries with item_title, band_name, item_url, supporters_count
@@ -186,9 +224,15 @@ class SupporterRecommender:
             for item_id, count in purchase_counter.items()
             if count >= min_supporters
         }
-        top_items = sorted(
+        sorted_items = sorted(
             filtered_items.items(), key=lambda x: x[1], reverse=True
-        )[:max_recommendations]
+        )
+
+        if bpm_match:
+            expanded_pool_size = max(50, max_recommendations * 3)
+            top_items = sorted_items[:expanded_pool_size]
+        else:
+            top_items = sorted_items[:max_recommendations]
 
         if progress_callback:
             progress_callback("Building recommendations...", total_supporters, total_supporters, 0)
@@ -205,6 +249,9 @@ class SupporterRecommender:
             if item_info:
                 item_info["supporters_count"] = supporters_count
                 recommendations.append(item_info)
+
+        for rec in recommendations:
+            rec["bpm_distance"] = None
 
         if include_bpm and recommendations:
             # Imported here so the optional audio stack is only loaded when
@@ -224,6 +271,64 @@ class SupporterRecommender:
                 duration=bpm_duration,
                 progress_callback=progress_callback,
             )
+
+        if bpm_match and recommendations:
+            from bandcamp_recommender.recommendations.bpm import (
+                attach_bpms,
+                get_seed_bpm,
+                octave_tolerant_bpm_distance,
+            )
+
+            if progress_callback:
+                progress_callback(
+                    "Detecting seed BPM...", 0, len(recommendations), 0
+                )
+            seed = get_seed_bpm(
+                wishlist_item_url, method=bpm_method, duration=bpm_duration
+            )
+            seed_bpm = float(seed["bpm"]) if seed and seed.get("bpm") else None
+
+            if seed_bpm is None:
+                # No seed BPM means every item gets a 0 penalty — re-ranking
+                # would be a no-op. Skip the expensive per-candidate BPM
+                # detection and just trim to the requested size.
+                recommendations = recommendations[:max_recommendations]
+            else:
+                # attach_bpms is idempotent — items with `bpm` already set (from the
+                # include_bpm pass above) are skipped without a page fetch.
+                if progress_callback:
+                    progress_callback(
+                        "Detecting BPMs for expanded candidate pool...",
+                        0,
+                        len(recommendations),
+                        0,
+                    )
+                attach_bpms(
+                    recommendations,
+                    method=bpm_method,
+                    duration=bpm_duration,
+                    progress_callback=progress_callback,
+                )
+
+                alpha = _resolve_bpm_rerank_alpha()
+                for rec in recommendations:
+                    cand_bpm = rec.get("bpm")
+                    if cand_bpm is not None:
+                        rec["bpm_distance"] = octave_tolerant_bpm_distance(
+                            seed_bpm, float(cand_bpm)
+                        )
+                    else:
+                        rec["bpm_distance"] = None
+
+                recommendations.sort(
+                    key=lambda r: _bpm_rerank_score(
+                        r.get("supporters_count", 0),
+                        r.get("bpm_distance"),
+                        alpha,
+                    ),
+                    reverse=True,
+                )
+                recommendations = recommendations[:max_recommendations]
 
         if progress_callback:
             progress_callback(

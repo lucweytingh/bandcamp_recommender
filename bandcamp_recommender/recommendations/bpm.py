@@ -23,8 +23,6 @@ import sys
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr
-from io import StringIO
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
@@ -46,83 +44,37 @@ warnings.filterwarnings("ignore", message=".*Cannot seek back.*")
 
 def detect_bpm_from_audio_url(audio_url: str, timeout: int = 300, duration: float = 60.0) -> Optional[float]:
     """Detect BPM from an audio file URL using librosa.
-    
-    Only downloads and analyzes the first portion of the audio file (default 60 seconds)
-    for faster BPM detection. This is much faster than downloading the entire file.
-    
-    Args:
-        audio_url: URL to the audio file (e.g., from bcbits.com)
-        timeout: Request timeout in seconds (default: 300)
-        duration: Duration in seconds to analyze (default: 60.0). 
-                  First 30-60 seconds is usually enough for accurate BPM detection.
-        
-    Returns:
-        BPM as float if detected, None if failed
+
+    Only downloads and analyzes the first portion of the audio file
+    (default 60 seconds) for faster BPM detection.
     """
-    # Suppress warnings and stderr at function level
-    # The mpg123 library prints directly to stderr file descriptor, so we need to redirect it at OS level
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+
+    decoded = _load_audio_segment(audio_url, duration=duration, timeout=timeout)
+    if decoded is None:
+        return None
+    samples, sr = decoded
+
+    try:
+        import librosa
+    except ImportError:
+        return None
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        # Redirect stderr file descriptor to devnull to suppress mpg123 C library warnings
-        # This works even for C libraries that write directly to the file descriptor
         try:
-            import librosa
-            import numpy as np
-        except ImportError:
+            onset_env = librosa.onset.onset_strength(y=samples, sr=sr)
+            tempo = librosa.feature.tempo(
+                onset_envelope=onset_env, sr=sr, aggregate=np.median
+            )
+        except Exception:
             return None
-        
-        # Save original stderr file descriptor
-        original_stderr_fd = sys.stderr.fileno()
-        devnull_fd = os.open(os.devnull, os.O_WRONLY)
-        
-        try:
-            # Redirect stderr at file descriptor level (works for C libraries)
-            os.dup2(devnull_fd, original_stderr_fd)
-            
-            try:
-                # Try to use HTTP range request to only download the first portion
-                # Estimate bytes needed: ~128kbps MP3 = ~16KB per second, so 60s = ~960KB
-                # We'll request more to be safe (2MB should cover most cases)
-                import urllib.request
-                
-                # Create request with Range header to only download first portion
-                req = urllib.request.Request(audio_url)
-                # Request first 2MB (should be enough for 60 seconds at 128kbps)
-                req.add_header('Range', 'bytes=0-2097151')
-                
-                try:
-                    with urllib.request.urlopen(req, timeout=timeout) as response:
-                        # Read the partial response into memory
-                        audio_data = io.BytesIO(response.read())
-                except Exception:
-                    # Fallback: if range requests aren't supported, download full file
-                    # but still only analyze first portion
-                    with urlopen(audio_url, timeout=timeout) as response:
-                        # Limit to first 2MB even if we download more
-                        audio_data = io.BytesIO(response.read(2097152))
-                
-                # Load only the first 'duration' seconds with librosa
-                # This is much faster than loading the entire file
-                y, sr = librosa.load(audio_data, sr=None, duration=duration)
-                
-                # Detect tempo using librosa
-                onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-                tempo = librosa.feature.tempo(onset_envelope=onset_env, sr=sr, aggregate=np.median)
-                
-                # tempo returns an array, get the first (median) value
-                bpm = float(tempo[0]) if isinstance(tempo, np.ndarray) else float(tempo)
-                
-                # Round to nearest whole number (BPM is almost never fractional)
-                bpm = round(bpm)
-                
-                return float(bpm)
-                        
-            except Exception:
-                return None
-        finally:
-            # Restore original stderr file descriptor
-            os.dup2(original_stderr_fd, original_stderr_fd)
-            os.close(devnull_fd)
+
+    bpm = float(tempo[0]) if isinstance(tempo, np.ndarray) else float(tempo)
+    return float(round(bpm))
 
 
 async def detect_bpm_from_audio_url_async(audio_url: str, timeout: int = 300) -> Optional[float]:
@@ -378,6 +330,20 @@ async def get_all_track_bpms_async(
 # Ported from .context/browser-bpm-detection.md. Numpy-only after decoding.
 # ---------------------------------------------------------------------------
 
+
+def octave_tolerant_bpm_distance(seed_bpm: float, candidate_bpm: float) -> float:
+    """Distance between two BPMs that treats half/double-time as near.
+
+    Returns ``min(|seed - cand|, |seed - 2*cand|, |2*seed - cand|)``.
+    Both inputs must be positive floats; callers are responsible for
+    guarding against ``None``.
+    """
+    delta = abs(seed_bpm - candidate_bpm)
+    half = abs(seed_bpm - 2.0 * candidate_bpm)
+    double = abs(2.0 * seed_bpm - candidate_bpm)
+    return float(min(delta, half, double))
+
+
 _BPM_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 _BPM_CACHE_LOCK = threading.Lock()
 
@@ -437,6 +403,24 @@ def _decode_audio_with_librosa(
         os.dup2(saved_stderr_fd, original_stderr_fd)
         os.close(saved_stderr_fd)
         os.close(devnull_fd)
+
+
+def _load_audio_segment(
+    audio_url: str,
+    duration: float = 60.0,
+    timeout: int = 300,
+) -> Optional[Tuple[Any, int]]:
+    """Download and decode the first ``duration`` seconds of ``audio_url``.
+
+    Returns ``(mono_samples, sample_rate)`` as a numpy array and int, or
+    ``None`` if the URL could not be fetched or decoded. Shared by every
+    BPM backend (and by callers in Prompts B/C) so a single network +
+    decode round-trip can feed multiple analyses.
+    """
+    audio_bytes = _download_audio_bytes(audio_url, timeout=timeout)
+    if not audio_bytes:
+        return None
+    return _decode_audio_with_librosa(audio_bytes, duration)
 
 
 def detect_bpm_joe_sullivan_from_samples(
@@ -538,10 +522,7 @@ def detect_bpm_joe_sullivan(
     :func:`detect_bpm_joe_sullivan_from_samples`, or ``None`` if the audio
     could not be fetched or decoded.
     """
-    audio_bytes = _download_audio_bytes(audio_url, timeout=timeout)
-    if not audio_bytes:
-        return None
-    decoded = _decode_audio_with_librosa(audio_bytes, duration)
+    decoded = _load_audio_segment(audio_url, duration=duration, timeout=timeout)
     if decoded is None:
         return None
     samples, sr = decoded
@@ -613,6 +594,42 @@ def clear_bpm_cache() -> None:
         _BPM_CACHE.clear()
 
 
+_SEED_BPM_CACHE: Dict[Tuple[str, str, float], Optional[Dict[str, Any]]] = {}
+_SEED_BPM_CACHE_LOCK = threading.Lock()
+
+
+def get_seed_bpm(
+    item_url: str,
+    method: str = "auto",
+    duration: float = 60.0,
+) -> Optional[Dict[str, Any]]:
+    """Detect (and cache) the BPM for a seed Bandcamp item URL.
+
+    Resolves the first playable preview via ``get_audio_url_for_item`` and
+    hands off to :func:`detect_bpm`. Results are cached on
+    ``(item_url, method, duration)`` so re-running the recommender in the
+    same process doesn't re-fetch the album page.
+    """
+    cache_key = (item_url, method, float(duration))
+    with _SEED_BPM_CACHE_LOCK:
+        if cache_key in _SEED_BPM_CACHE:
+            return _SEED_BPM_CACHE[cache_key]
+    audio_url = get_audio_url_for_item(item_url)
+    if not audio_url:
+        result = None
+    else:
+        result = detect_bpm(audio_url, method=method, duration=duration)
+    with _SEED_BPM_CACHE_LOCK:
+        _SEED_BPM_CACHE[cache_key] = result
+    return result
+
+
+def clear_seed_bpm_cache() -> None:
+    """Clear the process-level seed BPM cache."""
+    with _SEED_BPM_CACHE_LOCK:
+        _SEED_BPM_CACHE.clear()
+
+
 def get_audio_url_for_item(
     item_url: str,
     track_index: int = 0,
@@ -658,6 +675,20 @@ def attach_bpms(
 
     def _process(item: Dict[str, Any]) -> None:
         nonlocal done
+        if item.get("bpm") is not None:
+            # Already detected by a prior call (e.g. include_bpm before
+            # bpm_match). Skip the page-fetch + decode round-trip entirely.
+            with lock:
+                done += 1
+                current = done
+            if progress_callback:
+                progress_callback(
+                    f"Detected BPM for {current}/{total} items",
+                    current,
+                    total,
+                    0,
+                )
+            return
         audio_url = get_audio_url_for_item(item["item_url"])
         if audio_url:
             result = detect_bpm(audio_url, method=method, duration=duration)
