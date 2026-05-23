@@ -808,6 +808,9 @@ class SupporterRecommender:
         We skip Selenium entirely when this path works, which avoids both the
         ~1-3s per-supporter driver.get() and the up-front driver pool init.
         """
+        from .curl_breaker import should_skip_curl
+        if should_skip_curl():
+            return None
         wishlist_url = f"https://bandcamp.com/{username}/wishlist"
         html = fetch_page_html(wishlist_url, timeout=15)
         if not html:

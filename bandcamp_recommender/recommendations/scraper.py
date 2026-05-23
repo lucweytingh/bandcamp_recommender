@@ -10,17 +10,26 @@ from typing import List, Optional
 
 from bs4 import BeautifulSoup
 
+from . import curl_breaker
+
 
 def fetch_page_html(url: str, timeout: int = 15) -> Optional[str]:
-    """Fetch HTML content from a URL using curl.
-    
+    """Fetch HTML content from a URL using curl, falling back to Selenium.
+
+    The curl_breaker module short-circuits to Selenium when the IP appears to
+    be blocked, so we don't burn the full timeout per call after the first few
+    failures.
+
     Args:
         url: URL to fetch
         timeout: Request timeout in seconds
-        
+
     Returns:
         HTML content as string, or None if failed
     """
+    if curl_breaker.should_skip_curl():
+        return _fetch_page_with_selenium(url)
+
     curl_cmd = [
         "curl",
         "-s",  # Silent mode
@@ -32,15 +41,21 @@ def fetch_page_html(url: str, timeout: int = 15) -> Optional[str]:
         "-H", "Connection: keep-alive",
         url,
     ]
-    
+
     try:
         result = subprocess.run(
             curl_cmd, capture_output=True, text=True, timeout=timeout
         )
         if result.returncode != 0:
+            curl_breaker.record_outcome(success=False)
             print(f"Error fetching page with curl: {result.stderr}")
             return None
+        curl_breaker.record_outcome(success=True)
         return result.stdout
+    except subprocess.TimeoutExpired as e:
+        curl_breaker.record_outcome(success=False)
+        print(f"Error running curl: {e}")
+        return None
     except Exception as e:
         print(f"Error running curl: {e}")
         return None

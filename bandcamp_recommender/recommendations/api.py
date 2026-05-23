@@ -10,6 +10,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+from . import curl_breaker
+
 
 def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
     """Get fan_id from a supporter's page.
@@ -159,6 +161,9 @@ def _fetch_via_curl(
     timeout: int
 ) -> List[Dict]:
     """Fetch via curl subprocess (original approach, may 403 on headless servers)."""
+    if curl_breaker.should_skip_curl():
+        return []
+
     cookie_string = "; ".join([f"{k}={v}" for k, v in cookies.items()])
     curl_cmd = [
         "curl",
@@ -178,17 +183,23 @@ def _fetch_via_curl(
         api_url,
     ]
 
-    result = subprocess.run(
-        curl_cmd, capture_output=True, text=True, timeout=timeout
-    )
+    try:
+        result = subprocess.run(
+            curl_cmd, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        curl_breaker.record_outcome(success=False)
+        return []
 
     if result.returncode == 0:
         try:
             data = json.loads(result.stdout)
+            curl_breaker.record_outcome(success=True)
             return data.get("items", [])
         except (json.JSONDecodeError, KeyError):
             pass
 
+    curl_breaker.record_outcome(success=False)
     return []
 
 
