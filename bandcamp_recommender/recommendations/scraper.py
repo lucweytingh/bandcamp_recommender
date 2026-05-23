@@ -1,6 +1,7 @@
 """Web scraping utilities for Bandcamp pages."""
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,19 +14,44 @@ from bs4 import BeautifulSoup
 from . import curl_breaker
 
 
-def fetch_page_html(url: str, timeout: int = 15) -> Optional[str]:
-    """Fetch HTML content from a URL using curl, falling back to Selenium.
+logger = logging.getLogger(__name__)
 
-    The curl_breaker module short-circuits to Selenium when the IP appears to
-    be blocked, so we don't burn the full timeout per call after the first few
-    failures.
+
+def _debug_exc_info() -> bool:
+    return os.environ.get("BANDCAMP_DEBUG") == "1"
+
+
+# Default curl timeout, raised 15→20 to accommodate slow Bandcamp custom
+# domains (e.g. craigieknowes.com routinely takes 15–20s).
+_DEFAULT_CURL_TIMEOUT = 20
+
+# Backoff schedule for the curl retry loop. Three attempts total — the
+# downstream radio worker confirmed 3 is the sweet spot: enough to ride
+# out a per-IP throttle, few enough to not extend the slice budget too far.
+_RETRY_BACKOFF_SECONDS = (0.4, 1.2, 3.0)
+
+
+def fetch_page_html(url: str, timeout: int = _DEFAULT_CURL_TIMEOUT) -> Optional[str]:
+    """Fetch HTML content from a URL using curl, with bounded retry.
+
+    Strategy:
+
+    * If the curl-breaker has tripped (IP blocked), skip straight to Selenium.
+    * Otherwise try curl up to 3 times with exponential backoff
+      (0.4 s → 1.2 s → 3.0 s) on subprocess timeout or non-zero exit.
+      Bandcamp custom domains (e.g. craigieknowes.com) can spike to 15–20 s
+      on a single request; a single transient timeout shouldn't fail the
+      whole pipeline.
+    * Parse failures are out of scope here — this layer only retries on
+      transport-level failure.
 
     Args:
         url: URL to fetch
-        timeout: Request timeout in seconds
+        timeout: Per-attempt request timeout in seconds (default 20 s,
+            up from 15 s to match real-world custom-domain latency).
 
     Returns:
-        HTML content as string, or None if failed
+        HTML content as string, or None if all attempts fail.
     """
     if curl_breaker.should_skip_curl():
         return _fetch_page_with_selenium(url)
@@ -42,23 +68,57 @@ def fetch_page_html(url: str, timeout: int = 15) -> Optional[str]:
         url,
     ]
 
-    try:
-        result = subprocess.run(
-            curl_cmd, capture_output=True, text=True, timeout=timeout
-        )
-        if result.returncode != 0:
+    # Retry strategy: on transient HTTP-level failure (non-zero exit, but the
+    # subprocess didn't time out → the request completed, just badly), retry
+    # up to 3 times with backoff. On a hard timeout (subprocess.TimeoutExpired)
+    # we give up immediately — the per-call timeout (20 s default) is already
+    # generous enough for Bandcamp custom domains, and stacking 4 × 20 s on a
+    # dead URL would blow the per-supporter slice budget for everyone fanned
+    # out alongside it.
+    attempts = len(_RETRY_BACKOFF_SECONDS) + 1  # initial try + N backoffs
+    for attempt in range(attempts):
+        try:
+            result = subprocess.run(
+                curl_cmd, capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
             curl_breaker.record_outcome(success=False)
-            print(f"Error fetching page with curl: {result.stderr}")
+            logger.warning(
+                "curl timeout fetching %s (timeout=%ds, attempt %d/%d, not retrying timeouts)",
+                url,
+                timeout,
+                attempt + 1,
+                attempts,
+            )
             return None
-        curl_breaker.record_outcome(success=True)
-        return result.stdout
-    except subprocess.TimeoutExpired as e:
+        except Exception:
+            logger.warning(
+                "curl error fetching %s (attempt %d/%d)",
+                url,
+                attempt + 1,
+                attempts,
+                exc_info=_debug_exc_info(),
+            )
+            return None  # Non-timeout errors aren't worth retrying.
+
+        if result.returncode == 0:
+            curl_breaker.record_outcome(success=True)
+            return result.stdout
+
         curl_breaker.record_outcome(success=False)
-        print(f"Error running curl: {e}")
-        return None
-    except Exception as e:
-        print(f"Error running curl: {e}")
-        return None
+        logger.warning(
+            "curl returned %d for %s (attempt %d/%d): %s",
+            result.returncode,
+            url,
+            attempt + 1,
+            attempts,
+            result.stderr.strip()[:200],
+        )
+        if attempt < attempts - 1:
+            time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+
+    logger.error("curl gave up after %d attempts: %s", attempts, url)
+    return None
 
 
 def extract_supporters(item_url: str) -> List[str]:
@@ -93,7 +153,7 @@ def extract_supporters(item_url: str) -> List[str]:
                     if username:
                         supporters.append(username)
             except (json.JSONDecodeError, KeyError) as e:
-                print(f"Error parsing collectors-data: {e}")
+                logger.warning("error parsing collectors-data: %s", e)
     
     # Fallback - look for links with class "fan pic" or near supporter thumbnails
     if not supporters:
@@ -210,20 +270,40 @@ def _parse_supporters_from_html(html: str) -> List[str]:
 
 
 def _fetch_page_with_selenium(url: str) -> Optional[str]:
-    """Fetch page HTML using Selenium. Fallback for when curl is blocked (e.g. datacenter IPs)."""
-    try:
-        from .driver_manager import DriverManager
+    """Fetch page HTML using Selenium. Fallback for when curl is blocked (e.g. datacenter IPs).
 
-        dm = DriverManager()
+    Always cleans up the driver — even when ``driver.get(...)`` raises
+    ``TimeoutException`` because the page-load timeout fired. Pre-hardening
+    this routine could leak a chromedriver on every hung Bandcamp request.
+    """
+    from .driver_manager import DriverManager
+    from selenium.common.exceptions import TimeoutException, WebDriverException
+
+    dm = DriverManager()
+    try:
         dm.init_driver()
+    except WebDriverException:
+        logger.warning("Selenium fallback: driver init failed", exc_info=_debug_exc_info())
+        return None
+
+    try:
         dm.driver.get(url)
         time.sleep(3)
-        html = dm.driver.page_source
-        dm.close()
-        return html
-    except Exception as e:
-        print(f"Selenium fallback failed: {e}")
+        return dm.driver.page_source
+    except TimeoutException:
+        logger.warning("Selenium fallback: page-load timeout on %s", url)
         return None
+    except WebDriverException as e:
+        logger.warning("Selenium fallback: webdriver error on %s: %s", url, e)
+        return None
+    except Exception:
+        logger.warning("Selenium fallback failed", exc_info=_debug_exc_info())
+        return None
+    finally:
+        try:
+            dm.close()
+        except Exception:
+            logger.warning("Selenium fallback: driver close failed", exc_info=_debug_exc_info())
 
 
 def extract_item_id(item_url: str) -> Optional[str]:
@@ -237,10 +317,10 @@ def extract_item_id(item_url: str) -> Optional[str]:
     Returns:
         tralbum_id as string, or None if not found
     """
-    html = fetch_page_html(item_url, timeout=10)
+    html = fetch_page_html(item_url, timeout=_DEFAULT_CURL_TIMEOUT)
     if not html:
         return None
-    
+
     try:
         soup = BeautifulSoup(html, features="html.parser")
         pagedata_elem = soup.find(id="pagedata")
@@ -266,9 +346,8 @@ def extract_item_id(item_url: str) -> Optional[str]:
             
             if tralbum_id:
                 return str(tralbum_id)
-    except Exception as e:
-        print(f"Error extracting item ID: {e}")
-        pass
+    except Exception:
+        logger.warning("error extracting item id from %s", item_url, exc_info=_debug_exc_info())
 
     return None
 
@@ -284,7 +363,7 @@ def extract_tags(item_url: str) -> List[str]:
     Returns:
         List of tag strings, or empty list if not found
     """
-    html = fetch_page_html(item_url, timeout=10)
+    html = fetch_page_html(item_url, timeout=_DEFAULT_CURL_TIMEOUT)
     if not html:
         return []
     
@@ -296,9 +375,8 @@ def extract_tags(item_url: str) -> List[str]:
         tags = [tag.get_text(strip=True) for tag in tag_links if tag.get_text(strip=True)]
         
         return tags
-    except Exception as e:
-        # Log error for debugging but don't fail silently
-        print(f"Error extracting tags from {item_url}: {e}")
+    except Exception:
+        logger.warning("error extracting tags from %s", item_url, exc_info=_debug_exc_info())
         return []
 
 

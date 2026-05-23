@@ -1,16 +1,26 @@
 """Bandcamp API interaction utilities."""
 
 import json
+import logging
+import os
 import subprocess
 from typing import Dict, List, Optional
 
 from bs4 import BeautifulSoup
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from . import curl_breaker
+
+
+logger = logging.getLogger(__name__)
+
+
+def _debug_exc_info() -> bool:
+    return os.environ.get("BANDCAMP_DEBUG") == "1"
 
 
 def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
@@ -27,8 +37,12 @@ def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
         # Navigate to supporter's wishlist page to get fan_id and cookies
         # (wishlist/profile pages have fan_data, /music page doesn't)
         wishlist_url = f"https://bandcamp.com/{username}/wishlist"
-        driver.get(wishlist_url)
-        
+        try:
+            driver.get(wishlist_url)
+        except TimeoutException:
+            logger.warning("get_fan_id_from_page: wishlist page-load timeout for %s", username)
+            return None
+
         # Wait for pagedata element. Pagedata is server-rendered so it
         # resolves quickly when the page loads at all; long timeouts mostly
         # wait out failures.
@@ -39,7 +53,11 @@ def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
         except Exception:
             # If wishlist page doesn't work, try profile page
             profile_url = f"https://bandcamp.com/{username}"
-            driver.get(profile_url)
+            try:
+                driver.get(profile_url)
+            except TimeoutException:
+                logger.warning("get_fan_id_from_page: profile page-load timeout for %s", username)
+                return None
             try:
                 WebDriverWait(driver, 1.5).until(
                     EC.presence_of_element_located((By.ID, "pagedata"))
@@ -53,13 +71,17 @@ def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
             return None
 
         pagedata = json.loads(pagedata_elem.get("data-blob", "{}"))
-        
+
         # Get fan_id for API call
         fan_data = pagedata.get("fan_data", {})
         fan_id = fan_data.get("fan_id")
-        
+
         return fan_id
+    except WebDriverException:
+        logger.warning("get_fan_id_from_page: webdriver error for %s", username, exc_info=_debug_exc_info())
+        return None
     except Exception:
+        logger.warning("get_fan_id_from_page: unexpected error for %s", username, exc_info=_debug_exc_info())
         return None
 
 
@@ -148,8 +170,12 @@ def _fetch_via_driver(
         if result_json:
             data = json.loads(result_json)
             return data.get("items", [])
+    except TimeoutException:
+        logger.warning("_fetch_via_driver: script timeout after %ds", timeout)
+    except WebDriverException:
+        logger.warning("_fetch_via_driver: webdriver error", exc_info=_debug_exc_info())
     except Exception:
-        pass
+        logger.warning("_fetch_via_driver: unexpected error", exc_info=_debug_exc_info())
     return []
 
 

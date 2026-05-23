@@ -1,16 +1,46 @@
 """Selenium WebDriver management for Bandcamp scraping."""
 
+import logging
 import os
 import shutil
+import signal
+import subprocess
+import sys
 import time
 from queue import Queue
 from threading import Lock
 from typing import Optional
 
+from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium import webdriver
 from webdriver_manager.chrome import ChromeDriverManager
+
+
+logger = logging.getLogger(__name__)
+
+
+_DEFAULT_PAGE_LOAD_TIMEOUT = 30
+_DEFAULT_SCRIPT_TIMEOUT = 30
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _page_load_timeout() -> int:
+    return _env_int("BANDCAMP_PAGE_LOAD_TIMEOUT", _DEFAULT_PAGE_LOAD_TIMEOUT)
+
+
+def _script_timeout() -> int:
+    return _env_int("BANDCAMP_SCRIPT_TIMEOUT", _DEFAULT_SCRIPT_TIMEOUT)
 
 
 class DriverManager:
@@ -75,6 +105,22 @@ class DriverManager:
 
         return options
 
+    def _configure_driver(self, driver: webdriver.Chrome) -> None:
+        """Apply wall-clock timeouts to every driver this manager produces.
+
+        Without these, ``driver.get(...)`` and ``execute_async_script`` will
+        block forever on a stalled Bandcamp request. The radio worker
+        outage that triggered this hardening was exactly that hang.
+        """
+        try:
+            driver.set_page_load_timeout(_page_load_timeout())
+            driver.set_script_timeout(_script_timeout())
+        except WebDriverException:
+            logger.warning(
+                "failed to configure driver timeouts",
+                exc_info=os.environ.get("BANDCAMP_DEBUG") == "1",
+            )
+
     def init_driver(self):
         """Initialize the Selenium webdriver with appropriate options.
 
@@ -83,6 +129,7 @@ class DriverManager:
         options = self.get_driver_options()
         service = self._get_chromedriver_service()
         self.driver = webdriver.Chrome(service=service, options=options)
+        self._configure_driver(self.driver)
 
     def ensure_driver(self):
         """Ensure driver is initialized (lazy initialization)."""
@@ -117,6 +164,7 @@ class DriverManager:
                             service=self._chrome_service,
                             options=options
                         )
+                        self._configure_driver(driver)
                         self._driver_pool.put(driver)
                         if progress_callback:
                             progress_callback(f"Initialized driver {i+1}/{pool_size}...")
@@ -138,15 +186,23 @@ class DriverManager:
         options = self.get_driver_options()
         if self._chrome_service is None:
             self._chrome_service = self._get_chromedriver_service()
-        return webdriver.Chrome(
+        driver = webdriver.Chrome(
             service=self._chrome_service,
             options=options
         )
+        self._configure_driver(driver)
+        return driver
 
     def close(self):
         """Close the webdriver and cleanup driver pool."""
         if self.driver:
-            self.driver.quit()
+            try:
+                self.driver.quit()
+            except WebDriverException:
+                logger.warning(
+                    "driver.quit() failed in close()",
+                    exc_info=os.environ.get("BANDCAMP_DEBUG") == "1",
+                )
             self.driver = None
 
         # Clean up driver pool
@@ -158,3 +214,74 @@ class DriverManager:
                 except Exception:
                     pass
             self._driver_pool = None
+
+    @staticmethod
+    def is_driver_alive(driver) -> bool:
+        """Cheap liveness probe — reading ``current_url`` round-trips to chromedriver.
+
+        Used by the supporter-recommender fallback to decide whether a driver
+        returned from a worker is safe to put back in the pool or must be
+        quit instead.
+        """
+        try:
+            _ = driver.current_url
+            return True
+        except WebDriverException:
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def reap_orphans() -> int:
+        """SIGKILL local chromedriver / chrome / chromium processes whose
+        parent is init (PID 1) — i.e. orphans from a previous crashed run.
+
+        Returns the number of processes reaped. Safe no-op on Windows and
+        when ``ps`` is unavailable. Opt-in: callers run this on cold start.
+        """
+        if sys.platform.startswith("win"):
+            return 0
+        ps = shutil.which("ps")
+        if not ps:
+            return 0
+        try:
+            result = subprocess.run(
+                [ps, "-axo", "pid=,ppid=,comm="],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            logger.warning("reap_orphans: ps invocation failed")
+            return 0
+        if result.returncode != 0:
+            return 0
+
+        targets = ("chromedriver", "chrome", "chromium", "Google Chrome")
+        reaped = 0
+        for line in result.stdout.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            try:
+                pid = int(parts[0])
+                ppid = int(parts[1])
+            except ValueError:
+                continue
+            comm = parts[2]
+            if ppid != 1:
+                continue
+            base = os.path.basename(comm).lower()
+            if not any(t.lower() in base for t in targets):
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                reaped += 1
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                logger.warning("reap_orphans: no permission to kill pid %d", pid)
+                continue
+        if reaped:
+            logger.warning("reap_orphans: killed %d orphan chromium process(es)", reaped)
+        return reaped
