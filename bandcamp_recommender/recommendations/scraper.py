@@ -6,7 +6,9 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+from collections import OrderedDict
 from typing import List, Optional
 
 from bs4 import BeautifulSoup
@@ -24,6 +26,59 @@ def _debug_exc_info() -> bool:
 # Default curl timeout, raised 15→20 to accommodate slow Bandcamp custom
 # domains (e.g. craigieknowes.com routinely takes 15–20s).
 _DEFAULT_CURL_TIMEOUT = 20
+
+
+# ---------------------------------------------------------------------------
+# Process-level page cache.
+#
+# The recommender pipeline fetches the same URLs multiple times per call:
+# the seed URL is hit by extract_supporters + extract_item_id + extract_tags
+# + get_audio_url_for_item, and every top-N item page is hit by both tag
+# hydration and audio-URL hydration. None of that duplication adds value —
+# the HTML is identical. A small bounded LRU keyed on (url, timeout)
+# eliminates the redundant subprocess + HTTP round-trips for the rest of
+# the session. We only cache successful fetches; failures still retry so
+# we don't pin a transient outage into the cache.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PAGE_CACHE_SIZE = 256
+_page_cache: "OrderedDict[tuple, str]" = OrderedDict()
+_page_cache_lock = threading.Lock()
+
+
+def _resolve_page_cache_size() -> int:
+    raw = os.environ.get("BANDCAMP_PAGE_CACHE_SIZE")
+    if raw is None:
+        return _DEFAULT_PAGE_CACHE_SIZE
+    try:
+        n = int(raw)
+        return max(0, n)
+    except ValueError:
+        return _DEFAULT_PAGE_CACHE_SIZE
+
+
+def _page_cache_get(key: tuple) -> Optional[str]:
+    with _page_cache_lock:
+        value = _page_cache.get(key)
+        if value is not None:
+            _page_cache.move_to_end(key)
+        return value
+
+
+def _page_cache_put(key: tuple, value: str, max_size: int) -> None:
+    if max_size <= 0:
+        return
+    with _page_cache_lock:
+        _page_cache[key] = value
+        _page_cache.move_to_end(key)
+        while len(_page_cache) > max_size:
+            _page_cache.popitem(last=False)
+
+
+def clear_page_cache() -> None:
+    """Drop every entry in the page cache. Used by tests + long-running radios."""
+    with _page_cache_lock:
+        _page_cache.clear()
 
 # Backoff schedule for the curl retry loop. Three attempts total — the
 # downstream radio worker confirmed 3 is the sweet spot: enough to ride
@@ -53,8 +108,18 @@ def fetch_page_html(url: str, timeout: int = _DEFAULT_CURL_TIMEOUT) -> Optional[
     Returns:
         HTML content as string, or None if all attempts fail.
     """
+    cache_size = _resolve_page_cache_size()
+    cache_key = (url, timeout)
+    if cache_size > 0:
+        cached = _page_cache_get(cache_key)
+        if cached is not None:
+            return cached
+
     if curl_breaker.should_skip_curl():
-        return _fetch_page_with_selenium(url)
+        html = _fetch_page_with_selenium(url)
+        if html is not None:
+            _page_cache_put(cache_key, html, cache_size)
+        return html
 
     curl_cmd = [
         "curl",
@@ -103,6 +168,7 @@ def fetch_page_html(url: str, timeout: int = _DEFAULT_CURL_TIMEOUT) -> Optional[
 
         if result.returncode == 0:
             curl_breaker.record_outcome(success=True)
+            _page_cache_put(cache_key, result.stdout, cache_size)
             return result.stdout
 
         curl_breaker.record_outcome(success=False)
