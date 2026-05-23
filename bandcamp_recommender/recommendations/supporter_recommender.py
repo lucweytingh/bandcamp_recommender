@@ -1,6 +1,7 @@
 """Main recommendation engine for Bandcamp based on supporter purchases."""
 
 import json
+import logging
 import os
 import random
 import time
@@ -10,8 +11,33 @@ from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
 
 
+logger = logging.getLogger(__name__)
+
+
+def _debug_exc_info() -> bool:
+    return os.environ.get("BANDCAMP_DEBUG") == "1"
+
+
 _DEFAULT_DRIVER_POOL = 5
 _DEFAULT_TAG_WORKERS = 6
+_DEFAULT_SUPPORTER_CONCURRENCY = 6
+
+
+def _resolve_supporter_concurrency() -> int:
+    """Resolve the per-call ThreadPoolExecutor cap for supporter fetches.
+
+    Default 6. Downstream observation: even 5 was too aggressive when
+    Bandcamp custom domains (e.g. artist-hosted *.com pages) start
+    throttling per-IP. Env-overridable via ``BANDCAMP_SUPPORTER_CONCURRENCY``.
+    """
+    raw = os.environ.get("BANDCAMP_SUPPORTER_CONCURRENCY")
+    if raw is None:
+        return _DEFAULT_SUPPORTER_CONCURRENCY
+    try:
+        n = int(raw)
+        return max(1, n)
+    except ValueError:
+        return _DEFAULT_SUPPORTER_CONCURRENCY
 
 
 def _resolve_pool_size(total_supporters: int) -> int:
@@ -187,7 +213,7 @@ class SupporterRecommender:
         # Use ThreadPoolExecutor for parallel processing. Cap at 15 to avoid
         # hammering Bandcamp; curl handshakes are cheap so this is the limit
         # set by politeness, not by laptop resources.
-        max_workers = min(15, total_supporters)
+        max_workers = min(_resolve_supporter_concurrency(), total_supporters) if total_supporters else 1
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_supporter = {
@@ -657,8 +683,12 @@ class SupporterRecommender:
 
             return all_item_ids
 
-        except Exception as e:
-            # Silently handle errors (timeouts, network issues, etc.)
+        except Exception:
+            logger.warning(
+                "_get_supporter_purchases_with_driver failed for %s",
+                username,
+                exc_info=_debug_exc_info(),
+            )
             return []
 
     def _get_supporter_wishlist_with_driver(
@@ -751,8 +781,12 @@ class SupporterRecommender:
 
             return all_item_ids
 
-        except Exception as e:
-            # Silently handle errors (timeouts, network issues, etc.)
+        except Exception:
+            logger.warning(
+                "_get_supporter_wishlist_with_driver failed for %s",
+                username,
+                exc_info=_debug_exc_info(),
+            )
             return []
 
     def _store_item_metadata(
@@ -914,33 +948,82 @@ class SupporterRecommender:
         try:
             driver_pool = self._driver_manager.get_driver_pool(fallback_pool_size)
         except Exception:
-            return []
-        try:
-            driver = driver_pool.get(timeout=30)
-        except Exception:
-            return []
-        try:
-            if data_key == "wishlist_data":
-                return self._get_supporter_wishlist_with_driver(
-                    username, driver,
-                    first_page_only=first_page_only,
-                    extract_tags_flag=False,
-                )
-            return self._get_supporter_purchases_with_driver(
-                username, driver,
-                first_page_only=first_page_only,
-                extract_tags_flag=False,
+            logger.warning(
+                "Selenium fallback: pool init failed for %s",
+                username,
+                exc_info=_debug_exc_info(),
             )
-        except Exception:
             return []
-        finally:
+
+        # 1 retry on a fresh driver if the first attempt empties out — the
+        # most common cause is a TimeoutException that the _with_driver
+        # helper swallowed into []. Doesn't help if curl-blocked == auth, but
+        # does help with transient network blips.
+        for attempt in range(2):
             try:
-                driver_pool.put_nowait(driver)
+                driver = driver_pool.get(timeout=30)
             except Exception:
-                try:
-                    driver_pool.put(driver, timeout=2)
-                except Exception:
-                    pass
+                logger.warning(
+                    "Selenium fallback: pool get timed out for %s (attempt %d)",
+                    username,
+                    attempt + 1,
+                )
+                return []
+
+            try:
+                if data_key == "wishlist_data":
+                    result = self._get_supporter_wishlist_with_driver(
+                        username, driver,
+                        first_page_only=first_page_only,
+                        extract_tags_flag=False,
+                    )
+                else:
+                    result = self._get_supporter_purchases_with_driver(
+                        username, driver,
+                        first_page_only=first_page_only,
+                        extract_tags_flag=False,
+                    )
+            except Exception:
+                logger.warning(
+                    "Selenium fallback: worker raised for %s (attempt %d)",
+                    username,
+                    attempt + 1,
+                    exc_info=_debug_exc_info(),
+                )
+                result = []
+            finally:
+                # If the driver is poisoned (TimeoutException leaves chromedriver
+                # in a flaky state for the next page-load), quit it instead of
+                # returning it to the pool. The pool gets smaller on the fly;
+                # acceptable for a fallback-only path.
+                if not DriverManager.is_driver_alive(driver):
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        driver_pool.put_nowait(driver)
+                    except Exception:
+                        try:
+                            driver_pool.put(driver, timeout=2)
+                        except Exception:
+                            try:
+                                driver.quit()
+                            except Exception:
+                                pass
+
+            if result:
+                return result
+            # Empty result on first attempt → one retry with a fresh driver.
+            if attempt == 0:
+                logger.warning(
+                    "Selenium fallback: empty result for %s, retrying once",
+                    username,
+                )
+                continue
+            return []
+        return []
 
     def _hydrate_tags_for_items(self, item_ids: List[str]) -> None:
         """Fetch tags for a small set of items in parallel and store in cache.
@@ -1077,7 +1160,7 @@ class SupporterRecommender:
             except Exception as e:
                 return [], supporter, f"Error fetching items: {str(e)[:50]}"
 
-        max_workers = min(15, total_supporters)
+        max_workers = min(_resolve_supporter_concurrency(), total_supporters) if total_supporters else 1
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_supporter = {
@@ -1329,7 +1412,7 @@ class SupporterRecommender:
                 return [], supporter
 
         # Use ThreadPoolExecutor for parallel processing
-        max_workers = min(15, total_supporters)
+        max_workers = min(_resolve_supporter_concurrency(), total_supporters) if total_supporters else 1
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_supporter = {

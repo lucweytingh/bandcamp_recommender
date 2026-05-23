@@ -17,10 +17,12 @@ session (or a recommendation run that revisits items) only pays once.
 import asyncio
 import io
 import json
+import logging
 import os
 import re
 import sys
 import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -382,21 +384,101 @@ _BPM_CACHE_LOCK = threading.Lock()
 _STDERR_REDIRECT_LOCK = threading.Lock()
 
 
+_DEFAULT_AUDIO_TIMEOUT = 30
+
+
+def _resolve_audio_timeout(timeout: int) -> int:
+    """Allow ``BANDCAMP_AUDIO_TIMEOUT`` to override per-call timeouts."""
+    raw = os.environ.get("BANDCAMP_AUDIO_TIMEOUT")
+    if raw is None:
+        return timeout
+    try:
+        return int(raw)
+    except ValueError:
+        return timeout
+
+
+def _read_with_wall_clock_budget(resp, max_bytes: int, deadline: float) -> Optional[bytes]:
+    """Read up to ``max_bytes`` from ``resp``, aborting at ``deadline``.
+
+    Plain ``resp.read(n)`` blocks until ``n`` bytes arrive or EOF; on a
+    slow-trickle response (e.g. 1 byte / second) the socket timer is
+    refreshed by each byte, so the read can run for hours despite a
+    nominal socket timeout. We:
+
+    * use ``read1`` when available so a single underlying socket recv
+      returns immediately with whatever bytes are present,
+    * cap the per-chunk wait via the underlying socket's timeout, and
+    * re-check the deadline between chunks.
+
+    Returns the accumulated bytes (possibly empty → ``None``) when the
+    deadline trips, the connection closes, or any error fires.
+    """
+    import socket as _socket
+
+    buf = bytearray()
+    chunk_size = 64 * 1024
+    reader = getattr(resp, "read1", resp.read)
+
+    # Grab the underlying socket so we can tighten its timeout per-chunk.
+    # urllib's HTTPResponse wraps an io.BufferedReader around a SocketIO.
+    sock = None
+    try:
+        fp = getattr(resp, "fp", None)
+        raw = getattr(fp, "raw", None) if fp is not None else None
+        sock = getattr(raw, "_sock", None) if raw is not None else None
+    except Exception:
+        sock = None
+
+    while len(buf) < max_bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        per_chunk = min(remaining, 0.5)
+        if sock is not None:
+            try:
+                sock.settimeout(per_chunk)
+            except Exception:
+                pass
+        try:
+            chunk = reader(min(chunk_size, max_bytes - len(buf)))
+        except (_socket.timeout, TimeoutError):
+            # No data in this slice; loop and let the deadline check decide.
+            continue
+        except Exception:
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf) if buf else None
+
+
 def _download_audio_bytes(
     audio_url: str,
     max_bytes: int = 2_097_152,
-    timeout: int = 300,
+    timeout: int = _DEFAULT_AUDIO_TIMEOUT,
 ) -> Optional[bytes]:
-    """Fetch the first `max_bytes` of an audio URL. Returns None on failure."""
+    """Fetch the first ``max_bytes`` of an audio URL. Returns ``None`` on failure.
+
+    Bounded by ``timeout`` wall-clock seconds for the *whole* fetch — not
+    per socket op. Slow-trickle responses cannot exceed this budget.
+    """
+    effective = _resolve_audio_timeout(timeout)
+    deadline = time.monotonic() + effective
     try:
         req = Request(audio_url)
         req.add_header("Range", f"bytes=0-{max_bytes - 1}")
-        with urlopen(req, timeout=timeout) as resp:
-            return resp.read()
+        with urlopen(req, timeout=effective) as resp:
+            return _read_with_wall_clock_budget(resp, max_bytes, deadline)
     except Exception:
+        # Fallback only if we still have budget left — otherwise we'd
+        # double the wall-clock cost and exceed the caller's timeout.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
         try:
-            with urlopen(audio_url, timeout=timeout) as resp:
-                return resp.read(max_bytes)
+            with urlopen(audio_url, timeout=remaining) as resp:
+                return _read_with_wall_clock_budget(resp, max_bytes, deadline)
         except Exception:
             return None
 
