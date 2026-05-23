@@ -346,6 +346,7 @@ def octave_tolerant_bpm_distance(seed_bpm: float, candidate_bpm: float) -> float
 
 _BPM_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 _BPM_CACHE_LOCK = threading.Lock()
+_STDERR_REDIRECT_LOCK = threading.Lock()
 
 
 def _download_audio_bytes(
@@ -381,28 +382,54 @@ def _decode_audio_with_librosa(
     except ImportError:
         return None
 
-    original_stderr_fd = sys.stderr.fileno()
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    saved_stderr_fd = os.dup(original_stderr_fd)
-    try:
-        os.dup2(devnull_fd, original_stderr_fd)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            try:
-                import librosa
-                samples, sr = librosa.load(
-                    io.BytesIO(audio_bytes),
-                    sr=None,
-                    duration=duration,
-                    mono=True,
-                )
-                return samples, int(sr)
-            except Exception:
-                return None
-    finally:
-        os.dup2(saved_stderr_fd, original_stderr_fd)
-        os.close(saved_stderr_fd)
-        os.close(devnull_fd)
+    # Serialise the fd swap because stderr (fd 2) is process-global. Two
+    # concurrent decodes could otherwise restore each other's fds or
+    # leave stderr permanently redirected to devnull.
+    with _STDERR_REDIRECT_LOCK:
+        original_stderr_fd = sys.stderr.fileno()
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        saved_stderr_fd = os.dup(original_stderr_fd)
+        try:
+            os.dup2(devnull_fd, original_stderr_fd)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                try:
+                    import librosa
+                    samples, sr = librosa.load(
+                        io.BytesIO(audio_bytes),
+                        sr=None,
+                        duration=duration,
+                        mono=True,
+                    )
+                    return samples, int(sr)
+                except Exception:
+                    return None
+        finally:
+            os.dup2(saved_stderr_fd, original_stderr_fd)
+            os.close(saved_stderr_fd)
+            os.close(devnull_fd)
+
+
+def _load_audio_segment(
+    audio_url: str,
+    duration: float = 60.0,
+    timeout: int = 300,
+    max_bytes: int = 2_097_152,
+) -> Optional[Tuple[Any, int]]:
+    """Download + decode the first `duration` seconds of an audio URL.
+
+    Single-shot helper for callers that want a decoded mono numpy array and
+    sample rate. Returns ``None`` if the audio cannot be fetched or decoded
+    (network failure, librosa missing, unsupported format).
+
+    Intended for callers (notably ``intensity.score_intensity`` and
+    ``intensity.attach_audio_features``) that want both BPM and intensity
+    features off a single shared decode per track.
+    """
+    audio_bytes = _download_audio_bytes(audio_url, max_bytes=max_bytes, timeout=timeout)
+    if not audio_bytes:
+        return None
+    return _decode_audio_with_librosa(audio_bytes, duration)
 
 
 def _load_audio_segment(

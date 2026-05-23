@@ -87,6 +87,12 @@ Examples:
              "from the seed track. α defaults to 0.05 (set BANDCAMP_BPM_RERANK_ALPHA "
              "to override). Implies --bpm."
     )
+    parser.add_argument(
+        "--intensity",
+        action="store_true",
+        help="Attach a 0..1 audio intensity score to each recommendation "
+             "(display only, no filtering). Requires librosa."
+    )
 
     args = parser.parse_args()
 
@@ -99,6 +105,8 @@ Examples:
     if args.bpm or args.bpm_match:
         mode = "match+rerank" if args.bpm_match else "on"
         print(f"BPM detection: {mode} ({args.bpm_method})")
+    if args.intensity:
+        print("Intensity scoring: on")
     print("-" * 60)
 
     with SupporterRecommender() as recommender:
@@ -110,6 +118,7 @@ Examples:
             include_bpm=args.bpm or args.bpm_match,
             bpm_method=args.bpm_method,
             bpm_match=args.bpm_match,
+            include_intensity=args.intensity,
         )
         
         # Print newline after progress updates
@@ -143,6 +152,8 @@ Examples:
                 print(f"   {bpm_str}")
             if rec.get('bpm_distance') is not None:
                 print(f"   BPM distance from seed: {rec['bpm_distance']:.1f}")
+            if rec.get('intensity') is not None:
+                print(f"   Intensity: {rec['intensity']:.2f}")
             print()
 
 
