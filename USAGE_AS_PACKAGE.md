@@ -147,7 +147,81 @@ When `use_fallback=True` and `min_overlap` is set:
 
 ---
 
-### 3. Feature vectors (`bandcamp_recommender.features`)
+### 3. `get_similar_recommendations()` - One-call "more like this"
+
+End-to-end pipeline: from a source URL → supporter-overlap candidate
+pool → feature extraction (shared decode per track) → distance ranking
+→ enriched recommendation list. Use this when your downstream consumer
+(e.g. a radio queue) needs full per-track features attached and
+ordering by audio/tag similarity rather than supporter count.
+
+```python
+from bandcamp_recommender import SupporterRecommender
+
+with SupporterRecommender() as r:
+    similar = r.get_similar_recommendations(
+        source_url="https://artist.bandcamp.com/track/seed",
+        max_recommendations=10,
+        candidate_pool_size=30,           # how many supporter-overlap candidates to score
+        min_supporters=1,
+        feature_weights=None,             # or override DEFAULT_WEIGHTS
+        intensity_duration=60.0,
+        bpm_duration=60.0,
+        progress_callback=None,
+    )
+
+    for rec in similar:
+        bpm = rec["features"]["bpm"]
+        bpm_str = f"{bpm:.0f} BPM" if bpm is not None else "no BPM"
+        print(f"d={rec['distance']:.3f}  {rec['band_name']} - {rec['item_title']}  ({bpm_str})")
+```
+
+**Returned dict per recommendation:**
+
+```python
+{
+    # Standard recommendation metadata
+    "item_title":      "...",
+    "band_name":       "...",
+    "item_url":        "https://...",
+    "supporters_count": int,
+    "tags":            ["..."],
+
+    # Added by get_similar_recommendations
+    "audio_url":       "https://t4.bcbits.com/...mp3" | None,
+    "features": {
+        "tag_mood":          float | None,
+        "tag_spikiness":     float | None,
+        "rms_mean":          float | None,
+        "rms_p95":           float | None,
+        "onset_rate":        float | None,
+        "spectral_centroid": float | None,
+        "crest_factor":      float | None,
+        "bpm_folded_norm":   float | None,
+        "bpm_norm":          float | None,
+        "bpm":               float | None,   # raw BPM, not in DEFAULT_WEIGHTS
+    },
+    "distance":  float | None,    # ascending order; None sinks to bottom
+}
+```
+
+**How it differs from `get_recommendations`:**
+
+| | `get_recommendations` | `get_similar_recommendations` |
+|---|---|---|
+| Ordering | by `supporters_count` (popularity-among-overlap) | by feature distance (audio + tag similarity) |
+| Per-rec features | only when you opt in via `include_bpm` / `include_intensity` / `include_mood_tag_score` | full vector + raw BPM always attached |
+| Audio URL hydration | not done | done for every returned item |
+| Cost | 1 supporter scrape + tag hydration | same + N audio decodes (~1–3 s each) |
+
+Use `get_recommendations` for fast "what's popular among shared fans"
+lists; use `get_similar_recommendations` when downstream wants to play
+the result and needs the feature vector for filtering / display /
+beat-matching.
+
+---
+
+### 4. Feature vectors (`bandcamp_recommender.features`)
 
 Per-track feature vectors for "more like this" similarity matching and
 mood projection. Works independently of `SupporterRecommender` — given

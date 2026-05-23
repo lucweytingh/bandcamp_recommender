@@ -70,6 +70,37 @@ with SupporterRecommender() as recommender:
     )
 ```
 
+### Similarity-ordered recommendations
+
+One call: given a Bandcamp source song, get recs ordered by feature
+similarity with full per-track feature vectors (incl. raw BPM)
+attached.
+
+```python
+from bandcamp_recommender import SupporterRecommender
+
+with SupporterRecommender() as r:
+    recs = r.get_similar_recommendations(
+        source_url="https://artist.bandcamp.com/track/seed",
+        max_recommendations=10,
+        candidate_pool_size=30,      # supporter-overlap pool size
+    )
+
+    for rec in recs:
+        print(f"{rec['distance']:.2f}  {rec['band_name']} - {rec['item_title']}")
+        print(f"   tempo: {rec['features']['bpm']} BPM")
+        print(f"   audio: {rec['audio_url']}")
+```
+
+Each returned dict includes:
+- standard recommender metadata (`item_title`, `band_name`,
+  `item_url`, `supporters_count`, `tags`)
+- `audio_url` — preview URL used for feature extraction
+- `features` — the full feature dict from
+  `bandcamp_recommender.features.extract_features` (incl. raw `bpm`)
+- `distance` — weighted-Euclidean distance to the source
+  (smaller = more similar)
+
 ### Feature vectors (similarity matching, mood projection)
 
 ```python

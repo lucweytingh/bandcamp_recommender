@@ -389,6 +389,173 @@ class SupporterRecommender:
 
         return recommendations
 
+    def get_similar_recommendations(
+        self,
+        source_url: str,
+        max_recommendations: int = 10,
+        candidate_pool_size: int = 30,
+        min_supporters: int = 1,
+        feature_weights: Optional[Dict[str, float]] = None,
+        intensity_duration: float = 60.0,
+        bpm_duration: float = 60.0,
+        progress_callback: Optional[Callable] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get recommendations ordered by feature-vector similarity to a source.
+
+        End-to-end pipeline for a "more like this" call:
+
+        1. Run the existing supporter-overlap recommender to get a
+           ``candidate_pool_size`` pool of candidates (default 30).
+        2. Hydrate the source song (tags + preview ``audio_url``) and
+           any candidate that's missing one.
+        3. Extract the full feature vector for source + every candidate
+           (one download + decode per track, shared between intensity
+           and BPM detection).
+        4. Compute weighted-Euclidean distance from source to each
+           candidate over the intersection of present features.
+        5. Sort ascending and return the top ``max_recommendations``
+           candidates.
+
+        Each returned dict carries the usual supporter-overlap metadata
+        (``item_title``, ``band_name``, ``item_url``, ``supporters_count``,
+        ``tags``) plus:
+
+        * ``audio_url``   — the preview URL we used for feature extraction
+                            (``None`` if no streamable preview).
+        * ``features``    — the full feature dict from
+                            :func:`bandcamp_recommender.features.extract_features`,
+                            including the raw ``bpm`` float for display /
+                            beat-matching.
+        * ``distance``    — weighted-Euclidean similarity distance to the
+                            source (smaller = more similar; ``None`` only
+                            when no feature is shared).
+
+        ``feature_weights`` is passed straight through to ``distance`` —
+        leave as ``None`` to use ``features.DEFAULT_WEIGHTS``, or override
+        per-feature for the radio's mode-specific tuning.
+        """
+        # Local import keeps the optional audio stack out of cold starts
+        # for the rest of the package.
+        from bandcamp_recommender.features import (
+            DEFAULT_WEIGHTS,
+            distance as feature_distance,
+            extract_features,
+        )
+        from bandcamp_recommender.recommendations.bpm import get_audio_url_for_item
+
+        weights = feature_weights or DEFAULT_WEIGHTS
+
+        if progress_callback:
+            progress_callback("Fetching candidate pool via supporter overlap...", 0, 0, 0)
+
+        candidates = self.get_recommendations(
+            wishlist_item_url=source_url,
+            max_recommendations=candidate_pool_size,
+            min_supporters=min_supporters,
+            progress_callback=progress_callback,
+        )
+        if not candidates:
+            if progress_callback:
+                progress_callback("No candidates returned by supporter overlap.", 0, 0, 0)
+            return []
+
+        # Build a source item. The recommender's metadata cache may
+        # already have entries for the source's tags/title; if not we
+        # scrape them here.
+        if progress_callback:
+            progress_callback("Hydrating source song metadata...", 0, len(candidates), 0)
+        source_tags = extract_tags(source_url) or []
+        source_audio_url = get_audio_url_for_item(source_url)
+        source_item: Dict[str, Any] = {
+            "item_url": source_url,
+            "tags": source_tags,
+            "audio_url": source_audio_url,
+        }
+
+        # Make sure every candidate has an ``audio_url``. Tag hydration
+        # already happens inside ``get_recommendations`` for the top-N.
+        if progress_callback:
+            progress_callback(
+                "Hydrating candidate preview URLs...",
+                0,
+                len(candidates),
+                0,
+            )
+        self._hydrate_audio_urls_for_items(candidates)
+
+        # Feature extraction — one decode per track, includes raw BPM.
+        # Parallel here because each decode is the dominant cost.
+        if progress_callback:
+            progress_callback(
+                "Extracting feature vectors...",
+                0,
+                len(candidates) + 1,  # +1 for source
+                0,
+            )
+        source_features = extract_features(
+            source_item,
+            intensity_duration=intensity_duration,
+            bpm_duration=bpm_duration,
+        )
+        source_item["features"] = source_features
+
+        def _extract_for(item: Dict[str, Any]) -> Dict[str, Any]:
+            item["features"] = extract_features(
+                item,
+                intensity_duration=intensity_duration,
+                bpm_duration=bpm_duration,
+            )
+            return item
+
+        # 4 workers matches the pattern in scripts/eval_similarity.py —
+        # librosa decode is serialized by the stderr lock, so higher
+        # worker counts only overlap downloads.
+        workers = max(1, min(4, len(candidates)))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_extract_for, candidates))
+
+        # Distance + ordering. Items without any shared feature get
+        # distance=None and sink to the bottom (in stable order).
+        rated: List[Dict[str, Any]] = []
+        unrated: List[Dict[str, Any]] = []
+        for cand in candidates:
+            d = feature_distance(source_features, cand["features"], weights)
+            cand["distance"] = d
+            (rated if d is not None else unrated).append(cand)
+        rated.sort(key=lambda c: c["distance"])
+
+        ranked = (rated + unrated)[:max_recommendations]
+        if progress_callback:
+            progress_callback(
+                f"Returning top {len(ranked)} ordered by similarity.",
+                len(candidates) + 1,
+                len(candidates) + 1,
+                0,
+            )
+        return ranked
+
+    def _hydrate_audio_urls_for_items(self, items: List[Dict[str, Any]]) -> None:
+        """Fill in ``audio_url`` for any item missing one (parallel, in-place).
+
+        Each call is one curl + parse of the item page, so we cap
+        concurrency at the same modest level as tag hydration.
+        """
+        from bandcamp_recommender.recommendations.bpm import get_audio_url_for_item
+
+        targets = [it for it in items if not it.get("audio_url") and it.get("item_url")]
+        if not targets:
+            return
+
+        def _fetch_one(item: Dict[str, Any]) -> None:
+            try:
+                item["audio_url"] = get_audio_url_for_item(item["item_url"])
+            except Exception:
+                item["audio_url"] = None
+
+        workers = min(_DEFAULT_TAG_WORKERS, len(targets))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_fetch_one, targets))
+
     def _get_supporter_purchases_with_driver(
         self,
         username: str,
