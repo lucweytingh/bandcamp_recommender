@@ -42,39 +42,49 @@ warnings.filterwarnings("ignore", message=".*stream size.*")
 warnings.filterwarnings("ignore", message=".*Cannot seek back.*")
 
 
-def detect_bpm_from_audio_url(audio_url: str, timeout: int = 300, duration: float = 60.0) -> Optional[float]:
-    """Detect BPM from an audio file URL using librosa.
+def detect_bpm_librosa_from_samples(
+    samples: Any,
+    sample_rate: int,
+) -> Optional[float]:
+    """Run librosa's onset-envelope tempo estimator on a pre-decoded buffer.
 
-    Only downloads and analyzes the first portion of the audio file
-    (default 60 seconds) for faster BPM detection.
+    Returns a single rounded BPM float, or ``None`` if numpy / librosa are
+    unavailable or the estimator raises. Split out from the URL-based
+    variant so callers (notably :mod:`bandcamp_recommender.features`) that
+    already paid the decode cost can fall back to librosa when Joe
+    Sullivan returns no peak — without a second download.
     """
     try:
-        import numpy as np
-    except ImportError:
-        return None
-
-    decoded = _load_audio_segment(audio_url, duration=duration, timeout=timeout)
-    if decoded is None:
-        return None
-    samples, sr = decoded
-
-    try:
         import librosa
+        import numpy as np
     except ImportError:
         return None
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:
-            onset_env = librosa.onset.onset_strength(y=samples, sr=sr)
+            onset_env = librosa.onset.onset_strength(y=samples, sr=sample_rate)
             tempo = librosa.feature.tempo(
-                onset_envelope=onset_env, sr=sr, aggregate=np.median
+                onset_envelope=onset_env, sr=sample_rate, aggregate=np.median
             )
         except Exception:
             return None
 
     bpm = float(tempo[0]) if isinstance(tempo, np.ndarray) else float(tempo)
     return float(round(bpm))
+
+
+def detect_bpm_from_audio_url(audio_url: str, timeout: int = 300, duration: float = 60.0) -> Optional[float]:
+    """Detect BPM from an audio file URL using librosa.
+
+    Only downloads and analyzes the first portion of the audio file
+    (default 60 seconds) for faster BPM detection.
+    """
+    decoded = _load_audio_segment(audio_url, duration=duration, timeout=timeout)
+    if decoded is None:
+        return None
+    samples, sr = decoded
+    return detect_bpm_librosa_from_samples(samples, sr)
 
 
 async def detect_bpm_from_audio_url_async(audio_url: str, timeout: int = 300) -> Optional[float]:

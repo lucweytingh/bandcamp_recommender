@@ -123,6 +123,7 @@ def extract_features(
         _load_audio_segment,
         bpm_to_features,
         detect_bpm_joe_sullivan_from_samples,
+        detect_bpm_librosa_from_samples,
     )
     from bandcamp_recommender.recommendations.intensity import (
         extract_features_from_samples as intensity_features_from_samples,
@@ -136,8 +137,18 @@ def extract_features(
 
     vector.update(intensity_features_from_samples(samples, sr))
 
-    bpm_result = detect_bpm_joe_sullivan_from_samples(samples, sr)
-    raw_bpm = float(bpm_result["bpm"]) if bpm_result and bpm_result.get("bpm") else None
+    # Joe Sullivan first (fast, kick-driven music). Fall back to
+    # librosa on the same buffer for non-kick tracks (ambient, jazz,
+    # solo piano, …) so we don't lose tempo coverage just because we
+    # consolidated the decode. Both paths use the same samples — no
+    # second download.
+    raw_bpm: Optional[float] = None
+    js_result = detect_bpm_joe_sullivan_from_samples(samples, sr)
+    if js_result and js_result.get("bpm"):
+        raw_bpm = float(js_result["bpm"])
+    else:
+        raw_bpm = detect_bpm_librosa_from_samples(samples, sr)
+
     vector.update(bpm_to_features(raw_bpm))
     vector["bpm"] = raw_bpm
     return vector
