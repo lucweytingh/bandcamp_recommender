@@ -79,6 +79,12 @@ Examples:
         default="auto",
         help="BPM detection backend (default: auto = joe_sullivan with librosa fallback)."
     )
+    parser.add_argument(
+        "--mood-tags",
+        action="store_true",
+        help="Print a tag-based chill (-1) to party (+1) mood score "
+             "next to each recommendation's tags. Display only — no extra fetches."
+    )
 
     args = parser.parse_args()
 
@@ -90,6 +96,8 @@ Examples:
     print(f"Max recommendations: {max_recommendations}, Min supporters: {min_supporters}")
     if args.bpm:
         print(f"BPM detection: on ({args.bpm_method})")
+    if args.mood_tags:
+        print("Mood-tag scoring: on (chill -1 ... +1 party)")
     print("-" * 60)
 
     with SupporterRecommender() as recommender:
@@ -100,6 +108,7 @@ Examples:
             progress_callback=progress_callback,
             include_bpm=args.bpm,
             bpm_method=args.bpm_method,
+            include_mood_tag_score=args.mood_tags,
         )
         
         # Print newline after progress updates
@@ -120,7 +129,12 @@ Examples:
             print(f"   URL: {rec['item_url']}")
             print(f"   Supported by {rec['supporters_count']} people who also bought the original")
             if rec.get('tags'):
-                print(f"   Tags: {', '.join(rec['tags'])}")
+                tags_line = f"   Tags: {', '.join(rec['tags'])}"
+                if args.mood_tags:
+                    score = rec.get('mood_tag_score')
+                    score_str = f"{score:+.2f}" if score is not None else "n/a"
+                    tags_line += f"  [mood {score_str}]"
+                print(tags_line)
             if rec.get('bpm'):
                 bpm_str = f"{round(rec['bpm'])} BPM"
                 conf = rec.get('bpm_confidence')

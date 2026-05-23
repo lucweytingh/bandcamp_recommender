@@ -43,6 +43,7 @@ from bandcamp_recommender.recommendations.scraper import (
     extract_tags,
     fetch_page_html,
 )
+from bandcamp_recommender.recommendations.mood_tags import tag_mood_score
 from bandcamp_recommender.recommendations.tags import calculate_tag_similarity, normalize_tag
 
 
@@ -69,6 +70,7 @@ class SupporterRecommender:
         include_bpm: bool = False,
         bpm_method: str = "auto",
         bpm_duration: float = 60.0,
+        include_mood_tag_score: bool = False,
     ) -> List[Dict[str, Any]]:
         """Get recommendations based on supporter purchases.
 
@@ -84,6 +86,11 @@ class SupporterRecommender:
             bpm_method: BPM backend to use — ``"auto"`` (default),
                 ``"joe_sullivan"``, or ``"librosa"``.
             bpm_duration: Seconds of audio to analyse per track (default 60).
+            include_mood_tag_score: If True, attach a ``mood_tag_score`` key
+                to each recommendation. The score is in ``[-1, 1]`` from
+                chill to party (see :mod:`mood_tags`), or ``None`` when no
+                tag in the result matches the lexicon. Free of extra
+                fetches — tags are already hydrated for the top-N.
 
         Returns:
             List of recommendation dictionaries with item_title, band_name, item_url, supporters_count
@@ -205,6 +212,10 @@ class SupporterRecommender:
             if item_info:
                 item_info["supporters_count"] = supporters_count
                 recommendations.append(item_info)
+
+        if include_mood_tag_score:
+            for rec in recommendations:
+                rec["mood_tag_score"] = tag_mood_score(rec.get("tags") or [])
 
         if include_bpm and recommendations:
             # Imported here so the optional audio stack is only loaded when
