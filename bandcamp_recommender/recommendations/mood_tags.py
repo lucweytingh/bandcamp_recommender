@@ -77,6 +77,65 @@ _TAG_ALIASES: dict[str, str] = {
 }
 
 
+# Country / region tokens that Bandcamp users tag standalone (e.g.
+# "Japan", "U.S.A.", "UK") which everynoise expresses as adjectival
+# prefixes ("japanese …", "american …", "uk …"). When we build pair
+# lookups like "japan jazz", this map translates the qualifier component
+# to the form everynoise uses so we hit "japanese jazz".
+_COUNTRY_PREFIX_ALIASES: dict[str, str] = {
+    "japan": "japanese",
+    "usa": "american",
+    "u.s.a.": "american",
+    "us": "american",
+    "united states": "american",
+    "united kingdom": "uk",
+    "u.k.": "uk",
+    "britain": "uk",
+    "great britain": "uk",
+    "korea": "korean",
+    "south korea": "korean",
+    "k-pop": "k-pop",  # already canonical on everynoise; here to short-circuit
+    "germany": "german",
+    "france": "french",
+    "italy": "italian",
+    "spain": "spanish",
+    "brazil": "brazilian",
+    "russia": "russian",
+    "china": "chinese",
+    "argentina": "argentine",
+    "mexico": "mexican",
+    "sweden": "swedish",
+    "norway": "norwegian",
+    "finland": "finnish",
+    "denmark": "danish",
+    "netherlands": "dutch",
+    "holland": "dutch",
+    "poland": "polish",
+    "iceland": "icelandic",
+    "australia": "australian",
+    "canada": "canadian",
+    "india": "indian",
+    "indonesia": "indonesian",
+    "philippines": "filipino",
+    "portugal": "portuguese",
+    "ireland": "irish",
+    "scotland": "scottish",
+    "wales": "welsh",
+}
+
+
+def _norm_for_lookup(tag: str) -> str:
+    """Lower + strip only.
+
+    Crucially this does NOT call ``tags.normalize_tag`` — that function
+    expands "uk" → "united kingdom", which kills our pair lookups
+    against an everynoise lexicon that uses "uk" verbatim. Country
+    handling is done explicitly via :data:`_COUNTRY_PREFIX_ALIASES` so
+    the direction matches everynoise's convention.
+    """
+    return tag.lower().strip()
+
+
 def _load_everynoise() -> tuple[dict[str, tuple[float, float, float]], int, int, int]:
     """Load the snapshot and pre-compute ``(mood_score, spikiness_score, idf_weight)`` per genre."""
     data_file = resources.files(
@@ -102,7 +161,7 @@ def _load_everynoise() -> tuple[dict[str, tuple[float, float, float]], int, int,
 
     entries: dict[str, tuple[float, float, float]] = {}
     for name, top, left, font in rows:
-        norm = normalize_tag(name)
+        norm = _norm_for_lookup(name)
         mood = 1.0 - 2.0 * top / max_top
         # left=0 is the leftmost (dense/atmospheric); max_left is the
         # rightmost (spiky/bouncy) — map to [-1, 1].
@@ -125,8 +184,115 @@ def _resolve(norm_tag: str) -> Optional[tuple[float, float, float]]:
         return entry
     alias = _TAG_ALIASES.get(norm_tag)
     if alias is not None:
-        return _GENRE_ENTRIES.get(normalize_tag(alias))
+        return _GENRE_ENTRIES.get(_norm_for_lookup(alias))
     return None
+
+
+def _effective_token(tag: str) -> Optional[str]:
+    """Canonical lookup form for a single tag (or ``None`` if empty)."""
+    if not tag:
+        return None
+    norm = _norm_for_lookup(tag)
+    if not norm:
+        return None
+    alias = _TAG_ALIASES.get(norm)
+    return _norm_for_lookup(alias) if alias else norm
+
+
+def _effective_norms(tags: Iterable[str]) -> list[str]:
+    """Normalize each tag and pre-apply aliases.
+
+    Returning aliased forms means downstream pair-matching builds keys
+    out of the *canonical* tokens. So a Bandcamp track tagged
+    ``["uk", "dnb"]`` becomes ``["uk", "drum and bass"]`` for matching,
+    and the pair ``"uk drum and bass"`` becomes lookup-eligible.
+
+    Duplicate / empty tags are stripped while preserving first-seen
+    order.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in tags or []:
+        effective = _effective_token(raw)
+        if effective is None or effective in seen:
+            continue
+        seen.add(effective)
+        out.append(effective)
+    return out
+
+
+def _qualifier_form(token: str) -> str:
+    """Translate "japan" → "japanese", "united kingdom" → "uk", etc.
+
+    Used only when building pair lookups so that "Japan" + "jazz"
+    becomes "japanese jazz" (which exists on everynoise) instead of
+    "japan jazz" (which doesn't). Returns ``token`` unchanged when no
+    qualifier alias applies.
+    """
+    return _COUNTRY_PREFIX_ALIASES.get(token, token)
+
+
+def _collect_matches(
+    tags: Iterable[str],
+) -> list[tuple[float, float, float]]:
+    """Return every everynoise entry these tags resolve to.
+
+    Considers:
+
+    * **Pairs.** For each ordered pair of normalized tags ``(a, b)``,
+      look up the concatenation ``"a b"`` in the lexicon. This is what
+      lets Bandcamp's habit of splitting "bristol bass" into
+      ``"Bristol"`` + ``"bass"`` (or "berlin techno" into ``"Berlin"`` +
+      ``"techno"``) recover the right entry — 83% of everynoise genres
+      are multi-word, mostly qualifier+root constructions.
+
+    * **Singles.** Each normalized tag (after pair pass) tried alone.
+
+    Each canonical entry name (e.g. "berlin techno", "techno") is added
+    at most once across both passes — so a track tagged ``berlin`` +
+    ``techno`` contributes ``berlin techno`` AND ``techno`` (different
+    entries, valid double-signal) but won't double-count the same entry
+    just because two normalization paths hit it.
+    """
+    norms = _effective_norms(tags)
+    if not norms:
+        return []
+    matched_keys: set[str] = set()
+    out: list[tuple[float, float, float]] = []
+
+    # Pair pass — try both orders since "berlin techno" exists but
+    # "techno berlin" doesn't, and we can't know a priori which way.
+    # Also try the country-prefix form of ``a`` ("japan" → "japanese")
+    # so "Japan" + "jazz" reaches "japanese jazz".
+    for i, a in enumerate(norms):
+        for j, b in enumerate(norms):
+            if i == j:
+                continue
+            candidates = {f"{a} {b}"}
+            a_q = _qualifier_form(a)
+            if a_q != a:
+                candidates.add(f"{a_q} {b}")
+            for key in candidates:
+                if key in matched_keys:
+                    continue
+                entry = _GENRE_ENTRIES.get(key)
+                if entry is not None:
+                    matched_keys.add(key)
+                    out.append(entry)
+
+    # Solo pass — covers tags that aren't paired with a qualifier or
+    # whose pair never matched anything. We still want "techno" alone
+    # to score even when "berlin techno" already contributed, because
+    # the broader genre is real signal too.
+    for n in norms:
+        if n in matched_keys:
+            continue
+        entry = _resolve(n)
+        if entry is not None:
+            matched_keys.add(n)
+            out.append(entry)
+
+    return out
 
 
 def _weighted_axis_mean(
@@ -135,22 +301,13 @@ def _weighted_axis_mean(
     *,
     weighted: bool,
 ) -> Optional[float]:
-    """Internal: weighted mean of a single axis (0=mood, 1=organic)."""
-    if not tags:
+    """Internal: weighted mean of a single axis (0=mood, 1=spikiness)."""
+    matches = _collect_matches(tags)
+    if not matches:
         return None
-    seen: set[str] = set()
     total = 0.0
     weight_sum = 0.0
-    for raw in tags:
-        if not raw:
-            continue
-        norm = normalize_tag(raw)
-        if norm in seen:
-            continue
-        seen.add(norm)
-        entry = _resolve(norm)
-        if entry is None:
-            continue
+    for entry in matches:
         axis_value = entry[axis_index]
         weight = entry[2]
         w = weight if weighted else 1.0
@@ -193,25 +350,13 @@ def extract_features(
         ``tag_mood``       — chill (-1) ↔ party (+1)
         ``tag_spikiness``  — dense/atmospheric (-1) ↔ spiky/bouncy (+1)
     """
-    # Walking the tag list once for both axes avoids re-resolving each
-    # genre lookup twice.
-    if not tags:
+    matches = _collect_matches(tags)
+    if not matches:
         return {"tag_mood": None, "tag_spikiness": None}
-    seen: set[str] = set()
     mood_total = 0.0
     spiky_total = 0.0
     weight_sum = 0.0
-    for raw in tags:
-        if not raw:
-            continue
-        norm = normalize_tag(raw)
-        if norm in seen:
-            continue
-        seen.add(norm)
-        entry = _resolve(norm)
-        if entry is None:
-            continue
-        mood, spikiness, weight = entry
+    for mood, spikiness, weight in matches:
         w = weight if weighted else 1.0
         mood_total += w * mood
         spiky_total += w * spikiness
