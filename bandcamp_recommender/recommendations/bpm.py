@@ -674,6 +674,47 @@ def _empty_bpm_features() -> Dict[str, Optional[float]]:
     return {k: None for k in _BPM_FEATURE_KEYS}
 
 
+def bpm_to_features(bpm: Optional[float]) -> Dict[str, Optional[float]]:
+    """Convert a raw BPM (or ``None``) to the normalized feature dict.
+
+    Split out so callers that already have a BPM number can derive the
+    feature pair without going back through detection — used by
+    :func:`extract_features_from_samples` (which calls Joe Sullivan
+    on a pre-decoded buffer) and by orchestrators like
+    :func:`bandcamp_recommender.features.extract_features` that want a
+    single shared audio decode.
+    """
+    if bpm is None or bpm <= 0:
+        return _empty_bpm_features()
+    bpm = float(bpm)
+    return {
+        "bpm_norm": _normalize_bpm(bpm, _BPM_RAW_MIN, _BPM_RAW_MAX),
+        "bpm_folded_norm": _normalize_bpm(
+            _fold_to_octave(bpm), _BPM_FOLD_MIN, _BPM_FOLD_MAX
+        ),
+    }
+
+
+def extract_features_from_samples(
+    samples: Any,
+    sample_rate: int,
+) -> Dict[str, Optional[float]]:
+    """Run Joe Sullivan on a pre-decoded buffer + map to features.
+
+    Skips the librosa fallback that :func:`detect_bpm` (method=auto)
+    would otherwise try — the buffer-based path is meant for the
+    orchestrator that's already paid the decode cost and wants the
+    result without a second pass. Joe Sullivan handles kick-driven
+    music well; non-kick tracks may return ``None``, in which case
+    every feature is ``None`` and callers should treat it as "no
+    BPM signal" rather than as an error.
+    """
+    result = detect_bpm_joe_sullivan_from_samples(samples, sample_rate)
+    if not result or not result.get("bpm"):
+        return _empty_bpm_features()
+    return bpm_to_features(float(result["bpm"]))
+
+
 def extract_features(
     audio_url: str,
     method: str = "auto",

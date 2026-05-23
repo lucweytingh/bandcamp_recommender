@@ -80,7 +80,6 @@ def extract_features(
     item: Dict[str, Any],
     *,
     intensity_duration: float = 60.0,
-    bpm_method: str = "auto",
     bpm_duration: float = 60.0,
 ) -> Dict[str, Optional[float]]:
     """Compute the full feature vector for one track.
@@ -90,13 +89,18 @@ def extract_features(
     * Tag features come from ``item['tags']`` (no extra fetch — tags
       must already be hydrated by the caller).
     * Audio features (intensity + BPM) come from ``item['audio_url']``.
-      If absent, those features all return ``None``. They share the
-      ``_load_audio_segment`` cache, so a track gets decoded once even
-      when both detectors run.
+      The audio is downloaded and decoded **once** here; both
+      intensity feature extraction and Joe Sullivan BPM detection run
+      against the shared buffer. That halves wall-clock per track
+      versus calling the two sub-modules independently.
 
-    The return dict always has every key from ``DEFAULT_WEIGHTS``;
-    unavailable features are ``None`` rather than missing keys, so
-    downstream code can iterate without ``KeyError``.
+    Returned dict always contains every key from ``DEFAULT_WEIGHTS``
+    (unavailable features are ``None`` rather than missing). It also
+    carries an additional ``bpm`` field — the **raw BPM as a float**
+    when one was detected, or ``None`` otherwise. That value is not
+    part of the similarity vector (not in ``DEFAULT_WEIGHTS``) but
+    callers that need to display or filter on absolute tempo can read
+    it directly without re-running BPM detection.
     """
     # Local imports keep the optional audio stack out of bare cold starts
     # (e.g. when only tag features are needed).
@@ -105,23 +109,37 @@ def extract_features(
     )
 
     vector: Dict[str, Optional[float]] = _empty_vector()
+    vector["bpm"] = None  # Raw tempo, populated when audio is available.
     vector.update(extract_tag_features(item.get("tags") or []))
 
     audio_url = item.get("audio_url")
-    if audio_url:
-        from bandcamp_recommender.recommendations.intensity import (
-            extract_features as extract_intensity_features,
-        )
-        from bandcamp_recommender.recommendations.bpm import (
-            extract_features as extract_bpm_features,
-        )
+    if not audio_url:
+        return vector
 
-        vector.update(
-            extract_intensity_features(audio_url, duration=intensity_duration)
-        )
-        vector.update(
-            extract_bpm_features(audio_url, method=bpm_method, duration=bpm_duration)
-        )
+    # One download + decode, two feature paths. Match
+    # ``intensity.attach_audio_features`` and use the longer of the two
+    # configured durations so a shorter detector sees a prefix.
+    from bandcamp_recommender.recommendations.bpm import (
+        _load_audio_segment,
+        bpm_to_features,
+        detect_bpm_joe_sullivan_from_samples,
+    )
+    from bandcamp_recommender.recommendations.intensity import (
+        extract_features_from_samples as intensity_features_from_samples,
+    )
+
+    decode_duration = max(intensity_duration, bpm_duration)
+    decoded = _load_audio_segment(audio_url, duration=decode_duration)
+    if decoded is None:
+        return vector
+    samples, sr = decoded
+
+    vector.update(intensity_features_from_samples(samples, sr))
+
+    bpm_result = detect_bpm_joe_sullivan_from_samples(samples, sr)
+    raw_bpm = float(bpm_result["bpm"]) if bpm_result and bpm_result.get("bpm") else None
+    vector.update(bpm_to_features(raw_bpm))
+    vector["bpm"] = raw_bpm
     return vector
 
 
