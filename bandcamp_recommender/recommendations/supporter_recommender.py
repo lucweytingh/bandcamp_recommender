@@ -75,6 +75,15 @@ from bandcamp_recommender.recommendations.mood_tags import tag_mood_score
 from bandcamp_recommender.recommendations.tags import calculate_tag_similarity, normalize_tag
 
 
+def _normalize_item_url(url: str) -> str:
+    """Lowercase + strip query/fragment/trailing slash so two spellings of the
+    same Bandcamp item URL compare equal.
+    """
+    if not url:
+        return ""
+    return url.split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
+
+
 class SupporterRecommender:
     """Generates Bandcamp recommendations based on what supporters purchased."""
 
@@ -454,6 +463,17 @@ class SupporterRecommender:
             min_supporters=min_supporters,
             progress_callback=progress_callback,
         )
+
+        # Backstop the ID-based filter in get_recommendations: when
+        # extract_item_id can't read the source's tralbum_id (curl 403,
+        # page structure shift) the seed slips through and ranks #1 with
+        # near-zero feature distance to itself.
+        source_key = _normalize_item_url(source_url)
+        candidates = [
+            c for c in candidates
+            if _normalize_item_url(c.get("item_url", "")) != source_key
+        ]
+
         if not candidates:
             if progress_callback:
                 progress_callback("No candidates returned by supporter overlap.", 0, 0, 0)
