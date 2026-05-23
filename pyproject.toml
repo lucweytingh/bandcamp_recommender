@@ -1,7 +1,7 @@
 [project]
 name = "bandcamp-recommender"
-version = "0.2.0"
-description = "Bandcamp recommendation engine based on supporter purchases"
+version = "0.3.0"
+description = "Bandcamp recommendation engine based on supporter purchases, with per-track feature vectors for similarity matching"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

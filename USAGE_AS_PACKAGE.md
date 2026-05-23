@@ -147,6 +147,119 @@ When `use_fallback=True` and `min_overlap` is set:
 
 ---
 
+### 3. Feature vectors (`bandcamp_recommender.features`)
+
+Per-track feature vectors for "more like this" similarity matching and
+mood projection. Works independently of `SupporterRecommender` — given
+any track with tags and/or a preview URL, you get a normalized feature
+dict that can be compared against any other track's vector.
+
+```python
+from bandcamp_recommender.features import (
+    extract_features,
+    distance,
+    project_mood,
+    DEFAULT_WEIGHTS,
+    FEATURE_RANGES,
+)
+
+# Each "item" is a dict with at least item_url; tags / audio_url are
+# optional. Tags must already be hydrated by the caller (extract_features
+# does not fetch the Bandcamp page).
+seed = {
+    "item_url": "https://artist.bandcamp.com/track/seed",
+    "tags": ["downtempo", "trip-hop", "Bristol"],
+    "audio_url": "https://t4.bcbits.com/.../seed.mp3",
+}
+
+vec = extract_features(seed)
+# vec is a Dict[str, float | None] with keys from DEFAULT_WEIGHTS.
+# Any feature that couldn't be computed (no audio URL, no recognised
+# tag, no librosa installed) is None — not missing from the dict.
+```
+
+**Feature universe and ranges**
+
+```python
+{
+    "tag_mood":          (-1.0, 1.0),   # chill ↔ party (everynoise top axis)
+    "tag_spikiness":     (-1.0, 1.0),   # dense ↔ spiky (everynoise left axis)
+    "rms_mean":          (0.0, 1.0),    # mean RMS energy, normalized
+    "rms_p95":           (0.0, 1.0),    # 95th-percentile RMS, normalized
+    "onset_rate":        (0.0, 1.0),    # onsets/sec, normalized
+    "spectral_centroid": (0.0, 1.0),    # brightness, normalized
+    "crest_factor":      (0.0, 1.0),    # transient punchiness, normalized
+    "bpm_folded_norm":   (0.0, 1.0),    # BPM folded to [80, 160), normalized
+    "bpm_norm":          (0.0, 1.0),    # raw BPM normalized over [60, 200]
+}
+```
+
+**Distance** — weighted Euclidean over the intersection of features both
+vectors have. Missing features don't kill the score; the denominator is
+the sum of weights of *present* features, so a track with 6 of 9 known
+features still gets a distance on the same scale as a fully-featured
+one.
+
+```python
+cand = extract_features(some_other_track)
+d = distance(seed, cand)            # uses DEFAULT_WEIGHTS
+# Or override:
+d = distance(seed, cand, weights={
+    **DEFAULT_WEIGHTS,
+    "tag_mood": 2.0,                # double the mood axis
+    "bpm_norm": 0.0,                # ignore raw BPM entirely
+})
+```
+
+`distance` returns `None` when no feature is shared between the two
+vectors (rare in practice but the right behavior — there's nothing to
+say).
+
+**`project_mood`** — collapse a vector back to a single chill ↔ party
+scalar for UI use (e.g. a radio's mood slider).
+
+```python
+mood = project_mood(vec)             # in [-1, 1] (None if no signal)
+```
+
+The default projection blends `tag_mood` with the audio energy features
+that correlate with intensity (`rms_p95`, `onset_rate`, `crest_factor`,
+`spectral_centroid`, `bpm_folded_norm`). Pass `weights={…}` to
+customise, same key set as `extract_features` output.
+
+**Tag-only and audio-only modes**
+
+If you don't have an audio URL (or don't want to pay the decode cost),
+omit it — the audio features come back `None` and `distance` /
+`project_mood` rely on whatever tag features resolved:
+
+```python
+tag_only = {"item_url": "...", "tags": ["ambient", "drone"]}
+extract_features(tag_only)
+# {'tag_mood': -0.41, 'tag_spikiness': -0.71,
+#  'rms_mean': None, ..., 'bpm_norm': None}
+```
+
+Conversely, audio-only items (preview URL but no resolvable tags) get
+None tag features and a 7-dim audio + BPM vector.
+
+**Caching**
+
+Both intensity and BPM extraction cache per `audio_url` in-process, so
+a radio that calls `extract_features` lazily as tracks queue up only
+pays the network + decode cost once per track. Cache survives the
+lifetime of the Python process; clear via:
+
+```python
+from bandcamp_recommender.recommendations.intensity import clear_intensity_cache
+from bandcamp_recommender.recommendations.bpm import clear_bpm_cache, clear_seed_bpm_cache
+clear_intensity_cache()
+clear_bpm_cache()
+clear_seed_bpm_cache()
+```
+
+---
+
 ## Progress Callback
 
 All methods support an optional `progress_callback` function for real-time progress updates:
