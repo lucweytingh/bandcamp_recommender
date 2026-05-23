@@ -23,14 +23,15 @@ def test_snapshot_loaded():
 
 
 def test_scores_are_bounded():
-    for tag, (score, weight) in _GENRE_ENTRIES.items():
-        assert -1.0 <= score <= 1.0, (tag, score)
+    for tag, (mood, spikiness, weight) in _GENRE_ENTRIES.items():
+        assert -1.0 <= mood <= 1.0, (tag, mood)
+        assert -1.0 <= spikiness <= 1.0, (tag, spikiness)
         assert weight >= 1.0, (tag, weight)
 
 
 def test_snapshot_has_party_and_chill_extremes():
     # Sanity that both ends of the spectrum are represented.
-    scores = [s for s, _ in _GENRE_ENTRIES.values()]
+    scores = [m for m, _, _ in _GENRE_ENTRIES.values()]
     assert any(s > 0.9 for s in scores)
     assert any(s < -0.9 for s in scores)
 

@@ -344,6 +344,29 @@ def octave_tolerant_bpm_distance(seed_bpm: float, candidate_bpm: float) -> float
     return float(min(delta, half, double))
 
 
+# Normalization ranges for the vector-similarity feature dict. The raw
+# range is empirically the [60, 200] BPM band that covers ~all dance and
+# rock music; the folded range is the canonical [80, 160] octave window
+# every BPM gets remapped to. Both produce features in [0, 1].
+_BPM_RAW_MIN, _BPM_RAW_MAX = 60.0, 200.0
+_BPM_FOLD_MIN, _BPM_FOLD_MAX = 80.0, 160.0
+
+
+def _fold_to_octave(bpm: float) -> float:
+    """Fold a BPM into the canonical [80, 160) octave by doubling/halving."""
+    if bpm <= 0:
+        return bpm
+    while bpm < _BPM_FOLD_MIN:
+        bpm *= 2.0
+    while bpm >= _BPM_FOLD_MAX:
+        bpm /= 2.0
+    return bpm
+
+
+def _normalize_bpm(bpm: float, lo: float, hi: float) -> float:
+    return max(0.0, min(1.0, (bpm - lo) / (hi - lo)))
+
+
 _BPM_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 _BPM_CACHE_LOCK = threading.Lock()
 _STDERR_REDIRECT_LOCK = threading.Lock()
@@ -655,6 +678,46 @@ def clear_seed_bpm_cache() -> None:
     """Clear the process-level seed BPM cache."""
     with _SEED_BPM_CACHE_LOCK:
         _SEED_BPM_CACHE.clear()
+
+
+_BPM_FEATURE_KEYS = ("bpm_norm", "bpm_folded_norm")
+
+
+def _empty_bpm_features() -> Dict[str, Optional[float]]:
+    return {k: None for k in _BPM_FEATURE_KEYS}
+
+
+def extract_features(
+    audio_url: str,
+    method: str = "auto",
+    duration: float = 60.0,
+) -> Dict[str, Optional[float]]:
+    """Return the per-track BPM features as a dict, both in ``[0, 1]``.
+
+    Keys:
+        ``bpm_norm``         — raw BPM normalized over ``[60, 200]``,
+                               clipped. Distinguishes 90 BPM doom from
+                               180 BPM dnb even though they're an octave
+                               apart.
+        ``bpm_folded_norm``  — BPM folded to the canonical ``[80, 160)``
+                               octave first, then normalized over that
+                               window. Half/double-time tracks land at
+                               the same value, which is the right
+                               behavior for genre similarity.
+
+    Returns ``{None, None}`` when no BPM can be detected (no preview,
+    decode failure, missing optional deps).
+    """
+    result = detect_bpm(audio_url, method=method, duration=duration)
+    if not result or not result.get("bpm"):
+        return _empty_bpm_features()
+    bpm = float(result["bpm"])
+    return {
+        "bpm_norm": _normalize_bpm(bpm, _BPM_RAW_MIN, _BPM_RAW_MAX),
+        "bpm_folded_norm": _normalize_bpm(
+            _fold_to_octave(bpm), _BPM_FOLD_MIN, _BPM_FOLD_MAX
+        ),
+    }
 
 
 def get_audio_url_for_item(

@@ -61,7 +61,15 @@ _CREST_MIN, _CREST_MAX = 3.0, 15.0
 _W_RMS, _W_ONSET, _W_CENTROID, _W_CREST = 0.4, 0.2, 0.2, 0.2
 
 _INTENSITY_CACHE: Dict[str, Optional[float]] = {}
+_FEATURE_CACHE: Dict[str, Dict[str, Optional[float]]] = {}
 _INTENSITY_CACHE_LOCK = threading.Lock()
+
+
+_FEATURE_KEYS = ("rms_mean", "rms_p95", "onset_rate", "spectral_centroid", "crest_factor")
+
+
+def _empty_features() -> Dict[str, Optional[float]]:
+    return {k: None for k in _FEATURE_KEYS}
 
 
 def _normalize(value: float, lo: float, hi: float) -> float:
@@ -71,22 +79,25 @@ def _normalize(value: float, lo: float, hi: float) -> float:
     return max(0.0, min(1.0, (value - lo) / (hi - lo)))
 
 
-def score_intensity_from_samples(
+def extract_features_from_samples(
     samples: Any,
     sample_rate: int,
-) -> Optional[float]:
-    """Compute the 0..1 intensity score from a mono numpy buffer.
+) -> Dict[str, Optional[float]]:
+    """Compute the per-feature normalized scores from a mono numpy buffer.
 
-    Returns ``None`` if numpy/librosa are unavailable, the buffer is
-    empty, or feature extraction raises.
+    Returns a dict with keys :data:`_FEATURE_KEYS`, each normalized to
+    ``[0, 1]`` against the documented empirical min/max ranges. Any
+    failure (no librosa, empty buffer, librosa raises) returns a dict
+    with all keys set to ``None`` — callers can still ``score`` such
+    items, they just contribute nothing to vector similarity.
     """
     try:
         import librosa
         import numpy as np
     except ImportError:
-        return None
+        return _empty_features()
     if samples is None or len(samples) == 0:
-        return None
+        return _empty_features()
 
     try:
         rms_frames = librosa.feature.rms(y=samples)[0]
@@ -95,36 +106,99 @@ def score_intensity_from_samples(
         )[0]
         onsets = librosa.onset.onset_detect(y=samples, sr=sample_rate)
     except Exception:
-        return None
+        return _empty_features()
 
     if rms_frames is None or len(rms_frames) == 0:
-        return None
+        return _empty_features()
 
-    rms_mean = float(np.mean(rms_frames))
-    rms_p95 = float(np.percentile(rms_frames, 95))
-    centroid_mean = float(np.mean(centroid_frames)) if len(centroid_frames) else 0.0
+    rms_mean_val = float(np.mean(rms_frames))
+    rms_p95_val = float(np.percentile(rms_frames, 95))
+    centroid_mean_val = float(np.mean(centroid_frames)) if len(centroid_frames) else 0.0
 
     duration_sec = max(1e-6, len(samples) / float(sample_rate))
-    onset_rate = float(len(onsets)) / duration_sec
+    onset_rate_val = float(len(onsets)) / duration_sec
 
     peak = float(np.max(np.abs(samples)))
     # Guard against silence: a zero RMS would blow up the crest factor.
-    crest = peak / rms_mean if rms_mean > 1e-6 else 0.0
+    crest_val = peak / rms_mean_val if rms_mean_val > 1e-6 else 0.0
 
-    rms_score = 0.5 * _normalize(rms_mean, _RMS_MEAN_MIN, _RMS_MEAN_MAX) + 0.5 * _normalize(
-        rms_p95, _RMS_P95_MIN, _RMS_P95_MAX
-    )
-    onset_score = _normalize(onset_rate, _ONSET_RATE_MIN, _ONSET_RATE_MAX)
-    centroid_score = _normalize(centroid_mean, _CENTROID_MIN, _CENTROID_MAX)
-    crest_score = _normalize(crest, _CREST_MIN, _CREST_MAX)
+    return {
+        "rms_mean": _normalize(rms_mean_val, _RMS_MEAN_MIN, _RMS_MEAN_MAX),
+        "rms_p95": _normalize(rms_p95_val, _RMS_P95_MIN, _RMS_P95_MAX),
+        "onset_rate": _normalize(onset_rate_val, _ONSET_RATE_MIN, _ONSET_RATE_MAX),
+        "spectral_centroid": _normalize(centroid_mean_val, _CENTROID_MIN, _CENTROID_MAX),
+        "crest_factor": _normalize(crest_val, _CREST_MIN, _CREST_MAX),
+    }
 
+
+def score_intensity_from_features(features: Dict[str, Optional[float]]) -> Optional[float]:
+    """Collapse a feature dict to the legacy 0..1 intensity scalar.
+
+    Uses the historical weights: RMS dominates (mean+p95 averaged),
+    onset rate / centroid / crest each contribute one-fifth. Returns
+    ``None`` when no feature has a value (caller should fall back).
+    """
+    rms_mean = features.get("rms_mean")
+    rms_p95 = features.get("rms_p95")
+    onset = features.get("onset_rate")
+    centroid = features.get("spectral_centroid")
+    crest = features.get("crest_factor")
+
+    if all(v is None for v in (rms_mean, rms_p95, onset, centroid, crest)):
+        return None
+
+    rms_score = 0.5 * (rms_mean or 0.0) + 0.5 * (rms_p95 or 0.0)
     score = (
         _W_RMS * rms_score
-        + _W_ONSET * onset_score
-        + _W_CENTROID * centroid_score
-        + _W_CREST * crest_score
+        + _W_ONSET * (onset or 0.0)
+        + _W_CENTROID * (centroid or 0.0)
+        + _W_CREST * (crest or 0.0)
     )
     return max(0.0, min(1.0, score))
+
+
+def score_intensity_from_samples(
+    samples: Any,
+    sample_rate: int,
+) -> Optional[float]:
+    """Legacy entrypoint: extract features from samples, then blend to one score."""
+    features = extract_features_from_samples(samples, sample_rate)
+    return score_intensity_from_features(features)
+
+
+def extract_features(
+    audio_url: str,
+    duration: float = 60.0,
+    use_cache: bool = True,
+) -> Dict[str, Optional[float]]:
+    """Return the per-feature dict for a single preview URL.
+
+    Downloads + decodes the first ``duration`` seconds, then runs
+    :func:`extract_features_from_samples`. On any failure (network,
+    decode, missing librosa) returns a dict where every feature is
+    ``None`` — vector callers should treat that as "no audio signal
+    for this track" and rely on whatever non-audio features exist.
+
+    Results are cached per-URL so the radio can call this lazily
+    without re-downloading on repeated hits.
+    """
+    if use_cache:
+        with _INTENSITY_CACHE_LOCK:
+            cached = _FEATURE_CACHE.get(audio_url)
+            if cached is not None:
+                return dict(cached)
+
+    decoded = _load_audio_segment(audio_url, duration=duration)
+    if decoded is None:
+        features = _empty_features()
+    else:
+        samples, sr = decoded
+        features = extract_features_from_samples(samples, sr)
+
+    if use_cache:
+        with _INTENSITY_CACHE_LOCK:
+            _FEATURE_CACHE[audio_url] = dict(features)
+    return features
 
 
 def score_intensity(
@@ -132,30 +206,23 @@ def score_intensity(
     duration: float = 60.0,
     use_cache: bool = True,
 ) -> Optional[float]:
-    """Public per-track intensity scorer.
+    """Public per-track intensity scorer (legacy 0..1 scalar).
 
-    Downloads the first ``duration`` seconds of ``audio_url``, decodes via
-    librosa, and runs :func:`score_intensity_from_samples`. Returns
-    ``None`` if the audio can't be fetched/decoded or librosa is missing.
+    Now a thin wrapper over :func:`extract_features` + the documented
+    feature weights. Preserved for the radio's chill/party slider and
+    existing callers that want a single number.
 
     ``audio_url`` must be a direct CDN URL to the audio file (e.g. a
     ``https://*.bcbits.com/...`` preview), not a Bandcamp album/track page.
     Use ``bpm.get_audio_url_for_item`` to resolve a page URL first.
-
-    Results are cached per-URL in-process so the radio can call this
-    lazily without paying twice.
     """
     if use_cache:
         with _INTENSITY_CACHE_LOCK:
             if audio_url in _INTENSITY_CACHE:
                 return _INTENSITY_CACHE[audio_url]
 
-    decoded = _load_audio_segment(audio_url, duration=duration)
-    if decoded is None:
-        score: Optional[float] = None
-    else:
-        samples, sr = decoded
-        score = score_intensity_from_samples(samples, sr)
+    features = extract_features(audio_url, duration=duration, use_cache=use_cache)
+    score = score_intensity_from_features(features)
 
     if use_cache:
         with _INTENSITY_CACHE_LOCK:
@@ -164,9 +231,10 @@ def score_intensity(
 
 
 def clear_intensity_cache() -> None:
-    """Clear the in-process intensity cache."""
+    """Clear the in-process intensity + feature caches."""
     with _INTENSITY_CACHE_LOCK:
         _INTENSITY_CACHE.clear()
+        _FEATURE_CACHE.clear()
 
 
 def attach_intensities(
