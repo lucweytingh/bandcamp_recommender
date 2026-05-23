@@ -203,6 +203,47 @@ with SupporterRecommender() as recommender:
 
 ---
 
+## Audio Intensity Score (for radio-style consumers)
+
+When the caller passes `include_intensity=True`, each recommendation gets
+an `intensity` key in `[0.0, 1.0]` (or `None` if no preview was available).
+The score blends RMS energy, onset rate, spectral centroid, and crest
+factor — see `bandcamp_recommender/recommendations/intensity.py` for the
+normalisation constants and weights.
+
+Typical use from a downstream radio that switches between "chill" and
+"party" modes:
+
+```python
+from bandcamp_recommender import SupporterRecommender
+
+with SupporterRecommender() as recommender:
+    recs = recommender.get_recommendations(
+        wishlist_item_url="https://artist.bandcamp.com/album/name",
+        max_recommendations=30,
+        include_bpm=True,
+        include_intensity=True,
+    )
+
+# Sort low → high for a chill set, high → low for a party set.
+chill = sorted(
+    (r for r in recs if r.get("intensity") is not None),
+    key=lambda r: r["intensity"],
+)
+party = list(reversed(chill))
+
+# Or switch modes by threshold.
+mode = "party" if user_mode == "party" else "chill"
+target = 0.75 if mode == "party" else 0.25
+recs.sort(key=lambda r: abs((r.get("intensity") or 0.5) - target))
+```
+
+When both `include_bpm` and `include_intensity` are True, each track's
+preview audio is downloaded and decoded once and shared between the two
+detectors, so enabling both costs roughly the same as enabling either.
+
+---
+
 ## Notes
 
 - Always use `SupporterRecommender` as a context manager (`with` statement) to ensure proper cleanup
@@ -210,3 +251,74 @@ with SupporterRecommender() as recommender:
 - Collections may be private and require authentication (most common reason for empty results)
 - Tag extraction can be slow; it's automatically skipped in `get_random_items()` for performance
 - Driver pool is automatically managed for parallel processing (up to 15 concurrent workers)
+
+---
+
+## Updating to a New Version (for agents in consumer repos)
+
+**Current version: `0.2.0`** (was `0.1.1`). The public API is unchanged — `SupporterRecommender`, `get_recommendations`, `get_random_items`, and `get_tag_similar_recommendations` all keep the same signatures and return shapes. Internally, supporter fetches now go through `curl` first and only fall back to Selenium if blocked, which is ~40% faster on `get_random.py` and avoids spawning Chrome on healthy runs.
+
+### Pick the right command based on how the package was installed
+
+Check the consumer's `pyproject.toml` for a `bandcamp-recommender` entry to determine the install style.
+
+**1. Editable install (`uv add --editable /path/...` or `bandcamp-recommender @ file:///...` with `[tool.uv.sources] bandcamp-recommender = { path = "...", editable = true }`):**
+
+The consumer points at the source tree directly. Just pull the source:
+```bash
+cd /path/to/bandcamp_recommender   # the path the consumer points at
+git pull --ff-only origin master
+```
+No `uv sync` needed — next Python process picks up the new code.
+
+**2. Non-editable file-URL install (`bandcamp-recommender @ file:///path/to/bandcamp_recommender` with no editable flag):**
+
+`uv` caches the built wheel against the version string, so a behavior change without a version bump would silently use the old code. Since this update bumps `0.1.1 → 0.2.0`, force a refresh in the consumer repo:
+```bash
+cd /path/to/consumer/project
+uv lock --upgrade-package bandcamp-recommender
+uv sync
+```
+
+**3. PYTHONPATH / sys.path insert (Option 2 in this doc):**
+
+Just pull. No package metadata involved.
+```bash
+cd /path/to/bandcamp_recommender
+git pull --ff-only origin master
+```
+
+### Verify the upgrade succeeded
+
+From the consumer repo, after updating:
+```bash
+uv run python -c "import bandcamp_recommender, importlib.metadata as m; print(m.version('bandcamp-recommender'))"
+```
+Expected output: `0.2.0`.
+
+Also confirm the new curl-first path is wired in (only present in 0.2.0+):
+```bash
+uv run python -c "from bandcamp_recommender import SupporterRecommender; assert hasattr(SupporterRecommender, '_get_supporter_items_curl_first'); print('OK')"
+```
+
+### What the consumer code needs to change
+
+Nothing — this is a drop-in replacement. The two new env-var knobs are optional:
+
+- `BANDCAMP_DRIVER_POOL=N` — cap the Selenium fallback pool size (default 5; lower if RAM is tight).
+- `BANDCAMP_DISABLE_JS=1` — disable JavaScript in Chrome for extra speed in the fallback path. Off by default because it disables the in-browser `fetch()` used by the collection API; only safe if curl works for the collection API on your network.
+
+### If the upgrade misbehaves
+
+Pin back to `0.1.1` in the consumer's `pyproject.toml`:
+```toml
+dependencies = [
+    "bandcamp-recommender @ file:///path/to/bandcamp_recommender",
+]
+```
+And in `bandcamp_recommender`, check out the prior commit:
+```bash
+cd /path/to/bandcamp_recommender
+git checkout <commit-before-curl-first>
+```
+Then `uv sync --reinstall-package bandcamp-recommender` in the consumer.

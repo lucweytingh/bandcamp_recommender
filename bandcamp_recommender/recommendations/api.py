@@ -27,9 +27,11 @@ def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
         wishlist_url = f"https://bandcamp.com/{username}/wishlist"
         driver.get(wishlist_url)
         
-        # Wait for pagedata element
+        # Wait for pagedata element. Pagedata is server-rendered so it
+        # resolves quickly when the page loads at all; long timeouts mostly
+        # wait out failures.
         try:
-            WebDriverWait(driver, 3).until(
+            WebDriverWait(driver, 1.5).until(
                 EC.presence_of_element_located((By.ID, "pagedata"))
             )
         except Exception:
@@ -37,7 +39,7 @@ def get_fan_id_from_page(driver: WebDriver, username: str) -> Optional[int]:
             profile_url = f"https://bandcamp.com/{username}"
             driver.get(profile_url)
             try:
-                WebDriverWait(driver, 3).until(
+                WebDriverWait(driver, 1.5).until(
                     EC.presence_of_element_located((By.ID, "pagedata"))
                 )
             except Exception:
@@ -79,17 +81,23 @@ def fetch_collection_items_api(
     last_token: str,
     cookies: Dict[str, str],
     referer_url: str,
-    timeout: int = 30
+    timeout: int = 30,
+    driver: Optional[WebDriver] = None
 ) -> List[Dict]:
     """Fetch collection items from Bandcamp API.
-    
+
+    Uses the Selenium browser session (via driver.execute_async_script) when a
+    driver is provided, which avoids 403s from Bandcamp's bot protection on
+    headless servers. Falls back to curl if no driver is given.
+
     Args:
         fan_id: Bandcamp fan ID
         last_token: Token from last page
         cookies: Authentication cookies
         referer_url: Referer URL for the request
         timeout: Request timeout in seconds
-        
+        driver: Optional Selenium WebDriver to execute the fetch inside the browser
+
     Returns:
         List of item dictionaries from API response
     """
@@ -99,10 +107,62 @@ def fetch_collection_items_api(
         "older_than_token": last_token,
         "count": 10000,
     }
-    
+
+    if driver:
+        return _fetch_via_driver(driver, api_url, payload, timeout)
+
+    return _fetch_via_curl(api_url, payload, cookies, referer_url, timeout)
+
+
+def _fetch_via_driver(
+    driver: WebDriver,
+    api_url: str,
+    payload: Dict,
+    timeout: int
+) -> List[Dict]:
+    """Execute a fetch() inside the browser session to avoid bot protection."""
+    try:
+        script = """
+            var callback = arguments[arguments.length - 1];
+            fetch(arguments[0], {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: arguments[1],
+                credentials: 'include'
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) { callback(JSON.stringify(data)); })
+            .catch(function(e) { callback(JSON.stringify({error: e.toString()})); });
+        """
+        old_timeout = driver.timeouts.script
+        driver.set_script_timeout(timeout)
+        try:
+            result_json = driver.execute_async_script(
+                script, api_url, json.dumps(payload)
+            )
+        finally:
+            driver.set_script_timeout(old_timeout)
+
+        if result_json:
+            data = json.loads(result_json)
+            return data.get("items", [])
+    except Exception:
+        pass
+    return []
+
+
+def _fetch_via_curl(
+    api_url: str,
+    payload: Dict,
+    cookies: Dict[str, str],
+    referer_url: str,
+    timeout: int
+) -> List[Dict]:
+    """Fetch via curl subprocess (original approach, may 403 on headless servers)."""
     cookie_string = "; ".join([f"{k}={v}" for k, v in cookies.items()])
     curl_cmd = [
         "curl",
+        "-s",
         "-X",
         "POST",
         "-H",
@@ -117,18 +177,18 @@ def fetch_collection_items_api(
         json.dumps(payload),
         api_url,
     ]
-    
+
     result = subprocess.run(
         curl_cmd, capture_output=True, text=True, timeout=timeout
     )
-    
+
     if result.returncode == 0:
         try:
             data = json.loads(result.stdout)
             return data.get("items", [])
         except (json.JSONDecodeError, KeyError):
             pass
-    
+
     return []
 
 

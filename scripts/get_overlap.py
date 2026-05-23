@@ -67,15 +67,54 @@ Examples:
         default=2,
         help="Minimum number of supporters who must have purchased an item (default: 2)"
     )
-    
+    parser.add_argument(
+        "--bpm",
+        action="store_true",
+        help="Detect a BPM for each recommendation's first preview track. "
+             "Requires librosa (optional dependency)."
+    )
+    parser.add_argument(
+        "--bpm-method",
+        choices=("auto", "joe_sullivan", "librosa"),
+        default="auto",
+        help="BPM detection backend (default: auto = joe_sullivan with librosa fallback)."
+    )
+    parser.add_argument(
+        "--bpm-match",
+        action="store_true",
+        help="Expand the candidate pool, detect BPM for each candidate, and "
+             "re-rank by supporters_count - α * octave-tolerant BPM distance "
+             "from the seed track. α defaults to 0.05 (set BANDCAMP_BPM_RERANK_ALPHA "
+             "to override). Implies --bpm."
+    )
+    parser.add_argument(
+        "--intensity",
+        action="store_true",
+        help="Attach a 0..1 audio intensity score to each recommendation "
+             "(display only, no filtering). Requires librosa."
+    )
+    parser.add_argument(
+        "--mood-tags",
+        action="store_true",
+        help="Print a tag-based chill (-1) to party (+1) mood score "
+             "next to each recommendation's tags. Display only — no extra fetches."
+    )
+
     args = parser.parse_args()
-    
+
     item_url = args.url
     max_recommendations = args.max_recommendations
     min_supporters = args.min_supporters
 
     print(f"Getting recommendations for: {item_url}")
     print(f"Max recommendations: {max_recommendations}, Min supporters: {min_supporters}")
+    if args.bpm or args.bpm_match:
+        mode = "match+rerank" if args.bpm_match else "on"
+        print(f"BPM detection: {mode} ({args.bpm_method})")
+    if args.intensity:
+        print("Intensity scoring: on")
+    if args.mood_tags:
+        print("Mood-tag scoring: on (chill -1 ... +1 party)")
     print("-" * 60)
 
     with SupporterRecommender() as recommender:
@@ -84,6 +123,11 @@ Examples:
             max_recommendations=max_recommendations,
             min_supporters=min_supporters,
             progress_callback=progress_callback,
+            include_bpm=args.bpm or args.bpm_match,
+            bpm_method=args.bpm_method,
+            bpm_match=args.bpm_match,
+            include_intensity=args.intensity,
+            include_mood_tag_score=args.mood_tags,
         )
         
         # Print newline after progress updates
@@ -104,7 +148,26 @@ Examples:
             print(f"   URL: {rec['item_url']}")
             print(f"   Supported by {rec['supporters_count']} people who also bought the original")
             if rec.get('tags'):
-                print(f"   Tags: {', '.join(rec['tags'])}")
+                tags_line = f"   Tags: {', '.join(rec['tags'])}"
+                if args.mood_tags:
+                    score = rec.get('mood_tag_score')
+                    score_str = f"{score:+.2f}" if score is not None else "n/a"
+                    tags_line += f"  [mood {score_str}]"
+                print(tags_line)
+            if rec.get('bpm'):
+                bpm_str = f"{round(rec['bpm'])} BPM"
+                conf = rec.get('bpm_confidence')
+                method = rec.get('bpm_method')
+                if conf is not None:
+                    bpm_str += f" (confidence {conf:.2f}"
+                    if method:
+                        bpm_str += f", via {method}"
+                    bpm_str += ")"
+                print(f"   {bpm_str}")
+            if rec.get('bpm_distance') is not None:
+                print(f"   BPM distance from seed: {rec['bpm_distance']:.1f}")
+            if rec.get('intensity') is not None:
+                print(f"   Intensity: {rec['intensity']:.2f}")
             print()
 
 

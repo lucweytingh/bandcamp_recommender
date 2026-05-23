@@ -1,37 +1,16 @@
 """Selenium WebDriver management for Bandcamp scraping."""
 
-import contextlib
-import io
-import logging
-import sys
+import os
+import shutil
 import time
-import warnings
 from queue import Queue
 from threading import Lock
 from typing import Optional
 
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from seleniumwire import webdriver as wire_webdriver
+from selenium import webdriver
 from webdriver_manager.chrome import ChromeDriverManager
-
-# Suppress selenium-wire RuntimeWarnings (harmless coroutine warnings)
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="seleniumwire")
-
-# Suppress mitmproxy connection errors (harmless proxy initialization errors)
-# These occur when multiple drivers initialize simultaneously and are safe to ignore
-logging.getLogger("seleniumwire.thirdparty.mitmproxy").setLevel(logging.ERROR)
-
-
-@contextlib.contextmanager
-def suppress_stderr():
-    """Context manager to suppress stderr output (for mitmproxy traceback suppression)."""
-    original_stderr = sys.stderr
-    sys.stderr = io.StringIO()
-    try:
-        yield
-    finally:
-        sys.stderr = original_stderr
 
 
 class DriverManager:
@@ -39,14 +18,29 @@ class DriverManager:
 
     def __init__(self):
         """Initialize the driver manager."""
-        self.driver: Optional[wire_webdriver.Chrome] = None
+        self.driver: Optional[webdriver.Chrome] = None
         self._driver_pool: Optional[Queue] = None
         self._driver_pool_lock = Lock()
         self._chrome_service: Optional[Service] = None
 
+    def _get_chromedriver_service(self) -> Service:
+        """Get a ChromeDriver Service, preferring env var or system binary over webdriver_manager."""
+        # 1. Check CHROMEDRIVER env var
+        chromedriver_env = os.environ.get("CHROMEDRIVER", "")
+        if chromedriver_env and os.path.exists(chromedriver_env):
+            return Service(chromedriver_env)
+
+        # 2. Check system chromedriver on PATH
+        system_chromedriver = shutil.which("chromedriver")
+        if system_chromedriver:
+            return Service(system_chromedriver)
+
+        # 3. Fall back to webdriver_manager auto-download
+        return Service(ChromeDriverManager().install())
+
     def get_driver_options(self) -> Options:
         """Get optimized driver options (reusable).
-        
+
         Returns:
             Configured Chrome Options object
         """
@@ -57,37 +51,38 @@ class DriverManager:
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-images")  # Don't load images - faster page loads
+        # Skip images. --blink-settings is the canonical flag; --disable-images
+        # was deprecated upstream and silently ignored in newer Chromium.
+        options.add_argument("--blink-settings=imagesEnabled=false")
+        # Opt-in: disable JS for collection-page fetches. pagedata is in the
+        # initial HTML so this is safe for read-only page loads, but it
+        # breaks api.py:_fetch_via_driver (which uses execute_async_script).
+        # Default off to preserve the curl-403 fallback path.
+        if os.environ.get("BANDCAMP_DISABLE_JS") == "1":
+            options.add_argument("--disable-javascript")
         options.page_load_strategy = "eager"  # Don't wait for all resources to load
         options.add_experimental_option("excludeSwitches", ["enable-logging", "enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
 
-        # Auto-detect Chrome binary
-        chrome_paths = [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-            "/Applications/Arc.app/Contents/MacOS/Arc",
-        ]
-        for path in chrome_paths:
-            try:
-                options.binary_location = path
-                break
-            except Exception:
-                continue
+        # Set Chrome binary only if explicitly configured via env var.
+        # Otherwise let chromedriver find Chrome itself (works for both
+        # snap and apt installs; auto-detection via shutil.which is fragile
+        # because wrapper scripts like /usr/bin/google-chrome may exist but
+        # not be functional Chrome binaries).
+        chrome_binary = os.environ.get("CHROME_BINARY", "")
+        if chrome_binary and os.path.exists(chrome_binary):
+            options.binary_location = chrome_binary
 
         return options
 
     def init_driver(self):
         """Initialize the Selenium webdriver with appropriate options.
-        
+
         Only initialized when needed (for collection pages that require cookies).
         """
         options = self.get_driver_options()
-        service = Service(ChromeDriverManager().install())
-        # Suppress stderr during driver creation to hide harmless mitmproxy errors
-        with suppress_stderr():
-            self.driver = wire_webdriver.Chrome(service=service, options=options)
+        service = self._get_chromedriver_service()
+        self.driver = webdriver.Chrome(service=service, options=options)
 
     def ensure_driver(self):
         """Ensure driver is initialized (lazy initialization)."""
@@ -96,11 +91,11 @@ class DriverManager:
 
     def get_driver_pool(self, pool_size: int = 10, progress_callback=None) -> Queue:
         """Get or create a driver pool for parallel processing.
-        
+
         Args:
             pool_size: Number of drivers to create in the pool
             progress_callback: Optional callback for progress updates
-            
+
         Returns:
             Queue of driver instances
         """
@@ -110,24 +105,18 @@ class DriverManager:
 
                 # Pre-create ChromeDriver service (expensive operation, do once)
                 if self._chrome_service is None:
-                    self._chrome_service = Service(ChromeDriverManager().install())
+                    self._chrome_service = self._get_chromedriver_service()
 
                 # Pre-create drivers (this can take a while, but we do it once)
                 options = self.get_driver_options()
                 for i in range(pool_size):
                     try:
-                        # Add small delay between driver creations to reduce concurrent
-                        # proxy connection attempts (mitigates mitmproxy socket errors)
                         if i > 0:
                             time.sleep(0.1)
-                        
-                        # Suppress stderr during driver creation to hide harmless
-                        # mitmproxy connection errors that occur during initialization
-                        with suppress_stderr():
-                            driver = wire_webdriver.Chrome(
-                                service=self._chrome_service,
-                                options=options
-                            )
+                        driver = webdriver.Chrome(
+                            service=self._chrome_service,
+                            options=options
+                        )
                         self._driver_pool.put(driver)
                         if progress_callback:
                             progress_callback(f"Initialized driver {i+1}/{pool_size}...")
@@ -138,23 +127,21 @@ class DriverManager:
 
         return self._driver_pool
 
-    def create_driver(self) -> wire_webdriver.Chrome:
+    def create_driver(self) -> webdriver.Chrome:
         """Create a new driver instance (for parallel processing).
-        
+
         Note: Prefer using driver pool for better performance.
-        
+
         Returns:
             New Chrome WebDriver instance
         """
         options = self.get_driver_options()
         if self._chrome_service is None:
-            self._chrome_service = Service(ChromeDriverManager().install())
-        # Suppress stderr during driver creation to hide harmless mitmproxy errors
-        with suppress_stderr():
-            return wire_webdriver.Chrome(
-                service=self._chrome_service,
-                options=options
-            )
+            self._chrome_service = self._get_chromedriver_service()
+        return webdriver.Chrome(
+            service=self._chrome_service,
+            options=options
+        )
 
     def close(self):
         """Close the webdriver and cleanup driver pool."""
@@ -171,5 +158,3 @@ class DriverManager:
                 except Exception:
                     pass
             self._driver_pool = None
-
-
