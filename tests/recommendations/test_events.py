@@ -104,6 +104,35 @@ class EventCallbackTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0], {"type": "supporters", "supporters": [], "total": 0})
 
+    def test_random_mode_emits_supporters_and_per_supporter(self):
+        rec = SupporterRecommender()
+        events = []
+        with patch.object(sr, "extract_supporters", return_value=["u1", "u2"]), \
+             patch.object(sr, "extract_item_id", return_value="SEED"), \
+             patch.object(
+                 rec, "_get_supporter_items_curl_first", side_effect=_fake_fetch(rec)
+             ):
+            rec.get_random_items(
+                item_url="https://bc/seed",
+                num_items=5,
+                num_supporters=10,
+                event_callback=events.append,
+            )
+        types = [e["type"] for e in events]
+        self.assertEqual(types[0], "supporters")
+        self.assertEqual(types.count("supporter_done"), 2)
+        self.assertIn("ranked", types)
+
+    def test_random_no_supporters_emits_empty_supporters(self):
+        rec = SupporterRecommender()
+        events = []
+        with patch.object(sr, "extract_supporters", return_value=[]):
+            out = rec.get_random_items(
+                item_url="https://bc/seed", num_items=5, event_callback=events.append,
+            )
+        self.assertEqual(out, [])
+        self.assertEqual(events, [{"type": "supporters", "supporters": [], "total": 0}])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1431,6 +1431,7 @@ class SupporterRecommender:
         min_overlap: Optional[int] = None,
         use_fallback: bool = False,
         progress_callback: Optional[Callable] = None,
+        event_callback: Optional[Callable[[dict], None]] = None,
     ) -> List[Dict[str, Any]]:
         """Get random items from random supporters' collections.
         
@@ -1453,15 +1454,17 @@ class SupporterRecommender:
         if progress_callback:
             progress_callback("Extracting supporters from album page...", 0, 0, 0)
         supporters = extract_supporters(item_url)
-        
+
         if not supporters:
             if progress_callback:
                 progress_callback("No supporters found.", 0, 0, 0)
+            if event_callback:
+                event_callback({"type": "supporters", "supporters": [], "total": 0})
             return []
-        
+
         if progress_callback:
             progress_callback(f"Found {len(supporters)} supporters", len(supporters), len(supporters), 0)
-        
+
         # Select random supporters
         if len(supporters) > num_supporters:
             selected_supporters = random.sample(supporters, num_supporters)
@@ -1470,7 +1473,14 @@ class SupporterRecommender:
         
         if progress_callback:
             progress_callback(f"Checking {len(selected_supporters)} random supporters...", len(selected_supporters), len(selected_supporters), 0)
-        
+
+        if event_callback:
+            event_callback({
+                "type": "supporters",
+                "supporters": list(selected_supporters),
+                "total": len(selected_supporters),
+            })
+
         # Get items from selected supporters
         all_items = []
         start_time = time.time()
@@ -1541,6 +1551,24 @@ class SupporterRecommender:
                                     total_supporters,
                                     int(estimated_seconds)
                                 )
+
+                            if event_callback:
+                                items_meta = []
+                                for iid in items:
+                                    info = self.item_cache.get(iid) or {}
+                                    items_meta.append({
+                                        "id": iid,
+                                        "title": info.get("item_title", ""),
+                                        "band": info.get("band_name", ""),
+                                        "src": "collection",
+                                    })
+                                event_callback({
+                                    "type": "supporter_done",
+                                    "supporter": supporter,
+                                    "index": completed_count,
+                                    "total": total_supporters,
+                                    "items": items_meta,
+                                })
                     except Exception:
                         with completed_lock:
                             completed_count += 1
@@ -1682,7 +1710,24 @@ class SupporterRecommender:
                 )
             else:
                 progress_callback(f"Selected {len(selected_item_ids)} random items.", total_supporters, total_supporters, 0)
-        
+
+        if event_callback:
+            top_meta = []
+            for iid in selected_item_ids:
+                info = self.item_cache.get(iid) or {}
+                top_meta.append({
+                    "id": iid,
+                    "item_url": info.get("item_url", ""),
+                    "title": info.get("item_title", ""),
+                    "band": info.get("band_name", ""),
+                    "supporters_count": item_counts.get(iid, 0),
+                })
+            event_callback({
+                "type": "ranked",
+                "min_supporters": (min_overlap or 1),
+                "top": top_meta,
+            })
+
         # Build result list with metadata
         results = []
         for item_id in selected_item_ids:
