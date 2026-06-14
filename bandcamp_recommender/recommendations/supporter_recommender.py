@@ -205,6 +205,8 @@ class SupporterRecommender:
         if not supporters:
             if progress_callback:
                 progress_callback("No supporters found.", 0, 0, 0)
+            if event_callback:
+                event_callback({"type": "supporters", "supporters": [], "total": 0})
             return []
 
         if progress_callback:

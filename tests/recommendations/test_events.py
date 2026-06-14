@@ -88,5 +88,22 @@ class EventCallbackTests(unittest.TestCase):
         self.assertTrue(any(r["item_url"] == "https://bc/A" for r in out))
 
 
+    def test_no_supporters_emits_empty_supporters(self):
+        rec = SupporterRecommender()
+        events = []
+        with patch.object(sr, "extract_supporters", return_value=[]):
+            out = rec.get_recommendations(
+                wishlist_item_url="https://bc/seed",
+                max_recommendations=10,
+                min_supporters=1,
+                first_page_only=True,
+                hydrate_tags=False,
+                event_callback=events.append,
+            )
+        self.assertEqual(out, [])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0], {"type": "supporters", "supporters": [], "total": 0})
+
+
 if __name__ == "__main__":
     unittest.main()
