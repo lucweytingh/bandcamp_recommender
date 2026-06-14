@@ -223,6 +223,11 @@ class SupporterRecommender:
         if progress_callback:
             progress_callback("Extracting item ID...", 0, 0, 0)
         original_item_id = extract_item_id(wishlist_item_url)
+        # URL-normalized seed key, computed once. Used to drop the seed from
+        # the per-supporter supporter_done emit (the animation's cloud), the
+        # same way it's dropped from the ranked results below. Cosmetic only —
+        # ranking/counting still happen on the full purchase set.
+        seed_key = _normalize_item_url(wishlist_item_url)
 
         # Get purchases from all supporters (with metadata) - parallel processing
         all_purchases = []
@@ -302,6 +307,14 @@ class SupporterRecommender:
                             items_meta = []
                             for iid in purchases:
                                 info = self.item_cache.get(iid) or {}
+                                # Exclude the seed from the emitted cloud nodes
+                                # too — by id and by normalized url — so the
+                                # searched track never appears as a live graph
+                                # node. The ranked results already drop it.
+                                if iid == original_item_id or (
+                                    _normalize_item_url(info.get("item_url", "")) == seed_key
+                                ):
+                                    continue
                                 items_meta.append({
                                     "id": iid,
                                     "title": info.get("item_title", ""),
@@ -358,9 +371,8 @@ class SupporterRecommender:
         # can fail (curl 403, page-structure shift) and return None, leaving
         # the seed in the counter — where it would rank #1 in its own
         # recommendations. Drop any candidate whose normalized item_url
-        # matches the seed url. Done before the slice so the result count
-        # stays at max_recommendations.
-        seed_key = _normalize_item_url(wishlist_item_url)
+        # matches the seed url (seed_key computed once near original_item_id).
+        # Done before the slice so the result count stays at max_recommendations.
         sorted_items = [
             (iid, cnt) for (iid, cnt) in sorted_items
             if _normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
@@ -1506,13 +1518,21 @@ class SupporterRecommender:
                 "total": len(selected_supporters),
             })
 
+        # Seed identity, computed once BEFORE the fetch loop so the
+        # supporter_done emit (inside the loop) can drop the seed from the
+        # animation's cloud nodes — by id and by normalized url. The
+        # id-based pop / url backstop on the counts still happens below
+        # (after the loop); this is purely cosmetic for the emit.
+        seed_id = extract_item_id(item_url)
+        seed_key = _normalize_item_url(item_url)
+
         # Get items from selected supporters
         all_items = []
         start_time = time.time()
         total_supporters = len(selected_supporters)
         completed_count = 0
         completed_lock = Lock()
-        
+
         # Curl-first: no driver pool init up front.
         if progress_callback:
             progress_callback(
@@ -1581,6 +1601,12 @@ class SupporterRecommender:
                                 items_meta = []
                                 for iid in items:
                                     info = self.item_cache.get(iid) or {}
+                                    # Drop the seed from the emitted cloud
+                                    # nodes too — by id and by normalized url.
+                                    if iid == seed_id or (
+                                        _normalize_item_url(info.get("item_url", "")) == seed_key
+                                    ):
+                                        continue
                                     items_meta.append({
                                         "id": iid,
                                         "title": info.get("item_title", ""),
@@ -1631,12 +1657,14 @@ class SupporterRecommender:
                 progress_callback("No items found.", total_supporters, total_supporters, 0)
             return []
         
-        # Get original item ID to exclude it
-        original_item_id = extract_item_id(item_url)
-        
+        # Seed id already extracted once before the fetch loop (seed_id) so
+        # the supporter_done emit could exclude it; reuse it here to drop the
+        # seed from the counts.
+        original_item_id = seed_id
+
         # Count item occurrences (for min_overlap filtering)
         item_counts = Counter(all_items)
-        
+
         # Remove the original item from counts
         if original_item_id and original_item_id in item_counts:
             item_counts.pop(original_item_id)
@@ -1644,8 +1672,8 @@ class SupporterRecommender:
         # URL-normalized backstop for the id-based pop above: extract_item_id
         # can fail (curl 403, page-structure shift) and return None, leaving
         # the seed in the counts. Drop any id whose normalized item_url
-        # matches the seed url, before min_overlap filtering and sampling.
-        seed_key = _normalize_item_url(item_url)
+        # matches the seed url, before min_overlap filtering and sampling
+        # (seed_key computed once before the fetch loop).
         item_counts = Counter({
             iid: cnt for iid, cnt in item_counts.items()
             if _normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key

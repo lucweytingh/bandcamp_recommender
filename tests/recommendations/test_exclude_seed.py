@@ -99,6 +99,94 @@ class ExcludeSeedTests(unittest.TestCase):
             },
         )
 
+    def _assert_no_seed_in_supporter_done(self, events):
+        """Across every supporter_done event, the seed item (stored under id
+        ``seed_item`` with an item_url that normalizes to SEED) is never
+        emitted, but the genuine items DO appear. supporter_done items carry
+        no item_url, so the seed shows up only as its id ``seed_item`` — its
+        absence proves both the id-check and the url-check paths worked."""
+        emitted_ids = set()
+        saw_event = False
+        for ev in events:
+            if ev.get("type") != "supporter_done":
+                continue
+            saw_event = True
+            for it in ev.get("items", []):
+                emitted_ids.add(it["id"])
+        self.assertTrue(saw_event, "expected at least one supporter_done event")
+        # The seed item id must never be emitted into the cloud.
+        self.assertNotIn(
+            "seed_item",
+            emitted_ids,
+            "seed item leaked into a supporter_done event",
+        )
+        # The two genuine items must be present across the cloud.
+        self.assertIn("a1", emitted_ids)
+        self.assertIn("a2", emitted_ids)
+
+    def test_seed_excluded_from_supporter_done_via_id(self):
+        """extract_item_id returns the seed's real tralbum id — the seed must
+        be skipped from the supporter_done cloud by the id check."""
+        rec = SupporterRecommender()
+        events: list[dict] = []
+        with patch.object(sr, "extract_supporters", return_value=["alice", "bob"]), \
+             patch.object(sr, "extract_item_id", return_value="seed_item"), \
+             patch.object(
+                 rec, "_get_supporter_items_curl_first",
+                 side_effect=self._fetch_including_seed(rec),
+             ), \
+             patch.object(rec, "_hydrate_tags_for_items"):
+            rec.get_recommendations(
+                wishlist_item_url=SEED,
+                max_recommendations=10,
+                min_supporters=1,
+                first_page_only=True,
+                hydrate_tags=False,
+                event_callback=events.append,
+            )
+        self._assert_no_seed_in_supporter_done(events)
+
+    def test_seed_excluded_from_supporter_done_via_url(self):
+        """extract_item_id returns None — the seed must still be skipped from
+        the supporter_done cloud by the url-normalization check."""
+        rec = SupporterRecommender()
+        events: list[dict] = []
+        with patch.object(sr, "extract_supporters", return_value=["alice", "bob"]), \
+             patch.object(sr, "extract_item_id", return_value=None), \
+             patch.object(
+                 rec, "_get_supporter_items_curl_first",
+                 side_effect=self._fetch_including_seed(rec),
+             ), \
+             patch.object(rec, "_hydrate_tags_for_items"):
+            rec.get_recommendations(
+                wishlist_item_url=SEED,
+                max_recommendations=10,
+                min_supporters=1,
+                first_page_only=True,
+                hydrate_tags=False,
+                event_callback=events.append,
+            )
+        self._assert_no_seed_in_supporter_done(events)
+
+    def test_random_items_excludes_seed_from_supporter_done_via_url(self):
+        """get_random_items must also keep the seed out of the
+        supporter_done cloud (url path, extract_item_id → None)."""
+        rec = SupporterRecommender()
+        events: list[dict] = []
+        with patch.object(sr, "extract_supporters", return_value=["alice", "bob"]), \
+             patch.object(sr, "extract_item_id", return_value=None), \
+             patch.object(
+                 rec, "_get_supporter_items_curl_first",
+                 side_effect=self._fetch_including_seed(rec),
+             ):
+            rec.get_random_items(
+                item_url=SEED,
+                num_items=10,
+                num_supporters=20,
+                event_callback=events.append,
+            )
+        self._assert_no_seed_in_supporter_done(events)
+
     def test_random_items_excludes_seed_when_extract_item_id_is_none(self):
         rec = SupporterRecommender()
         seed_key = _normalize_item_url(SEED)
