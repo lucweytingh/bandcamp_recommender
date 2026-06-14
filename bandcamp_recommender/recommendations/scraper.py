@@ -125,6 +125,15 @@ def fetch_page_html(url: str, timeout: int = _DEFAULT_CURL_TIMEOUT) -> Optional[
         "curl",
         "-s",  # Silent mode
         "-L",  # Follow redirects
+        # --fail: treat an HTTP error status (429/403/404/5xx) as a failure
+        # (exit 22, empty stdout) instead of exit 0 with the error-page body.
+        # Without this, a rate-limit (429) page is cached as if it were the
+        # real page, so extract_supporters/extract_tags parse it, find
+        # nothing, and the seed returns 0 results for the whole life of the
+        # (long-lived) process — even after the throttle clears. Routing HTTP
+        # errors through the non-zero-exit path means they retry with backoff
+        # and are never cached.
+        "--fail",
         "--compressed",  # Automatically decompress gzip/deflate
         "-H", "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
