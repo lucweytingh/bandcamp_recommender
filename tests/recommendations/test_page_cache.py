@@ -117,6 +117,21 @@ class FetchPageHtmlCacheTests(unittest.TestCase):
         # correctness requirement).
         self.assertLessEqual(len(calls), 2)
 
+    def test_curl_uses_fail_flag_so_http_errors_are_not_cached(self):
+        """curl must run with --fail so an HTTP error (429/4xx/5xx) exits
+        non-zero instead of returning the error-page body with exit 0. That
+        routes it through the not-cached + retry path (see
+        test_failed_fetch_is_not_cached) and prevents a rate-limit page from
+        poisoning the cache for the life of the process."""
+        os.environ["BANDCAMP_PAGE_CACHE_SIZE"] = "16"
+        run, calls = self._fake_run()
+        with patch.object(self.scraper.subprocess, "run", side_effect=run):
+            self.scraper.fetch_page_html("https://x.test/fail-flag", timeout=5)
+        self.assertIn(
+            "--fail", calls[0],
+            "curl must use --fail so HTTP-error responses are never cached",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
