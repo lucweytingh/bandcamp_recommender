@@ -133,6 +133,33 @@ class EventCallbackTests(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertEqual(events, [{"type": "supporters", "supporters": [], "total": 0}])
 
+    def test_wishlist_items_tagged_src(self):
+        rec = SupporterRecommender()
+        events = []
+
+        def fetch(username, data_key, first_page_only=False):
+            iid = "W" if data_key == "wishlist_data" else "C"
+            rec._store_item_metadata(
+                iid,
+                {"item_title": iid, "band_name": "b",
+                 "item_url": f"https://bc/{iid}", "tralbum_id": iid},
+                True,
+            )
+            return [iid]
+
+        with patch.object(sr, "extract_supporters", return_value=["u1"]), \
+             patch.object(sr, "extract_item_id", return_value="SEED"), \
+             patch.object(rec, "_get_supporter_items_curl_first", side_effect=fetch):
+            rec.get_recommendations(
+                wishlist_item_url="https://bc/seed", max_recommendations=10,
+                min_supporters=1, first_page_only=True, hydrate_tags=False,
+                use_wishlist=True, event_callback=events.append,
+            )
+        done = [e for e in events if e["type"] == "supporter_done"][0]
+        by_id = {it["id"]: it["src"] for it in done["items"]}
+        self.assertEqual(by_id["C"], "collection")
+        self.assertEqual(by_id["W"], "wishlist")
+
 
 if __name__ == "__main__":
     unittest.main()

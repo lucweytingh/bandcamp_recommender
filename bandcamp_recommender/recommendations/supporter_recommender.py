@@ -231,6 +231,12 @@ class SupporterRecommender:
         completed_count = 0
         completed_lock = Lock()
 
+        # Per-id provenance: "collection" (owned) wins over "wishlist"
+        # (wanted), accumulated across supporters under a lock so the
+        # supporter_done emit can tag owned vs. wanted edges.
+        item_src: Dict[str, str] = {}
+        item_src_lock = Lock()
+
         # Curl-first: no driver pool init up front. Workers spin up Chrome
         # lazily only if curl falls over for a specific supporter.
         def fetch_supporter_purchases(supporter):
@@ -243,15 +249,22 @@ class SupporterRecommender:
             per-supporter so one person counts an item once even if it's both
             bought and wishlisted — keeps ``min_supporters`` counting people.
             """
-            ids = self._get_supporter_items_curl_first(
+            coll = self._get_supporter_items_curl_first(
                 supporter, "collection_data", first_page_only=first_page_only
             )
+            ids = list(coll)
             if use_wishlist:
-                ids = list(dict.fromkeys(
-                    ids + self._get_supporter_items_curl_first(
-                        supporter, "wishlist_data", first_page_only=first_page_only
-                    )
-                ))
+                wish = self._get_supporter_items_curl_first(
+                    supporter, "wishlist_data", first_page_only=first_page_only
+                )
+                with item_src_lock:
+                    for iid in wish:
+                        if iid not in coll:
+                            item_src.setdefault(iid, "wishlist")
+                ids = list(dict.fromkeys(ids + wish))
+            with item_src_lock:
+                for iid in coll:
+                    item_src[iid] = "collection"
             return ids, supporter
 
         # Use ThreadPoolExecutor for parallel processing. Cap at 15 to avoid
@@ -293,7 +306,7 @@ class SupporterRecommender:
                                     "id": iid,
                                     "title": info.get("item_title", ""),
                                     "band": info.get("band_name", ""),
-                                    "src": "collection",
+                                    "src": item_src.get(iid, "collection"),
                                 })
                             event_callback({
                                 "type": "supporter_done",
