@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Get random items (purchases or wishlist) from random supporters."""
+"""Get random items (purchases, optionally unioned with wishlists) from random supporters."""
 
 import argparse
 import sys
@@ -42,7 +42,7 @@ def progress_callback(status, current, total, estimated_seconds):
 def main():
     """Main function to get random items from supporters."""
     parser = argparse.ArgumentParser(
-        description="Get random items (purchases or wishlist) from random supporters.",
+        description="Get random items (purchases, optionally unioned with wishlists) from random supporters.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -71,7 +71,7 @@ Examples:
     parser.add_argument(
         "--wishlist",
         action="store_true",
-        help="Use wishlist items instead of purchases (default: purchases)"
+        help="Also include supporters' wishlists in the pool, unioned with their purchases (default: purchases only)"
     )
     parser.add_argument(
         "--min-overlap",
@@ -95,8 +95,8 @@ Examples:
     min_overlap = args.min_overlap
     use_fallback = args.use_fallback
     
-    item_type = "wishlist" if use_wishlist else "purchase"
-    item_type_plural = "wishlist items" if use_wishlist else "purchases"
+    item_type = "purchase+wishlist" if use_wishlist else "purchase"
+    item_type_plural = "purchases + wishlist items" if use_wishlist else "purchases"
 
     print(f"Getting {num_items} random {item_type_plural} from {num_supporters} random supporters")
     print(f"Source album: {item_url}")

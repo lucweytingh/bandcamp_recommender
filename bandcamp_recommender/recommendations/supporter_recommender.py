@@ -269,7 +269,7 @@ class SupporterRecommender:
                             remaining = total_supporters - completed_count
                             estimated_seconds = avg_time_per_supporter * remaining
                             progress_callback(
-                                f"Fetching purchases from supporter {completed_count}/{total_supporters} ({supporter})...",
+                                f"Fetching items from supporter {completed_count}/{total_supporters} ({supporter})...",
                                 completed_count,
                                 total_supporters,
                                 int(estimated_seconds)
@@ -1393,7 +1393,10 @@ class SupporterRecommender:
             item_url: URL of the Bandcamp item to get supporters from
             num_items: Number of random items to return
             num_supporters: Number of random supporters to check (default: 20)
-            use_wishlist: If True, use wishlist items instead of purchases (default: False)
+            use_wishlist: If True, draw candidates from the distinct union of each
+                supporter's collection AND wishlist (deduped per supporter), not just
+                their purchases. Consistent with get_recommendations and the UI.
+                Defaults to False (collection only, unchanged behavior).
             min_overlap: Only select items found in at least N supporters' collections (default: None, i.e., any item)
             use_fallback: If True and min_overlap is set, automatically reduce min_overlap if not enough items found
             progress_callback: Optional callback function(status, current, total, estimated_seconds)
@@ -1486,7 +1489,7 @@ class SupporterRecommender:
                                 avg_time = elapsed / completed_count if completed_count > 0 else 2.0
                                 remaining = total_supporters - completed_count
                                 estimated_seconds = avg_time * remaining
-                                item_type = "wishlist items" if use_wishlist else "purchases"
+                                item_type = "purchases + wishlist" if use_wishlist else "purchases"
                                 progress_callback(
                                     f"Fetched {len(items)} {item_type} from {supporter} ({completed_count}/{total_supporters})...",
                                     completed_count,
