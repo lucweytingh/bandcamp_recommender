@@ -137,6 +137,8 @@ class SupporterRecommender:
         include_intensity: bool = False,
         intensity_duration: float = 60.0,
         include_mood_tag_score: bool = False,
+        first_page_only: bool = False,
+        hydrate_tags: bool = True,
     ) -> List[Dict[str, Any]]:
         """Get recommendations based on supporter purchases.
 
@@ -173,6 +175,17 @@ class SupporterRecommender:
                 chill to party (see :mod:`mood_tags`), or ``None`` when no
                 tag in the result matches the lexicon. Free of extra
                 fetches — tags are already hydrated for the top-N.
+            first_page_only: If True, read only each supporter's first
+                collection page (~20 most-recent purchases) instead of
+                paginating their entire collection via the API. Trades
+                deep-overlap recall for a large latency win — a single
+                supporter with a multi-thousand-item collection can cost
+                10-20s of API pagination otherwise. Defaults to False
+                (full collections, unchanged behavior).
+            hydrate_tags: If True (default), fetch tags for the final
+                top-N items. Set False when the caller hydrates tags
+                out-of-band (e.g. from its own page scrape) and wants the
+                candidate pool back without paying the per-item curl cost.
 
         Returns:
             List of recommendation dictionaries with item_title, band_name, item_url, supporters_count
@@ -206,7 +219,7 @@ class SupporterRecommender:
         def fetch_supporter_purchases(supporter):
             """Fetch purchases for a single supporter (thread-safe)."""
             purchases = self._get_supporter_items_curl_first(
-                supporter, "collection_data"
+                supporter, "collection_data", first_page_only=first_page_only
             )
             return purchases, supporter
 
@@ -290,8 +303,12 @@ class SupporterRecommender:
 
         # Hydrate tags only for the final ranked items. This is the big win
         # vs. the old behavior where every item from every supporter triggered
-        # a separate curl call for tags.
-        self._hydrate_tags_for_items([item_id for item_id, _ in top_items])
+        # a separate curl call for tags. Callers running a progressive UI
+        # (boemketel's fast /recommend) skip this entirely — they hydrate
+        # tags out-of-band from their own page scrape — so the candidate
+        # pool can return before paying ~N curl round-trips.
+        if hydrate_tags:
+            self._hydrate_tags_for_items([item_id for item_id, _ in top_items])
 
         # Get item info and build recommendations
         recommendations = []
