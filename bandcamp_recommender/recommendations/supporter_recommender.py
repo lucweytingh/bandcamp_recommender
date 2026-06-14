@@ -6,7 +6,7 @@ import os
 import random
 import time
 from collections import Counter
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
 
@@ -140,6 +140,7 @@ class SupporterRecommender:
         first_page_only: bool = False,
         hydrate_tags: bool = True,
         use_wishlist: bool = False,
+        event_callback: Optional[Callable[[dict], None]] = None,
     ) -> List[Dict[str, Any]]:
         """Get recommendations based on supporter purchases.
 
@@ -204,10 +205,19 @@ class SupporterRecommender:
         if not supporters:
             if progress_callback:
                 progress_callback("No supporters found.", 0, 0, 0)
+            if event_callback:
+                event_callback({"type": "supporters", "supporters": [], "total": 0})
             return []
 
         if progress_callback:
             progress_callback(f"Found {len(supporters)} supporters", len(supporters), len(supporters), 0)
+
+        if event_callback:
+            event_callback({
+                "type": "supporters",
+                "supporters": list(supporters),
+                "total": len(supporters),
+            })
 
         # Get the original item ID to exclude it from recommendations
         if progress_callback:
@@ -221,6 +231,12 @@ class SupporterRecommender:
         completed_count = 0
         completed_lock = Lock()
 
+        # Per-id provenance: "collection" (owned) wins over "wishlist"
+        # (wanted), accumulated across supporters under a lock so the
+        # supporter_done emit can tag owned vs. wanted edges.
+        item_src: Dict[str, str] = {}
+        item_src_lock = Lock()
+
         # Curl-first: no driver pool init up front. Workers spin up Chrome
         # lazily only if curl falls over for a specific supporter.
         def fetch_supporter_purchases(supporter):
@@ -233,15 +249,22 @@ class SupporterRecommender:
             per-supporter so one person counts an item once even if it's both
             bought and wishlisted — keeps ``min_supporters`` counting people.
             """
-            ids = self._get_supporter_items_curl_first(
+            coll = self._get_supporter_items_curl_first(
                 supporter, "collection_data", first_page_only=first_page_only
             )
+            ids = list(coll)
             if use_wishlist:
-                ids = list(dict.fromkeys(
-                    ids + self._get_supporter_items_curl_first(
-                        supporter, "wishlist_data", first_page_only=first_page_only
-                    )
-                ))
+                wish = self._get_supporter_items_curl_first(
+                    supporter, "wishlist_data", first_page_only=first_page_only
+                )
+                with item_src_lock:
+                    for iid in wish:
+                        if iid not in coll:
+                            item_src.setdefault(iid, "wishlist")
+                ids = list(dict.fromkeys(ids + wish))
+            with item_src_lock:
+                for iid in coll:
+                    item_src[iid] = "collection"
             return ids, supporter
 
         # Use ThreadPoolExecutor for parallel processing. Cap at 15 to avoid
@@ -256,7 +279,7 @@ class SupporterRecommender:
             }
 
             # Process completed tasks as they finish
-            for future in future_to_supporter:
+            for future in as_completed(future_to_supporter):
                 try:
                     purchases, supporter = future.result()
                     with completed_lock:
@@ -274,6 +297,24 @@ class SupporterRecommender:
                                 total_supporters,
                                 int(estimated_seconds)
                             )
+
+                        if event_callback:
+                            items_meta = []
+                            for iid in purchases:
+                                info = self.item_cache.get(iid) or {}
+                                items_meta.append({
+                                    "id": iid,
+                                    "title": info.get("item_title", ""),
+                                    "band": info.get("band_name", ""),
+                                    "src": item_src.get(iid, "collection"),
+                                })
+                            event_callback({
+                                "type": "supporter_done",
+                                "supporter": supporter,
+                                "index": completed_count,
+                                "total": total_supporters,
+                                "items": items_meta,
+                            })
                 except Exception as e:
                     supporter = future_to_supporter[future]
                     print(f"Error processing {supporter}: {e}")
@@ -318,6 +359,23 @@ class SupporterRecommender:
             top_items = sorted_items[:expanded_pool_size]
         else:
             top_items = sorted_items[:max_recommendations]
+
+        if event_callback:
+            top_meta = []
+            for iid, cnt in top_items:
+                info = self.item_cache.get(iid) or {}
+                top_meta.append({
+                    "id": iid,
+                    "item_url": info.get("item_url", ""),
+                    "title": info.get("item_title", ""),
+                    "band": info.get("band_name", ""),
+                    "supporters_count": cnt,
+                })
+            event_callback({
+                "type": "ranked",
+                "min_supporters": min_supporters,
+                "top": top_meta,
+            })
 
         if progress_callback:
             progress_callback("Building recommendations...", total_supporters, total_supporters, 0)
@@ -1386,6 +1444,7 @@ class SupporterRecommender:
         min_overlap: Optional[int] = None,
         use_fallback: bool = False,
         progress_callback: Optional[Callable] = None,
+        event_callback: Optional[Callable[[dict], None]] = None,
     ) -> List[Dict[str, Any]]:
         """Get random items from random supporters' collections.
         
@@ -1408,15 +1467,17 @@ class SupporterRecommender:
         if progress_callback:
             progress_callback("Extracting supporters from album page...", 0, 0, 0)
         supporters = extract_supporters(item_url)
-        
+
         if not supporters:
             if progress_callback:
                 progress_callback("No supporters found.", 0, 0, 0)
+            if event_callback:
+                event_callback({"type": "supporters", "supporters": [], "total": 0})
             return []
-        
+
         if progress_callback:
             progress_callback(f"Found {len(supporters)} supporters", len(supporters), len(supporters), 0)
-        
+
         # Select random supporters
         if len(supporters) > num_supporters:
             selected_supporters = random.sample(supporters, num_supporters)
@@ -1425,7 +1486,14 @@ class SupporterRecommender:
         
         if progress_callback:
             progress_callback(f"Checking {len(selected_supporters)} random supporters...", len(selected_supporters), len(selected_supporters), 0)
-        
+
+        if event_callback:
+            event_callback({
+                "type": "supporters",
+                "supporters": list(selected_supporters),
+                "total": len(selected_supporters),
+            })
+
         # Get items from selected supporters
         all_items = []
         start_time = time.time()
@@ -1496,6 +1564,24 @@ class SupporterRecommender:
                                     total_supporters,
                                     int(estimated_seconds)
                                 )
+
+                            if event_callback:
+                                items_meta = []
+                                for iid in items:
+                                    info = self.item_cache.get(iid) or {}
+                                    items_meta.append({
+                                        "id": iid,
+                                        "title": info.get("item_title", ""),
+                                        "band": info.get("band_name", ""),
+                                        "src": "collection",
+                                    })
+                                event_callback({
+                                    "type": "supporter_done",
+                                    "supporter": supporter,
+                                    "index": completed_count,
+                                    "total": total_supporters,
+                                    "items": items_meta,
+                                })
                     except Exception:
                         with completed_lock:
                             completed_count += 1
@@ -1637,7 +1723,24 @@ class SupporterRecommender:
                 )
             else:
                 progress_callback(f"Selected {len(selected_item_ids)} random items.", total_supporters, total_supporters, 0)
-        
+
+        if event_callback:
+            top_meta = []
+            for iid in selected_item_ids:
+                info = self.item_cache.get(iid) or {}
+                top_meta.append({
+                    "id": iid,
+                    "item_url": info.get("item_url", ""),
+                    "title": info.get("item_title", ""),
+                    "band": info.get("band_name", ""),
+                    "supporters_count": item_counts.get(iid, 0),
+                })
+            event_callback({
+                "type": "ranked",
+                "min_supporters": (min_overlap or 1),
+                "top": top_meta,
+            })
+
         # Build result list with metadata
         results = []
         for item_id in selected_item_ids:
