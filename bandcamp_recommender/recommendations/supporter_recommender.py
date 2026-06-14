@@ -354,6 +354,18 @@ class SupporterRecommender:
             filtered_items.items(), key=lambda x: x[1], reverse=True
         )
 
+        # URL-normalized backstop for the id-based pop above: extract_item_id
+        # can fail (curl 403, page-structure shift) and return None, leaving
+        # the seed in the counter — where it would rank #1 in its own
+        # recommendations. Drop any candidate whose normalized item_url
+        # matches the seed url. Done before the slice so the result count
+        # stays at max_recommendations.
+        seed_key = _normalize_item_url(wishlist_item_url)
+        sorted_items = [
+            (iid, cnt) for (iid, cnt) in sorted_items
+            if _normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
+        ]
+
         if bpm_match:
             expanded_pool_size = max(50, max_recommendations * 3)
             top_items = sorted_items[:expanded_pool_size]
@@ -1628,7 +1640,17 @@ class SupporterRecommender:
         # Remove the original item from counts
         if original_item_id and original_item_id in item_counts:
             item_counts.pop(original_item_id)
-        
+
+        # URL-normalized backstop for the id-based pop above: extract_item_id
+        # can fail (curl 403, page-structure shift) and return None, leaving
+        # the seed in the counts. Drop any id whose normalized item_url
+        # matches the seed url, before min_overlap filtering and sampling.
+        seed_key = _normalize_item_url(item_url)
+        item_counts = Counter({
+            iid: cnt for iid, cnt in item_counts.items()
+            if _normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
+        })
+
         # Filter by min_overlap if specified, with fallback if enabled
         final_overlap = None
         if min_overlap is not None and min_overlap > 1:
