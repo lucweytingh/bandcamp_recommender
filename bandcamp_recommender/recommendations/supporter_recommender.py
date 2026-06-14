@@ -139,6 +139,7 @@ class SupporterRecommender:
         include_mood_tag_score: bool = False,
         first_page_only: bool = False,
         hydrate_tags: bool = True,
+        use_wishlist: bool = False,
     ) -> List[Dict[str, Any]]:
         """Get recommendations based on supporter purchases.
 
@@ -186,6 +187,12 @@ class SupporterRecommender:
                 top-N items. Set False when the caller hydrates tags
                 out-of-band (e.g. from its own page scrape) and wants the
                 candidate pool back without paying the per-item curl cost.
+            use_wishlist: If True, draw candidates from the distinct union of
+                each supporter's collection AND wishlist (deduped per
+                supporter). Both lists come from the same ``/wishlist``
+                pagedata, so with ``first_page_only`` the wishlist read is a
+                page-cache hit (no extra network). Defaults to False
+                (collection only, unchanged behavior).
 
         Returns:
             List of recommendation dictionaries with item_title, band_name, item_url, supporters_count
@@ -217,11 +224,25 @@ class SupporterRecommender:
         # Curl-first: no driver pool init up front. Workers spin up Chrome
         # lazily only if curl falls over for a specific supporter.
         def fetch_supporter_purchases(supporter):
-            """Fetch purchases for a single supporter (thread-safe)."""
-            purchases = self._get_supporter_items_curl_first(
+            """Fetch purchases (and optionally wishlist) for one supporter.
+
+            With ``use_wishlist`` the candidate set is the distinct union of
+            the supporter's collection and wishlist. Both lists live in the
+            same ``/wishlist`` pagedata, so the second fetch is a page-cache
+            hit (no extra network) in the ``first_page_only`` path. Dedupe is
+            per-supporter so one person counts an item once even if it's both
+            bought and wishlisted — keeps ``min_supporters`` counting people.
+            """
+            ids = self._get_supporter_items_curl_first(
                 supporter, "collection_data", first_page_only=first_page_only
             )
-            return purchases, supporter
+            if use_wishlist:
+                ids = list(dict.fromkeys(
+                    ids + self._get_supporter_items_curl_first(
+                        supporter, "wishlist_data", first_page_only=first_page_only
+                    )
+                ))
+            return ids, supporter
 
         # Use ThreadPoolExecutor for parallel processing. Cap at 15 to avoid
         # hammering Bandcamp; curl handshakes are cheap so this is the limit
@@ -1418,12 +1439,18 @@ class SupporterRecommender:
                 0,
             )
 
-        data_key = "wishlist_data" if use_wishlist else "collection_data"
-
         def fetch_supporter_items(supporter):
-            """Fetch items (purchases or wishlist) for a single supporter."""
+            """Fetch items for one supporter: collection, plus wishlist when
+            ``use_wishlist`` is set (distinct union, deduped per supporter).
+            Union — not replace — so the flag means "also mine wishlists, not
+            just collections" consistently with get_recommendations and the UI.
+            """
             try:
-                items = self._get_supporter_items_curl_first(supporter, data_key)
+                items = self._get_supporter_items_curl_first(supporter, "collection_data")
+                if use_wishlist:
+                    items = list(dict.fromkeys(
+                        items + self._get_supporter_items_curl_first(supporter, "wishlist_data")
+                    ))
                 return items, supporter
             except Exception:
                 return [], supporter
