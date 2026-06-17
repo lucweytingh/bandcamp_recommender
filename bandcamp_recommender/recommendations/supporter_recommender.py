@@ -553,6 +553,10 @@ class SupporterRecommender:
         feature_weights: Optional[Dict[str, float]] = None,
         intensity_duration: float = 60.0,
         bpm_duration: float = 60.0,
+        diversify: Optional[str] = None,
+        diversity_lambda: float = 0.5,
+        vibe_tau: float = 0.15,
+        realm_mult: float = 1.5,
         progress_callback: Optional[Callable] = None,
     ) -> List[Dict[str, Any]]:
         """Get recommendations ordered by feature-vector similarity to a source.
@@ -588,6 +592,17 @@ class SupporterRecommender:
         ``feature_weights`` is passed straight through to ``distance`` —
         leave as ``None`` to use ``features.DEFAULT_WEIGHTS``, or override
         per-feature for the radio's mode-specific tuning.
+
+        ``diversify`` opts into an in-vibe diversity re-rank applied to the
+        distance-ranked pool before trimming to ``max_recommendations``: instead
+        of the top-k (which cluster in style) it returns k items that are diverse
+        in style while keeping the source's vibe (intensity within ``vibe_tau``)
+        and staying related (``realm_mult``). Modes: ``"mmr"`` (relevance↔
+        diversity via ``diversity_lambda`` 0..1), ``"maxmin"`` (max style spread),
+        ``"stratified"`` (genre/artist coverage). ``None`` (the default) is the
+        plain similarity ranking — fully backward-compatible; if unset it falls
+        back to the ``BANDCAMP_DIVERSIFY`` env var. See
+        :mod:`bandcamp_recommender.recommendations.diversity`.
         """
         # Local import keeps the optional audio stack out of cold starts
         # for the rest of the package.
@@ -689,6 +704,23 @@ class SupporterRecommender:
             cand["distance"] = d
             (rated if d is not None else unrated).append(cand)
         rated.sort(key=lambda c: c["distance"])
+
+        # Opt-in in-vibe diversity re-rank (applied to the feature-comparable
+        # candidates; the unrated tail keeps its sink-to-bottom order). Default
+        # off → plain similarity ranking. Falls back to the BANDCAMP_DIVERSIFY
+        # env so it can be toggled without a code change, mirroring the BPM
+        # re-rank knob.
+        mode = diversify if diversify is not None else os.environ.get("BANDCAMP_DIVERSIFY")
+        if mode:
+            from bandcamp_recommender.recommendations.diversity import diversify_items
+            rated = diversify_items(
+                rated,
+                source_features,
+                mode=mode,
+                lam=diversity_lambda,
+                vibe_tau=vibe_tau,
+                realm_mult=realm_mult,
+            )
 
         ranked = (rated + unrated)[:max_recommendations]
         if progress_callback:
