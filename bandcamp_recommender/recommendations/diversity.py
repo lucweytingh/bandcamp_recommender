@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import statistics
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -431,10 +432,31 @@ def diversify_items(
     / ``maxmin`` / ``stratified``) so the set spreads across styles while staying
     anchored to the source; out-of-vibe candidates are appended as backfill (so a
     caller asking for k items is never starved). ``k`` truncates the result.
-    ``mode`` falsey (None/"baseline"/"none") is a no-op (just truncates to k).
+
+    ``mode`` is normalized (trimmed + lower-cased): ``None``/""/"baseline"/"none"
+    is a no-op (plain ranking, just truncates to k); ``"mmr"``/``"maxmin"``/
+    ``"stratified"`` select a strategy. An **unknown** mode (an operator typo in a
+    param or the ``BANDCAMP_DIVERSIFY`` env) does NOT raise — it warns and falls
+    back to the plain ranking, so a config typo can never crash recommendation
+    generation.
     """
     out = list(items)
-    if not mode or mode in ("baseline", "none") or len(out) < 2:
+    norm = (mode or "").strip().lower()
+    if norm in ("", "baseline", "none") or len(out) < 2:
+        return out[:k] if k else out
+
+    selector_factories = {
+        "mmr": lambda g, seed: select_mmr(g, seed, len(g), lam=lam),
+        "maxmin": lambda g, seed: select_maxmin(g, seed, len(g)),
+        "stratified": lambda g, seed: select_stratified(g, seed, len(g)),
+    }
+    factory = selector_factories.get(norm)
+    if factory is None:
+        warnings.warn(
+            f"unknown diversify mode {mode!r}; returning plain similarity ranking "
+            f"(expected one of {sorted(selector_factories)})",
+            stacklevel=2,
+        )
         return out[:k] if k else out
 
     seed = Track(features=source_features or {}, id="__source__")
@@ -450,14 +472,7 @@ def diversify_items(
     gate = GateConfig(tau_int=vibe_tau, realm_mult=realm_mult if realm_mult else None)
     gated = vibe_gate(cand, seed, gate)
     gated_ids = {t.id for t in gated}
-
-    selector = {
-        "mmr": lambda g: select_mmr(g, seed, len(g), lam=lam),
-        "maxmin": lambda g: select_maxmin(g, seed, len(g)),
-        "stratified": lambda g: select_stratified(g, seed, len(g)),
-    }.get(mode)
-    if selector is None:
-        raise ValueError(f"unknown diversify mode: {mode!r}")
+    selector = lambda g: factory(g, seed)
 
     ranked = selector(gated) if gated else []
     order = [int(t.id) for t in ranked]

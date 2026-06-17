@@ -337,3 +337,24 @@ def test_diversify_items_handles_missing_features_and_distance():
     items = [{"item_url": "a", "band_name": "x"}, {"item_url": "b", "band_name": "y"}]
     out = diversify_items(items, src, mode="mmr")
     assert {i["item_url"] for i in out} == {"a", "b"}
+
+
+def test_diversify_items_normalizes_mode_case_and_whitespace():
+    src = feat(intensity=0.5)
+    items = [_item(mood=-0.9, dist=0.10, url="a"), _item(mood=-0.88, dist=0.11, url="a2"),
+             _item(mood=0.9, dist=0.13, url="b")]
+    canonical = [i["item_url"] for i in diversify_items(items, src, mode="mmr")]
+    for variant in ("MMR", " mmr ", "Mmr"):
+        assert [i["item_url"] for i in diversify_items(items, src, mode=variant)] == canonical
+
+
+def test_diversify_items_unknown_mode_is_noop_not_crash():
+    src = feat(intensity=0.5)
+    items = [_item(mood=-0.8, dist=0.1, url="a"), _item(mood=0.8, dist=0.2, url="b")]
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        out = diversify_items(items, src, mode="max-min")  # operator typo
+    # Degrades gracefully to the plain ranking instead of raising.
+    assert [i["item_url"] for i in out] == ["a", "b"]
+    assert any("unknown diversify mode" in str(x.message).lower() for x in w)

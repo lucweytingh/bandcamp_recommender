@@ -84,6 +84,26 @@ class DiversifyWiringTests(unittest.TestCase):
         spy.assert_called_once()
         assert spy.call_args.kwargs.get("mode") == "maxmin"
 
+    def test_garbage_mode_does_not_crash(self):
+        # An operator typo in the env (or param) must NOT crash recommendation
+        # generation — it degrades to the plain similarity ranking with a warning.
+        import warnings
+        os.environ["BANDCAMP_DIVERSIFY"] = "max-min"  # typo, runs the real re-rank
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = self.rec.get_similar_recommendations(
+                "https://x.bandcamp.com/album/seed", max_recommendations=3)
+        assert [c["item_url"] for c in out] == [c["item_url"] for c in _cands()]
+
+    def test_garbage_param_does_not_crash(self):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = self.rec.get_similar_recommendations(
+                "https://x.bandcamp.com/album/seed", max_recommendations=3,
+                diversify="MMR ")  # case/whitespace typo still works (normalized)
+        assert len(out) == 3
+
 
 if __name__ == "__main__":
     unittest.main()
