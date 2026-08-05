@@ -101,6 +101,28 @@ Each returned dict includes:
 - `distance` — weighted-Euclidean distance to the source
   (smaller = more similar)
 
+#### In-vibe diversity (opt-in)
+
+By default the top-k cluster in style. Pass `diversify` to instead get k recs
+that are **diverse in style while keeping the source's vibe** (intensity within
+`vibe_tau`) and staying related to it — a "more like this, but varied" mode:
+
+```python
+recs = r.get_similar_recommendations(
+    source_url="https://artist.bandcamp.com/track/seed",
+    max_recommendations=4,
+    diversify="mmr",        # "mmr" | "maxmin" | "stratified" (None = plain ranking)
+    diversity_lambda=0.5,   # mmr: 1.0 = relevance-only, 0.0 = pure spread
+    vibe_tau=0.15,          # max |intensity - source intensity| to stay in-vibe
+)
+```
+
+MMR is the recommended default (best diversity↔vibe-tightness↔anchoring balance);
+see `bandcamp_recommender/recommendations/diversity.py` and the side-by-side study
+in `docs/diversity-eval-results.md`. Backward-compatible: `diversify=None` (the
+default) is the unchanged similarity ranking; the `BANDCAMP_DIVERSIFY` env var
+sets a global default when the param is unset.
+
 ### Feature vectors (similarity matching, mood projection)
 
 ```python

@@ -87,7 +87,7 @@ wheels = [
 
 [[package]]
 name = "bandcamp-recommender"
-version = "0.5.1"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
