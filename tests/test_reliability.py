@@ -248,7 +248,7 @@ class SharedBrowserTests(unittest.TestCase):
             self.assertEqual(chrome.call_count, 1, "fallback must not start a Chrome per page")
             browser.close()
         fake.quit.assert_called_once()
-        self.assertFalse(browser.is_running())
+        self.assertIsNone(browser._driver)
 
     def test_dead_driver_is_quit_and_replaced(self):
         from bandcamp_recommender import browser

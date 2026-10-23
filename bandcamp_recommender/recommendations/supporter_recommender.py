@@ -797,28 +797,6 @@ class SupporterRecommender:
             )
         return ranked
 
-    def _hydrate_audio_urls_for_items(self, items: List[Dict[str, Any]]) -> None:
-        """Fill in ``audio_url`` for any item missing one (parallel, in-place).
-
-        Each call is one curl + parse of the item page, so we cap
-        concurrency at the same modest level as tag hydration.
-        """
-        from bandcamp_recommender.recommendations.bpm import get_audio_url_for_item
-
-        targets = [it for it in items if not it.get("audio_url") and it.get("item_url")]
-        if not targets:
-            return
-
-        def _fetch_one(item: Dict[str, Any]) -> None:
-            try:
-                item["audio_url"] = get_audio_url_for_item(item["item_url"])
-            except Exception:
-                item["audio_url"] = None
-
-        workers = min(_DEFAULT_TAG_WORKERS, len(targets))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(_fetch_one, targets))
-
     def _store_item_metadata(
         self,
         item_id_str: str,
@@ -926,6 +904,7 @@ class SupporterRecommender:
         depth = "first" if first_page_only else f"n{self._collection_page_size}"
         cached = bc_cache.get_supporter_items(username, data_key, depth)
         if cached is not None:
+            http.count("supporter_cached")
             ids = []
             for iid, title, band, url in cached:
                 self._store_item_metadata(
@@ -940,8 +919,10 @@ class SupporterRecommender:
                     raise http.Challenged(f"breaker tripped: {username}")
                 result = None
                 if username in self._fan_ids:
+                    http.count("supporter_api")
                     result = self._read_supporter_api(username, data_key, first_page_only)
                 if result is None:
+                    http.count("supporter_page")
                     result = self._read_supporter(username, data_key, first_page_only, None)
                 ids, complete = result
                 curl_breaker.record_outcome(success=True)
@@ -972,7 +953,11 @@ class SupporterRecommender:
                      (self.item_cache.get(iid) or {}).get("item_url", "")]
                     for iid in ids
                 ]
-            bc_cache.put_supporter_items(username, data_key, depth, rows)
+            # An empty list may be a soft failure: don't pin it for a week.
+            bc_cache.put_supporter_items(
+                username, data_key, depth, rows,
+                ttl_s=bc_cache.SUPPORTER_TTL_S if rows else bc_cache.EMPTY_SUPPORTER_TTL_S,
+            )
         return ids
 
     def _read_supporter_api(self, username: str, data_key: str, first_page_only: bool):
@@ -1237,7 +1222,7 @@ class SupporterRecommender:
             # in the queue far longer than it runs. Each request is already
             # bounded by its own wall-clock deadline.
             pending = set(future_to_supporter.keys())
-            max_future_time = 90
+            max_future_time = 150
 
             while pending:
                 done, _still_pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
@@ -1509,7 +1494,7 @@ class SupporterRecommender:
             # in the queue far longer than it runs. Each request is already
             # bounded by its own wall-clock deadline.
             pending = set(future_to_supporter.keys())
-            max_future_time = 90
+            max_future_time = 150
 
             while pending:
                 done, _still_pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
@@ -1759,7 +1744,7 @@ class SupporterRecommender:
         process-wide now; see bandcamp_recommender.browser)."""
         from bandcamp_recommender import browser
 
-        browser.close_if_idle(0)
+        browser.close_if_idle()
 
     def __enter__(self):
         """Context manager entry."""

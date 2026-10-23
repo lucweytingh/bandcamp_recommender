@@ -42,6 +42,7 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 import requests
+import urllib3
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,9 @@ def is_challenge_page(body: str) -> bool:
 
 _COUNTER_NAMES = (
     "requests", "challenged", "rate_limited", "timeouts", "errors", "selenium_fallbacks",
+    # How supporter collections were read: one API call (fan_id known) vs
+    # fan page + API. A rising supporter_page share doubles cold-seed cost.
+    "supporter_api", "supporter_page", "supporter_cached",
 )
 _counters: Dict[str, int] = {k: 0 for k in _COUNTER_NAMES}
 _counters_lock = threading.Lock()
@@ -271,7 +275,15 @@ def _read_body(resp: requests.Response, deadline: float, url: str) -> bytes:
     while True:
         if time.monotonic() > deadline:
             raise Timeout(f"wall-clock deadline exceeded reading {url}")
-        chunk = raw.read1(_CHUNK, decode_content=True)
+        # Reading `raw` bypasses requests' exception translation: map
+        # urllib3/socket errors onto our typed errors so a mid-body stall,
+        # reset or bad gzip is a counted FetchError, never an escape.
+        try:
+            chunk = raw.read1(_CHUNK, decode_content=True)
+        except urllib3.exceptions.ReadTimeoutError as e:
+            raise Timeout(f"read timeout mid-body: {url}") from e
+        except (urllib3.exceptions.HTTPError, OSError) as e:
+            raise FetchError(f"transport error mid-body: {url}: {e}") from e
         if not chunk:
             return bytes(buf)
         buf.extend(chunk)
@@ -326,6 +338,9 @@ def request(method: str, url: str, *, timeout: float, **kwargs: Any) -> Response
             status, result = _attempt(session, gate, method, url, timeout, kwargs)
         except Timeout:
             count("timeouts")
+            raise
+        except FetchError:
+            count("errors")
             raise
         except requests.Timeout as e:
             count("timeouts")
@@ -451,15 +466,35 @@ def _page_cache_put(url: str, body: str) -> None:
             _page_cache_drop(oldest)
 
 
-def peek_page(url: str) -> Optional[str]:
-    """A cached page if present, without fetching."""
-    return _page_cache_get(url)
+_FAILURE_TTL_S = 60.0
+_failures: Dict[str, tuple] = {}
+
+
+def _remember_failure(url: str, error: FetchError) -> None:
+    with _page_cache_lock:
+        _failures[url] = (time.monotonic() + _FAILURE_TTL_S, error)
+        if len(_failures) > 512:
+            now = time.monotonic()
+            for k in [k for k, (exp, _) in _failures.items() if exp < now]:
+                del _failures[k]
+
+
+def _recent_failure(url: str) -> Optional[FetchError]:
+    with _page_cache_lock:
+        entry = _failures.get(url)
+        if entry is None:
+            return None
+        if time.monotonic() > entry[0]:
+            del _failures[url]
+            return None
+        return entry[1]
 
 
 def clear_page_cache() -> None:
     global _page_cache_bytes
     with _page_cache_lock:
         _page_cache.clear()
+        _failures.clear()
         _page_cache_bytes = 0
 
 
@@ -475,26 +510,39 @@ def get_page(url: str, expect: Optional[str] = None, timeout: float = 20,
 
     if cache:
         cached = _page_cache_get(url)
-        if cached is not None:
+        if cached is not None and (expect is None or expect in cached):
             return cached
+    failed = _recent_failure(url)
+    if failed is not None:
+        # Asked again moments after it failed (e.g. tags then audio for the
+        # same candidate): don't spend another paced request or browser load.
+        raise failed
 
     body: Optional[str] = None
     if not curl_breaker.should_skip_curl():
         try:
             body = get_html(url, expect=expect, timeout=timeout)
             curl_breaker.record_outcome(success=True)
-        except Challenged:
+        except Challenged as e:
             curl_breaker.record_outcome(success=False)
             if not fallback:
+                _remember_failure(url, e)
                 raise
             logger.warning("bot challenge on %s; using the fallback browser", url)
+        except FetchError as e:
+            _remember_failure(url, e)
+            raise
     elif not fallback:
         raise Challenged(f"challenge breaker tripped: {url}")
 
-    if body is None:
-        from bandcamp_recommender import browser
+    try:
+        if body is None:
+            from bandcamp_recommender import browser
 
-        body = browser.fetch_html(url, expect)
+            body = browser.fetch_html(url, expect)
+    except FetchError as e:
+        _remember_failure(url, e)
+        raise
     if cache:
         _page_cache_put(url, body)
     return body

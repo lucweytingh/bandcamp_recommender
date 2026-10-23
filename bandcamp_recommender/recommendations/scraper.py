@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import threading
+from collections import OrderedDict
 from typing import Dict, List, Optional
 
 from bs4 import BeautifulSoup
@@ -76,6 +78,7 @@ def extract_supporters(item_url: str) -> List[str]:
                 collectors_json = json.loads(data_blob)
                 # Extract usernames from thumbs array
                 thumbs = collectors_json.get("thumbs", [])
+                _remember_fan_ids(item_url, thumbs)
                 for thumb in thumbs:
                     username = thumb.get("username")
                     if username:
@@ -164,28 +167,31 @@ def extract_supporters(item_url: str) -> List[str]:
     return unique_supporters
 
 
+# item_url -> {username: fan_id}, filled by extract_supporters from the parse
+# it already does. Lets each supporter's collection be read with ONE API call
+# (fan page + API call otherwise). Small LRU: callers read it right after.
+_fan_ids_by_item: "OrderedDict[str, Dict[str, int]]" = OrderedDict()
+_fan_ids_lock = threading.Lock()
+
+
+def _remember_fan_ids(item_url: str, thumbs) -> None:
+    ids = {
+        t.get("username"): t.get("fan_id")
+        for t in thumbs or []
+        if t.get("username") and t.get("fan_id")
+    }
+    with _fan_ids_lock:
+        _fan_ids_by_item[item_url] = ids
+        _fan_ids_by_item.move_to_end(item_url)
+        while len(_fan_ids_by_item) > 64:
+            _fan_ids_by_item.popitem(last=False)
+
+
 def supporter_fan_ids(item_url: str) -> Dict[str, int]:
-    """``{username: fan_id}`` for the supporters shown on an item page, read
-    from the page cache only (``extract_supporters`` just fetched it). Lets a
-    supporter's collection be read with ONE API call instead of fan page +
-    API call. Empty when the page isn't cached or has no ids."""
-    html = http.peek_page(item_url)
-    if not html:
-        return {}
-    soup = BeautifulSoup(html, features="html.parser")
-    collectors_data = soup.find("div", id="collectors-data")
-    if not collectors_data:
-        return {}
-    try:
-        blob = json.loads(collectors_data.get("data-blob") or "{}")
-    except (json.JSONDecodeError, TypeError):
-        return {}
-    out: Dict[str, int] = {}
-    for thumb in blob.get("thumbs", []) or []:
-        username, fan_id = thumb.get("username"), thumb.get("fan_id")
-        if username and fan_id:
-            out[username] = fan_id
-    return out
+    """``{username: fan_id}`` for the supporters :func:`extract_supporters`
+    last read from ``item_url`` (empty if it wasn't called or found none)."""
+    with _fan_ids_lock:
+        return dict(_fan_ids_by_item.get(item_url) or {})
 
 
 def _parse_supporters_from_html(html: str) -> List[str]:

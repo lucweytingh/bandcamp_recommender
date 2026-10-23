@@ -38,7 +38,6 @@ _EXPECT_WAIT_S = 6.0
 
 _lock = threading.Lock()
 _driver = None
-_last_used = 0.0
 
 
 class BrowserUnavailable(http.FetchError):
@@ -63,7 +62,7 @@ def _quit(driver) -> None:
 def session() -> Iterator[Any]:
     """Exclusive use of the shared driver for a sequence of steps that must
     stay on one page (e.g. load a fan page, then call the API from it)."""
-    global _driver, _last_used
+    global _driver
     if not _lock.acquire(timeout=_acquire_timeout()):
         raise BrowserUnavailable("fallback browser busy")
     try:
@@ -80,7 +79,6 @@ def session() -> Iterator[Any]:
         try:
             yield _driver
         finally:
-            _last_used = time.monotonic()
             if not DriverManager.is_driver_alive(_driver):
                 _quit(_driver)
                 _driver = None
@@ -104,7 +102,10 @@ def load(driver, url: str, expect: Optional[str]) -> str:
         gate.release()
     deadline = time.monotonic() + _EXPECT_WAIT_S
     while True:
-        source = driver.page_source
+        try:
+            source = driver.page_source
+        except Exception as e:  # e.g. Chrome OOM-killed under its scope cap
+            raise http.FetchError(f"browser died reading {url}: {e}") from e
         if expect is None or expect in source:
             if not http.is_challenge_page(source):
                 return source
@@ -160,23 +161,20 @@ def close() -> None:
             _driver = None
 
 
-def close_if_idle(max_idle_s: float) -> bool:
-    """Quit the driver if nobody used it for ``max_idle_s``. Never blocks."""
+def close_if_idle() -> bool:
+    """Quit the driver unless someone is using it right now. Never blocks;
+    True if a driver was quit."""
     global _driver
     if not _lock.acquire(blocking=False):
         return False
     try:
-        if _driver is not None and time.monotonic() - _last_used >= max_idle_s:
-            _quit(_driver)
-            _driver = None
-            return True
-        return False
+        if _driver is None:
+            return False
+        _quit(_driver)
+        _driver = None
+        return True
     finally:
         _lock.release()
-
-
-def is_running() -> bool:
-    return _driver is not None
 
 
 atexit.register(close)

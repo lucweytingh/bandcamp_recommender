@@ -61,9 +61,16 @@ class GetPageCacheTests(unittest.TestCase):
                 raise http.RateLimited("429")
             return "<html>ok</html>"
 
-        with patch.object(http, "get_html", side_effect=flaky):
+        with patch.object(http, "get_html", side_effect=flaky), \
+             patch.object(http, "_FAILURE_TTL_S", 0.05):
             with self.assertRaises(http.RateLimited):
                 http.get_page("https://x.test/q")
+            # Within the failure window: remembered, no second request.
+            with self.assertRaises(http.RateLimited):
+                http.get_page("https://x.test/q")
+            self.assertEqual(state["n"], 1)
+            import time
+            time.sleep(0.1)
             self.assertEqual(http.get_page("https://x.test/q"), "<html>ok</html>")
 
     def test_challenge_never_cached_and_falls_back_to_browser(self):
@@ -80,6 +87,13 @@ class GetPageCacheTests(unittest.TestCase):
              patch("bandcamp_recommender.recommendations.curl_breaker.record_outcome"):
             with self.assertRaises(http.Challenged):
                 http.get_page("https://x.test/c", fallback=False)
+
+    def test_cache_hit_rechecks_expected_marker(self):
+        get_html, calls = self._fake("<html>pagedata</html>")
+        with patch.object(http, "get_html", side_effect=get_html):
+            http.get_page("https://x.test/m", expect="pagedata")
+            http.get_page("https://x.test/m", expect="data-tralbum")
+        self.assertEqual(len(calls), 2)
 
     def test_entries_expire(self):
         os.environ["BANDCAMP_PAGE_CACHE_TTL_S"] = "0.05"

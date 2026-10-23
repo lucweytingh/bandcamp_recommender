@@ -86,6 +86,17 @@ class FeatureCacheTests(unittest.TestCase):
         dec.assert_called_once()  # retried, not pinned to "unknown"
         self.assertEqual(vec2["rms_mean"], 0.4)
 
+    def test_featured_track_changed_since_meta_was_cached(self):
+        with patch.object(scraper, "fetch_page_html", return_value=_page(featured=2)), \
+             patch.object(features, "extract_audio_features", return_value=None):
+            features.features_for_item(URL)  # caches meta (track 2), no audio
+        with patch.object(bpm, "fetch_page_html", return_value=_page(featured=1)), \
+             patch.object(features, "extract_audio_features", return_value=dict(AUDIO)) as dec:
+            _, preview = features.features_for_item(URL)
+        self.assertEqual(preview["track_id"], 1)
+        self.assertEqual(dec.call_args[0][0], "https://t4.bcbits.com/stream/1")
+        self.assertEqual(cache.get_item_meta("https://a.bandcamp.com/album/x")["track_id"], 1)
+
     def test_unreadable_page_returns_tag_only_vector(self):
         with patch.object(scraper, "fetch_page_html", return_value=None):
             vec, preview = features.features_for_item(URL)

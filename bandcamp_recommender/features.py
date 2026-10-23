@@ -210,10 +210,24 @@ def features_for_item(
     preview = {"track_id": track_id, "title": meta.get("title"), "audio_path": meta.get("audio_path")}
     key = f"{normalize_item_url(item_url)}#{track_id}"
     audio = cache.get_audio_features(key)
+    if audio is None and not preview["audio_path"]:
+        # Need the (signed, uncached) stream URL. The page may have moved its
+        # featured track since the metadata was cached: adopt the fresh
+        # preview wholesale so the features, the returned track id and what
+        # a radio airs all describe the same track.
+        fresh = get_preview_for_item(item_url)
+        if not fresh:
+            return vector, None
+        preview = {"track_id": fresh.get("track_id"), "title": fresh.get("title"),
+                   "audio_path": fresh.get("audio_path")}
+        if str(preview["track_id"]) != str(track_id):
+            cache.put_item_meta(normalize_item_url(item_url), {
+                "track_id": preview["track_id"], "title": preview["title"],
+                "tags": meta.get("tags") or [],
+            })
+            key = f"{normalize_item_url(item_url)}#{preview['track_id']}"
+            audio = cache.get_audio_features(key)
     if audio is None:
-        if not preview["audio_path"]:
-            fresh = get_preview_for_item(item_url) or {}
-            preview["audio_path"] = fresh.get("audio_path")
         audio = extract_audio_features(
             preview["audio_path"],
             intensity_duration=intensity_duration,

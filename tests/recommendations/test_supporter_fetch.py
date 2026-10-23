@@ -137,6 +137,54 @@ class SupporterFetchTests(unittest.TestCase):
         self.assertEqual(sess.call_count, 1)
 
 
+class SupporterApiPathTests(unittest.TestCase):
+    """The one-call path: fan_id known from the seed page."""
+
+    def setUp(self):
+        SupporterFetchTests.setUp(self)
+        self.rec._fan_ids = {"alice": 77}
+
+    def test_one_api_call_with_future_token_no_fan_page(self):
+        before = http.snapshot()
+        with patch.object(http, "get_html") as g, \
+             patch.object(http, "post_json", return_value=_api_items([1, 2, 3])) as pj:
+            ids = self.rec._get_supporter_items_curl_first("alice", "collection_data")
+        g.assert_not_called()
+        self.assertEqual(ids, ["1", "2", "3"])
+        payload = pj.call_args[0][1]
+        self.assertEqual(payload["fan_id"], 77)
+        self.assertEqual(payload["count"], 500)
+        self.assertTrue(payload["older_than_token"].endswith("::a::"))
+        self.assertEqual(http.diff(before)["supporter_api"], 1)
+        self.assertIsNotNone(cache.get_supporter_items("alice", "collection_data", "n500"))
+
+    def test_reply_without_items_falls_back_to_page_path(self):
+        with patch.object(http, "post_json", side_effect=[{"error": True}, _api_items([2])]), \
+             patch.object(http, "get_html", return_value=_fan_page([1], 2)) as g:
+            ids = self.rec._get_supporter_items_curl_first("alice", "collection_data")
+        g.assert_called_once()
+        self.assertEqual(ids, ["1", "2"])
+
+    def test_empty_api_result_cached_short(self):
+        with patch.object(http, "post_json", return_value={"items": []}):
+            self.assertEqual(self.rec._get_supporter_items_curl_first("alice", "collection_data"), [])
+        import sqlite3, time as _t
+        conn = sqlite3.connect(os.environ["BANDCAMP_CACHE_PATH"])
+        (expires,) = conn.execute("SELECT expires_ts FROM supporter_items WHERE username='alice'").fetchone()
+        self.assertLess(expires - _t.time(), cache.EMPTY_SUPPORTER_TTL_S + 5)
+
+
+class ExtractSupportersFanIdTests(unittest.TestCase):
+    def test_fan_ids_recorded_from_the_same_parse(self):
+        from bandcamp_recommender.recommendations import scraper
+
+        blob = {"thumbs": [{"username": "a", "fan_id": 1}, {"username": "b", "fan_id": 2}]}
+        page = f'<div id="collectors-data" data-blob="{htmllib.escape(json.dumps(blob))}"></div>'
+        with patch.object(scraper, "fetch_page_html", return_value=page):
+            self.assertEqual(scraper.extract_supporters("https://x/album/s"), ["a", "b"])
+        self.assertEqual(scraper.supporter_fan_ids("https://x/album/s"), {"a": 1, "b": 2})
+
+
 class CandidateFilterTests(unittest.TestCase):
     def test_filter_applies_before_the_pool_is_cut(self):
         from bandcamp_recommender.recommendations import supporter_recommender as sr

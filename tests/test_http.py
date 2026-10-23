@@ -150,6 +150,20 @@ class HttpClientTests(unittest.TestCase):
                 bchttp.get_html(f"{base}/trickle", timeout=1.0)
             self.assertLess(time.monotonic() - t0, 3.0)
 
+    def test_mid_body_transport_error_is_typed(self):
+        import urllib3
+        from unittest.mock import patch as _patch
+
+        with server() as base:
+            with _patch.object(urllib3.response.HTTPResponse, "read1",
+                               side_effect=urllib3.exceptions.ProtocolError("reset")):
+                with self.assertRaises(bchttp.FetchError):
+                    bchttp.get_html(f"{base}/item")
+            with _patch.object(urllib3.response.HTTPResponse, "read1",
+                               side_effect=urllib3.exceptions.ReadTimeoutError(None, "u", "slow")):
+                with self.assertRaises(bchttp.Timeout):
+                    bchttp.get_html(f"{base}/item")
+
     def test_post_json_decodes_and_detects_challenge(self):
         with server() as base:
             self.assertEqual(bchttp.post_json(f"{base}/api", {"a": 1}), {"items": [1, 2]})
