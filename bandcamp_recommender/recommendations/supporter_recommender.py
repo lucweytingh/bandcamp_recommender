@@ -53,6 +53,43 @@ def _resolve_pool_size(total_supporters: int) -> int:
 
 _DEFAULT_BPM_RERANK_ALPHA = 0.05
 
+# API `count` for a supporter's collection beyond the first page. 10000 =
+# "everything" (the historical behaviour). Callers that want speed and less
+# whale bias pass a smaller page (the feed is newest-first).
+_DEFAULT_COLLECTION_PAGE_SIZE = 10000
+_DEFAULT_SELENIUM_FALLBACK_BUDGET = 8
+# Items on a fan page's first page (what ``first_page_only`` reads).
+_FIRST_PAGE_SIZE = 20
+
+
+def _resolve_selenium_fallback_budget() -> int:
+    """Max supporters per call read through the (slow, single) fallback
+    browser when Bandcamp challenges plain HTTP. Env
+    ``BANDCAMP_SELENIUM_FALLBACK_BUDGET``."""
+    try:
+        return max(0, int(os.environ.get("BANDCAMP_SELENIUM_FALLBACK_BUDGET",
+                                         _DEFAULT_SELENIUM_FALLBACK_BUDGET)))
+    except ValueError:
+        return _DEFAULT_SELENIUM_FALLBACK_BUDGET
+
+
+_DEFAULT_FEATURE_WORKERS = 4
+
+
+def _resolve_feature_workers() -> int:
+    """Parallel feature extractions (download + analysis; the decode itself
+    is serialized process-wide). Env ``BANDCAMP_FEATURE_WORKERS``; small
+    CPU-bound hosts want ~their core count."""
+    try:
+        return max(1, int(os.environ.get("BANDCAMP_FEATURE_WORKERS", _DEFAULT_FEATURE_WORKERS)))
+    except ValueError:
+        return _DEFAULT_FEATURE_WORKERS
+
+
+class _NoFanData(Exception):
+    """A fan page that legitimately has no readable list (private, deleted,
+    empty). Cached as empty for a day so it isn't re-fetched every call."""
+
 
 def _resolve_bpm_rerank_alpha() -> float:
     """Resolve α for the BPM re-rank score from the env, defaulting to 0.05."""
@@ -80,22 +117,13 @@ def _bpm_rerank_score(
 
 
 from bs4 import BeautifulSoup
-from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webdriver import WebDriver
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
 
-from bandcamp_recommender.recommendations.api import (
-    fetch_collection_items_api,
-    get_cookies_from_driver,
-    get_fan_id_from_page,
-)
-from bandcamp_recommender.recommendations.driver_manager import DriverManager
 from bandcamp_recommender.recommendations.scraper import (
     extract_item_id,
     extract_supporters,
     extract_tags,
     fetch_page_html,
+    supporter_fan_ids,
 )
 from bandcamp_recommender.recommendations.mood_tags import tag_mood_score
 from bandcamp_recommender.recommendations.tags import calculate_tag_similarity, normalize_tag
@@ -120,9 +148,13 @@ class SupporterRecommender:
             headless: Ignored - Selenium always runs headless to prevent popup windows.
                      Kept for API compatibility.
         """
-        self._driver_manager = DriverManager()
         self.item_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_lock = Lock()
+        self._budget_lock = Lock()
+        self._collection_page_size = _DEFAULT_COLLECTION_PAGE_SIZE
+        self._selenium_budget = _resolve_selenium_fallback_budget()
+        # username -> fan_id from the seed page (one-call collection reads).
+        self._fan_ids: Dict[str, int] = {}
 
     def get_recommendations(
         self,
@@ -141,6 +173,8 @@ class SupporterRecommender:
         hydrate_tags: bool = True,
         use_wishlist: bool = False,
         event_callback: Optional[Callable[[dict], None]] = None,
+        collection_page_size: int = _DEFAULT_COLLECTION_PAGE_SIZE,
+        candidate_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ) -> List[Dict[str, Any]]:
         """Get recommendations based on supporter purchases.
 
@@ -195,13 +229,26 @@ class SupporterRecommender:
                 page-cache hit (no extra network). Defaults to False
                 (collection only, unchanged behavior).
 
+            collection_page_size: How many items to read from each
+                supporter's collection beyond the first page (the API feed is
+                newest-first). Default reads everything (unchanged
+                behaviour); a smaller page is much faster and damps "whale"
+                collectors who own thousands of items.
+            candidate_filter: Optional predicate on an item's metadata dict
+                (``item_title``, ``band_name``, ``item_url``). Applied to the
+                ranked candidates BEFORE the result is cut to
+                ``max_recommendations``, so the caller's exclusions (e.g.
+                recently played) don't waste result slots or downstream work.
+
         Returns:
             List of recommendation dictionaries with item_title, band_name, item_url, supporters_count
         """
+        self._begin_call(collection_page_size)
         # Get supporters of the wishlist item
         if progress_callback:
             progress_callback("Extracting supporters from album page...", 0, 0, 0)
         supporters = extract_supporters(wishlist_item_url)
+        self._fan_ids = supporter_fan_ids(wishlist_item_url)
         if not supporters:
             if progress_callback:
                 progress_callback("No supporters found.", 0, 0, 0)
@@ -377,6 +424,12 @@ class SupporterRecommender:
             (iid, cnt) for (iid, cnt) in sorted_items
             if _normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
         ]
+
+        if candidate_filter is not None:
+            sorted_items = [
+                (iid, cnt) for (iid, cnt) in sorted_items
+                if candidate_filter(self.item_cache.get(iid) or {})
+            ]
 
         if bpm_match:
             expanded_pool_size = max(50, max_recommendations * 3)
@@ -558,6 +611,8 @@ class SupporterRecommender:
         vibe_tau: float = 0.15,
         realm_mult: float = 1.5,
         progress_callback: Optional[Callable] = None,
+        collection_page_size: int = _DEFAULT_COLLECTION_PAGE_SIZE,
+        candidate_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ) -> List[Dict[str, Any]]:
         """Get recommendations ordered by feature-vector similarity to a source.
 
@@ -603,17 +658,26 @@ class SupporterRecommender:
         plain similarity ranking — fully backward-compatible; if unset it falls
         back to the ``BANDCAMP_DIVERSIFY`` env var. See
         :mod:`bandcamp_recommender.recommendations.diversity`.
+
+        ``collection_page_size`` and ``candidate_filter`` are passed to
+        :meth:`get_recommendations` (the filter runs before the pool is cut,
+        so every hydrated + decoded candidate is one the caller can use).
+
+        Audio features describe each item's featured preview track (the one
+        ``audio_url`` points at) and are cached on disk per (item, track).
         """
         # Local import keeps the optional audio stack out of cold starts
         # for the rest of the package.
+        from bandcamp_recommender import http
         from bandcamp_recommender.features import (
             DEFAULT_WEIGHTS,
             distance as feature_distance,
-            extract_features,
+            features_for_item,
         )
-        from bandcamp_recommender.recommendations.bpm import get_audio_url_for_item
 
         weights = feature_weights or DEFAULT_WEIGHTS
+        counters_before = http.snapshot()
+        t0 = time.monotonic()
 
         if progress_callback:
             progress_callback("Fetching candidate pool via supporter overlap...", 0, 0, 0)
@@ -623,7 +687,10 @@ class SupporterRecommender:
             max_recommendations=candidate_pool_size,
             min_supporters=min_supporters,
             progress_callback=progress_callback,
+            collection_page_size=collection_page_size,
+            candidate_filter=candidate_filter,
         )
+        t_pool = time.monotonic() - t0
 
         # Backstop the ID-based filter in get_recommendations: when
         # extract_item_id can't read the source's tralbum_id (curl 403,
@@ -640,32 +707,6 @@ class SupporterRecommender:
                 progress_callback("No candidates returned by supporter overlap.", 0, 0, 0)
             return []
 
-        # Build a source item. The recommender's metadata cache may
-        # already have entries for the source's tags/title; if not we
-        # scrape them here.
-        if progress_callback:
-            progress_callback("Hydrating source song metadata...", 0, len(candidates), 0)
-        source_tags = extract_tags(source_url) or []
-        source_audio_url = get_audio_url_for_item(source_url)
-        source_item: Dict[str, Any] = {
-            "item_url": source_url,
-            "tags": source_tags,
-            "audio_url": source_audio_url,
-        }
-
-        # Make sure every candidate has an ``audio_url``. Tag hydration
-        # already happens inside ``get_recommendations`` for the top-N.
-        if progress_callback:
-            progress_callback(
-                "Hydrating candidate preview URLs...",
-                0,
-                len(candidates),
-                0,
-            )
-        self._hydrate_audio_urls_for_items(candidates)
-
-        # Feature extraction — one decode per track, includes raw BPM.
-        # Parallel here because each decode is the dominant cost.
         if progress_callback:
             progress_callback(
                 "Extracting feature vectors...",
@@ -673,27 +714,38 @@ class SupporterRecommender:
                 len(candidates) + 1,  # +1 for source
                 0,
             )
-        source_features = extract_features(
-            source_item,
-            intensity_duration=intensity_duration,
-            bpm_duration=bpm_duration,
-        )
-        source_item["features"] = source_features
+        t1 = time.monotonic()
 
-        def _extract_for(item: Dict[str, Any]) -> Dict[str, Any]:
-            item["features"] = extract_features(
-                item,
-                intensity_duration=intensity_duration,
-                bpm_duration=bpm_duration,
-            )
+        def _featurize(item: Dict[str, Any]) -> Dict[str, Any]:
+            # One page read (shared short-lived page cache with the tag
+            # hydration above) picks the featured preview; its audio
+            # features come from the disk cache or one decode.
+            try:
+                vector, preview = features_for_item(
+                    item["item_url"],
+                    item.get("tags") or [],
+                    intensity_duration=intensity_duration,
+                    bpm_duration=bpm_duration,
+                )
+            except Exception:
+                logger.warning("feature extraction failed for %s", item.get("item_url"),
+                               exc_info=_debug_exc_info())
+                vector, preview = {k: None for k in weights}, None
+            item["features"] = vector
+            item["audio_url"] = preview.get("audio_path") if preview else None
+            item["preview_track_id"] = preview.get("track_id") if preview else None
+            item["preview_title"] = preview.get("title") if preview else None
             return item
 
-        # 4 workers matches the pattern in scripts/eval_similarity.py —
-        # librosa decode is serialized by the stderr lock, so higher
-        # worker counts only overlap downloads.
-        workers = max(1, min(4, len(candidates)))
+        source_item: Dict[str, Any] = {
+            "item_url": source_url,
+            "tags": extract_tags(source_url) or [],
+        }
+        workers = max(1, min(_resolve_feature_workers(), len(candidates) + 1))
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(_extract_for, candidates))
+            list(ex.map(_featurize, [source_item] + candidates))
+        source_features = source_item["features"]
+        t_features = time.monotonic() - t1
 
         # Distance + ordering. Items without any shared feature get
         # distance=None and sink to the bottom (in stable order).
@@ -723,6 +775,19 @@ class SupporterRecommender:
             )
 
         ranked = (rated + unrated)[:max_recommendations]
+        with_audio = sum(1 for c in candidates if (c.get("features") or {}).get("rms_mean") is not None)
+        logger.info(
+            "similar recs for %s: pool=%.1fs features=%.1fs candidates=%d with_audio=%d http=%s",
+            source_url, t_pool, t_features, len(candidates), with_audio,
+            {k: v for k, v in http.diff(counters_before).items() if v},
+        )
+        self.last_call_stats = {
+            "pool_s": round(t_pool, 1),
+            "features_s": round(t_features, 1),
+            "candidates": len(candidates),
+            "with_audio": with_audio,
+            "http": http.diff(counters_before),
+        }
         if progress_callback:
             progress_callback(
                 f"Returning top {len(ranked)} ordered by similarity.",
@@ -753,193 +818,6 @@ class SupporterRecommender:
         workers = min(_DEFAULT_TAG_WORKERS, len(targets))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             list(ex.map(_fetch_one, targets))
-
-    def _get_supporter_purchases_with_driver(
-        self,
-        username: str,
-        driver: WebDriver,
-        first_page_only: bool = False,
-        extract_tags_flag: bool = True
-    ) -> List[str]:
-        """Get purchases for a supporter using a specific driver instance.
-
-        Args:
-            username: Supporter username
-            driver: Selenium WebDriver instance to use
-            first_page_only: If True, only get first page items (skip API call for speed)
-            extract_tags_flag: If False, skip tag extraction (faster but no tag data)
-
-        Returns:
-            List of item IDs (tralbum_id) that the supporter purchased
-        """
-        try:
-            # Get fan_id from wishlist/profile page (which also has collection_data)
-            fan_id = get_fan_id_from_page(driver, username)
-            if not fan_id:
-                return []
-
-            # Get pagedata from current page (wishlist page has collection_data)
-            soup = BeautifulSoup(driver.page_source, features="html.parser")
-            pagedata_elem = soup.find(id="pagedata")
-            if not pagedata_elem:
-                return []
-
-            pagedata = json.loads(pagedata_elem.get("data-blob", "{}"))
-
-            # Extract first page from pagedata
-            collection_data = pagedata.get("collection_data", {})
-            item_cache = pagedata.get("item_cache", {}).get("collection", {})
-
-            # Get item IDs from sequence and pending_sequence (first page)
-            sequence = collection_data.get("sequence", [])
-            pending_sequence = collection_data.get("pending_sequence", [])
-            first_page_item_ids = []
-
-            for item_key in sequence + pending_sequence:
-                item_data = item_cache.get(item_key)
-                if item_data:
-                    tralbum_id = item_data.get("tralbum_id")
-                    if tralbum_id:
-                        first_page_item_ids.append(str(tralbum_id))
-                        self._store_item_metadata(
-                            str(tralbum_id),
-                            item_data,
-                            extract_tags_flag
-                        )
-
-            # Get remaining items via API using last_token
-            all_item_ids = list(first_page_item_ids)
-
-            # Skip API call if first_page_only is True (for speed in random mode)
-            if first_page_only:
-                return all_item_ids
-
-            last_token = collection_data.get("last_token", "")
-            item_count = collection_data.get("item_count", 0)
-            first_page_count = len(first_page_item_ids)
-
-            # Skip API call if first page has all items (common for small collections)
-            if last_token and first_page_count < item_count:
-                cookies = get_cookies_from_driver(driver)
-                wishlist_url = f"https://bandcamp.com/{username}/wishlist"
-                items = fetch_collection_items_api(fan_id, last_token, cookies, wishlist_url, driver=driver)
-
-                # Extract tralbum_id from API response and store metadata
-                for item in items:
-                    tralbum_id = item.get("tralbum_id")
-                    if tralbum_id:
-                        item_id_str = str(tralbum_id)
-                        if item_id_str not in all_item_ids:  # Avoid duplicates
-                            all_item_ids.append(item_id_str)
-                            self._store_item_metadata(item_id_str, item, extract_tags_flag)
-
-            return all_item_ids
-
-        except Exception:
-            logger.warning(
-                "_get_supporter_purchases_with_driver failed for %s",
-                username,
-                exc_info=_debug_exc_info(),
-            )
-            return []
-
-    def _get_supporter_wishlist_with_driver(
-        self,
-        username: str,
-        driver: WebDriver,
-        first_page_only: bool = False,
-        extract_tags_flag: bool = True
-    ) -> List[str]:
-        """Get wishlist items for a supporter using a specific driver instance.
-
-        Args:
-            username: Supporter username
-            driver: Selenium WebDriver instance to use
-            first_page_only: If True, only get first page items (skip API call for speed)
-            extract_tags_flag: If False, skip tag extraction (faster but no tag data)
-
-        Returns:
-            List of item IDs (tralbum_id) that the supporter has in their wishlist
-        """
-        try:
-            wishlist_url = f"https://bandcamp.com/{username}/wishlist"
-            driver.get(wishlist_url)
-
-            # Pagedata is in the initial HTML, so it appears within ~200ms once
-            # the page actually loads. Shorter wait = faster wall-clock when a
-            # supporter's page 404s or hangs.
-            wait_timeout = 1 if first_page_only else 1.5
-            try:
-                WebDriverWait(driver, wait_timeout).until(
-                    EC.presence_of_element_located((By.ID, "pagedata"))
-                )
-            except Exception:
-                return []
-
-            soup = BeautifulSoup(driver.page_source, features="html.parser")
-            pagedata_elem = soup.find(id="pagedata")
-            if not pagedata_elem:
-                return []
-
-            pagedata = json.loads(pagedata_elem.get("data-blob", "{}"))
-
-            # Extract wishlist from pagedata
-            wishlist_data = pagedata.get("wishlist_data", {})
-            item_cache = pagedata.get("item_cache", {}).get("wishlist", {})
-
-            # Get item IDs from sequence and pending_sequence (first page)
-            sequence = wishlist_data.get("sequence", [])
-            pending_sequence = wishlist_data.get("pending_sequence", [])
-            first_page_item_ids = []
-
-            for item_key in sequence + pending_sequence:
-                item_data = item_cache.get(item_key)
-                if item_data:
-                    tralbum_id = item_data.get("tralbum_id")
-                    if tralbum_id:
-                        first_page_item_ids.append(str(tralbum_id))
-                        self._store_item_metadata(
-                            str(tralbum_id),
-                            item_data,
-                            extract_tags_flag
-                        )
-
-            # Get remaining items via API using last_token
-            all_item_ids = list(first_page_item_ids)
-
-            # Skip API call if first_page_only is True (for speed in random mode)
-            if first_page_only:
-                return all_item_ids
-
-            last_token = wishlist_data.get("last_token", "")
-            item_count = wishlist_data.get("item_count", 0)
-            first_page_count = len(first_page_item_ids)
-
-            # Skip API call if first page has all items (common for small wishlists)
-            if last_token and first_page_count < item_count:
-                fan_id = get_fan_id_from_page(driver, username)
-                if fan_id:
-                    cookies = get_cookies_from_driver(driver)
-                    items = fetch_collection_items_api(fan_id, last_token, cookies, wishlist_url, driver=driver)
-
-                    # Extract tralbum_id from API response and store metadata
-                    for item in items:
-                        tralbum_id = item.get("tralbum_id")
-                        if tralbum_id:
-                            item_id_str = str(tralbum_id)
-                            if item_id_str not in all_item_ids:  # Avoid duplicates
-                                all_item_ids.append(item_id_str)
-                                self._store_item_metadata(item_id_str, item, extract_tags_flag)
-
-            return all_item_ids
-
-        except Exception:
-            logger.warning(
-                "_get_supporter_wishlist_with_driver failed for %s",
-                username,
-                exc_info=_debug_exc_info(),
-            )
-            return []
 
     def _store_item_metadata(
         self,
@@ -1000,79 +878,38 @@ class SupporterRecommender:
             "fan_id": pagedata.get("fan_data", {}).get("fan_id"),
         }
 
-    def _get_supporter_items_via_curl(
-        self,
-        username: str,
-        data_key: str,
-        first_page_only: bool = False,
-    ) -> Optional[List[str]]:
-        """Fetch a supporter's collection or wishlist using plain curl, no driver.
+    # ---- supporter collections --------------------------------------------
+    #
+    # One supporter = their /wishlist fan page (pagedata: first ~20 items of
+    # each list + pagination state) plus, for deeper reads, one API call.
+    # Plain HTTP first; the shared browser only when Bandcamp serves its bot
+    # challenge, and at most `_selenium_budget` supporters per call. Rate
+    # limits and timeouts skip the supporter (losing one supporter's votes is
+    # harmless; launching Chrome for it is not). Complete reads are cached on
+    # disk (bandcamp_recommender.cache), so recurring seeds and overlapping
+    # scenes stop re-downloading the same collections.
 
-        Returns None on failure (caller falls back to the Selenium path).
-        Returns [] if the page parsed fine but the supporter has no items.
+    _API_URLS = {
+        "collection_data": "https://bandcamp.com/api/fancollection/1/collection_items",
+        "wishlist_data": "https://bandcamp.com/api/fancollection/1/wishlist_items",
+    }
+    # Hidden/removed items make the API return slightly fewer ids than the
+    # advertised count; a read much shorter than expected is partial.
+    _COMPLETE_FRACTION = 0.9
 
-        We skip Selenium entirely when this path works, which avoids both the
-        ~1-3s per-supporter driver.get() and the up-front driver pool init.
-        """
-        from .curl_breaker import should_skip_curl
-        if should_skip_curl():
-            return None
-        wishlist_url = f"https://bandcamp.com/{username}/wishlist"
-        html = fetch_page_html(wishlist_url, timeout=15)
-        if not html:
-            return None
-        soup = BeautifulSoup(html, features="html.parser")
-        pagedata_elem = soup.find(id="pagedata")
-        if not pagedata_elem:
-            return None
-        try:
-            pagedata = json.loads(pagedata_elem.get("data-blob", "{}"))
-        except Exception:
-            return None
+    def _begin_call(self, collection_page_size: int = _DEFAULT_COLLECTION_PAGE_SIZE) -> None:
+        """Per-call knobs + fallback budget (entry points call this first)."""
+        self._collection_page_size = max(1, int(collection_page_size))
+        self._fan_ids = {}
+        with self._budget_lock:
+            self._selenium_budget = _resolve_selenium_fallback_budget()
 
-        parsed = self._parse_collection_pagedata(pagedata, data_key)
-        if parsed is None:
-            return None
-
-        all_item_ids = list(parsed["first_page_item_ids"])
-        if first_page_only:
-            return all_item_ids
-
-        last_token = parsed["last_token"]
-        item_count = parsed["item_count"]
-        fan_id = parsed["fan_id"]
-        if last_token and fan_id and len(all_item_ids) < item_count:
-            # fetch_collection_items_api falls through to curl when no driver
-            # is supplied. Bandcamp accepts this endpoint without auth cookies
-            # for public fan collections.
-            items = fetch_collection_items_api(
-                fan_id=fan_id,
-                last_token=last_token,
-                cookies={},
-                referer_url=wishlist_url,
-            )
-            if items is None:
-                items = []
-            seen = set(all_item_ids)
-            for item in items:
-                tralbum_id = item.get("tralbum_id")
-                if not tralbum_id:
-                    continue
-                item_id_str = str(tralbum_id)
-                if item_id_str in seen:
-                    continue
-                seen.add(item_id_str)
-                all_item_ids.append(item_id_str)
-                self._store_item_metadata(item_id_str, item, True)
-
-            # Sanity check: if Bandcamp reported a non-trivial item_count and
-            # curl came back with almost nothing, treat as a soft failure so
-            # the caller falls back to Selenium. This catches the case where
-            # an IP-block or anti-bot kicks in mid-stream.
-            if item_count >= 10 and len(all_item_ids) < max(1, item_count // 4):
-                return None
-
-        return all_item_ids
+    def _take_selenium_budget(self) -> bool:
+        with self._budget_lock:
+            if self._selenium_budget <= 0:
+                return False
+            self._selenium_budget -= 1
+            return True
 
     def _get_supporter_items_curl_first(
         self,
@@ -1080,102 +917,167 @@ class SupporterRecommender:
         data_key: str,
         first_page_only: bool = False,
     ) -> List[str]:
-        """Curl-first supporter fetch with lazy Selenium fallback.
+        """A supporter's item ids (collection or wishlist), metadata stored
+        in ``item_cache``. Never raises; returns [] when the supporter can't
+        be read right now (logged, not cached)."""
+        from bandcamp_recommender import browser, cache as bc_cache, http
+        from bandcamp_recommender.recommendations import curl_breaker
 
-        Bandcamp's wishlist page and the collection_items API both serve the
-        full data anonymously when called from a residential IP, so we skip
-        the browser entirely when we can. Chrome only spins up if curl
-        returns None (e.g. blocked from a datacenter IP), and the driver
-        pool is created on first miss, not up front.
-        """
-        items = self._get_supporter_items_via_curl(
-            username, data_key, first_page_only=first_page_only
-        )
-        if items is not None:
-            return items
+        depth = "first" if first_page_only else f"n{self._collection_page_size}"
+        cached = bc_cache.get_supporter_items(username, data_key, depth)
+        if cached is not None:
+            ids = []
+            for iid, title, band, url in cached:
+                self._store_item_metadata(
+                    iid, {"item_title": title, "band_name": band, "item_url": url}, True
+                )
+                ids.append(iid)
+            return ids
 
-        # Fallback to Selenium. Smaller pool than the old default — most
-        # supporters now go through curl, so this only handles outliers.
-        fallback_pool_size = min(3, _resolve_pool_size(0))
         try:
-            driver_pool = self._driver_manager.get_driver_pool(fallback_pool_size)
+            try:
+                if curl_breaker.should_skip_curl():
+                    raise http.Challenged(f"breaker tripped: {username}")
+                result = None
+                if username in self._fan_ids:
+                    result = self._read_supporter_api(username, data_key, first_page_only)
+                if result is None:
+                    result = self._read_supporter(username, data_key, first_page_only, None)
+                ids, complete = result
+                curl_breaker.record_outcome(success=True)
+            except http.Challenged:
+                if not curl_breaker.should_skip_curl():
+                    curl_breaker.record_outcome(success=False)
+                if not self._take_selenium_budget():
+                    logger.warning("challenged; browser budget spent, skipping supporter %s", username)
+                    return []
+                with browser.session() as driver:
+                    ids, complete = self._read_supporter(username, data_key, first_page_only, driver)
+        except _NoFanData:
+            bc_cache.put_supporter_items(username, data_key, depth, [], ttl_s=bc_cache.EMPTY_SUPPORTER_TTL_S)
+            return []
+        except http.FetchError as e:
+            logger.warning("skipping supporter %s (%s): %s", username, data_key, e)
+            return []
         except Exception:
-            logger.warning(
-                "Selenium fallback: pool init failed for %s",
-                username,
-                exc_info=_debug_exc_info(),
-            )
+            logger.warning("skipping supporter %s (%s)", username, data_key, exc_info=_debug_exc_info())
             return []
 
-        # 1 retry on a fresh driver if the first attempt empties out — the
-        # most common cause is a TimeoutException that the _with_driver
-        # helper swallowed into []. Doesn't help if curl-blocked == auth, but
-        # does help with transient network blips.
-        for attempt in range(2):
-            try:
-                driver = driver_pool.get(timeout=30)
-            except Exception:
-                logger.warning(
-                    "Selenium fallback: pool get timed out for %s (attempt %d)",
-                    username,
-                    attempt + 1,
-                )
-                return []
+        if complete:
+            with self._cache_lock:
+                rows = [
+                    [iid,
+                     (self.item_cache.get(iid) or {}).get("item_title", ""),
+                     (self.item_cache.get(iid) or {}).get("band_name", ""),
+                     (self.item_cache.get(iid) or {}).get("item_url", "")]
+                    for iid in ids
+                ]
+            bc_cache.put_supporter_items(username, data_key, depth, rows)
+        return ids
 
-            try:
-                if data_key == "wishlist_data":
-                    result = self._get_supporter_wishlist_with_driver(
-                        username, driver,
-                        first_page_only=first_page_only,
-                        extract_tags_flag=False,
-                    )
-                else:
-                    result = self._get_supporter_purchases_with_driver(
-                        username, driver,
-                        first_page_only=first_page_only,
-                        extract_tags_flag=False,
-                    )
-            except Exception:
-                logger.warning(
-                    "Selenium fallback: worker raised for %s (attempt %d)",
-                    username,
-                    attempt + 1,
-                    exc_info=_debug_exc_info(),
-                )
-                result = []
-            finally:
-                # If the driver is poisoned (TimeoutException leaves chromedriver
-                # in a flaky state for the next page-load), quit it instead of
-                # returning it to the pool. The pool gets smaller on the fly;
-                # acceptable for a fallback-only path.
-                if not DriverManager.is_driver_alive(driver):
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        driver_pool.put_nowait(driver)
-                    except Exception:
-                        try:
-                            driver_pool.put(driver, timeout=2)
-                        except Exception:
-                            try:
-                                driver.quit()
-                            except Exception:
-                                pass
+    def _read_supporter_api(self, username: str, data_key: str, first_page_only: bool):
+        """One API call when the seed page told us the supporter's fan_id: a
+        token in the future returns the newest ``count`` items, the same head
+        the fan page shows (verified), so the fan page fetch is skipped and a
+        cold supporter costs one request instead of two. Returns
+        ``(ids, True)``, or None when the API answers without an item list
+        (the page path then decides private vs. broken). Raises
+        ``http.FetchError`` subclasses like the page path."""
+        from bandcamp_recommender import http
 
-            if result:
-                return result
-            # Empty result on first attempt → one retry with a fresh driver.
-            if attempt == 0:
-                logger.warning(
-                    "Selenium fallback: empty result for %s, retrying once",
-                    username,
-                )
+        count = _FIRST_PAGE_SIZE if first_page_only else self._collection_page_size
+        payload = {
+            "fan_id": self._fan_ids[username],
+            "older_than_token": f"{int(time.time()) + 86400}::a::",
+            "count": count,
+        }
+        data = http.post_json(
+            self._API_URLS[data_key], payload, timeout=60,
+            referer=f"https://bandcamp.com/{username}",
+        )
+        items = (data or {}).get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return None
+        ids: List[str] = []
+        seen = set()
+        for item in items:
+            tralbum_id = item.get("tralbum_id")
+            if not tralbum_id:
                 continue
-            return []
-        return []
+            item_id_str = str(tralbum_id)
+            if item_id_str in seen:
+                continue
+            seen.add(item_id_str)
+            ids.append(item_id_str)
+            self._store_item_metadata(item_id_str, item, True)
+        return ids, True
+
+    def _read_supporter(self, username: str, data_key: str, first_page_only: bool, driver) -> tuple:
+        """``(ids, complete)`` for one supporter list over plain HTTP
+        (``driver`` None) or inside the shared browser session. Raises
+        ``http.Challenged`` / ``http.FetchError``, or ``_NoFanData`` for a
+        private, deleted or empty fan page."""
+        from bandcamp_recommender import browser, http
+
+        url = f"https://bandcamp.com/{username}/wishlist"
+        try:
+            if driver is None:
+                html = http.get_html(url, timeout=20)
+            else:
+                html = browser.load(driver, url, None)
+        except http.HTTPStatus as e:
+            if e.status in (404, 410):
+                raise _NoFanData(username) from e
+            raise
+        soup = BeautifulSoup(html, features="html.parser")
+        pagedata_elem = soup.find(id="pagedata")
+        if not pagedata_elem:
+            raise _NoFanData(username)
+        try:
+            pagedata = json.loads(pagedata_elem.get("data-blob", "{}"))
+        except ValueError:
+            raise _NoFanData(username)
+        parsed = self._parse_collection_pagedata(pagedata, data_key)
+        if parsed is None:
+            raise _NoFanData(username)
+
+        ids = list(parsed["first_page_item_ids"])
+        first_len = len(ids)
+        item_count = parsed["item_count"]
+        if first_page_only:
+            return ids, True
+        page_size = self._collection_page_size
+        if parsed["last_token"] and parsed["fan_id"] and first_len < item_count:
+            payload = {
+                "fan_id": parsed["fan_id"],
+                "older_than_token": parsed["last_token"],
+                "count": page_size,
+            }
+            api_url = self._API_URLS[data_key]
+            try:
+                if driver is None:
+                    data = http.post_json(api_url, payload, timeout=60, referer=url)
+                else:
+                    data = browser.post_json(driver, api_url, payload)
+            except http.Challenged:
+                raise
+            except http.FetchError as e:
+                # Keep the first page (better than nothing), never cache it.
+                logger.warning("collection API failed for %s, using first page: %s", username, e)
+                return ids, False
+            seen = set(ids)
+            for item in (data or {}).get("items", []) or []:
+                tralbum_id = item.get("tralbum_id")
+                if not tralbum_id:
+                    continue
+                item_id_str = str(tralbum_id)
+                if item_id_str in seen:
+                    continue
+                seen.add(item_id_str)
+                ids.append(item_id_str)
+                self._store_item_metadata(item_id_str, item, True)
+        expected = min(item_count, first_len + page_size)
+        return ids, len(ids) >= self._COMPLETE_FRACTION * expected
 
     def _hydrate_tags_for_items(self, item_ids: List[str]) -> None:
         """Fetch tags for a small set of items in parallel and store in cache.
@@ -1204,7 +1106,11 @@ class SupporterRecommender:
                 url = info.get("item_url") if info else None
             if not url:
                 return
-            tags = extract_tags(url)
+            # Cached item metadata: the page is read at most once per month
+            # per item instead of once per call (Bandcamp allows ~1 req/s).
+            from bandcamp_recommender.items import item_meta
+
+            tags = (item_meta(url) or {}).get("tags")
             if not tags:
                 return
             with self._cache_lock:
@@ -1250,6 +1156,7 @@ class SupporterRecommender:
             List of recommendation dictionaries with item_title, band_name, item_url,
             tags, similarity_score, and supporters_count
         """
+        self._begin_call()
         # Get original item tags
         if progress_callback:
             progress_callback("Extracting tags from original item...", 0, 0, 0)
@@ -1271,6 +1178,7 @@ class SupporterRecommender:
         if progress_callback:
             progress_callback("Extracting supporters from page...", 0, 0, 0)
         supporters = extract_supporters(item_url)
+        self._fan_ids = supporter_fan_ids(item_url)
         if not supporters:
             if progress_callback:
                 progress_callback("No supporters found.", 0, 0, 0)
@@ -1302,8 +1210,11 @@ class SupporterRecommender:
                 0
             )
 
+        started: Dict[str, float] = {}
+
         def fetch_supporter_items(supporter):
             """Fetch items for a single supporter (thread-safe)."""
+            started[supporter] = time.time()
             try:
                 items = self._get_supporter_items_curl_first(
                     supporter, "collection_data"
@@ -1320,11 +1231,13 @@ class SupporterRecommender:
                 for supporter in supporters
             }
 
-            # Block on futures.wait instead of polling+sleep. Same per-future
-            # timeout semantics (30s), but no 0.5s idle pause between batches.
+            # Block on futures.wait instead of polling+sleep. The per-future
+            # timeout counts from when the worker STARTS (recorded in the
+            # worker): requests are paced, so a future can legitimately wait
+            # in the queue far longer than it runs. Each request is already
+            # bounded by its own wall-clock deadline.
             pending = set(future_to_supporter.keys())
-            future_start_times = {f: time.time() for f in pending}
-            max_future_time = 30
+            max_future_time = 90
 
             while pending:
                 done, _still_pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
@@ -1372,7 +1285,7 @@ class SupporterRecommender:
                 now = time.time()
                 timed_out = {
                     f for f in pending - done
-                    if now - future_start_times[f] > max_future_time
+                    if now - started.get(future_to_supporter[f], now) > max_future_time
                 }
                 for future in timed_out:
                     future.cancel()
@@ -1478,19 +1391,6 @@ class SupporterRecommender:
         """
         return extract_supporters(item_url)
 
-    def _get_driver_pool(self, pool_size: int = 10):
-        """Get or create a driver pool for parallel processing.
-        
-        Wrapper method for backward compatibility with scripts.
-        
-        Args:
-            pool_size: Number of drivers to create in the pool
-            
-        Returns:
-            Queue of driver instances
-        """
-        return self._driver_manager.get_driver_pool(pool_size)
-
     def get_random_items(
         self,
         item_url: str,
@@ -1519,10 +1419,12 @@ class SupporterRecommender:
         Returns:
             List of item dictionaries with item_title, band_name, item_url, tags, and overlap_count
         """
+        self._begin_call()
         # Get supporters from the album
         if progress_callback:
             progress_callback("Extracting supporters from album page...", 0, 0, 0)
         supporters = extract_supporters(item_url)
+        self._fan_ids = supporter_fan_ids(item_url)
 
         if not supporters:
             if progress_callback:
@@ -1580,6 +1482,7 @@ class SupporterRecommender:
             Union — not replace — so the flag means "also mine wishlists, not
             just collections" consistently with get_recommendations and the UI.
             """
+            started[supporter] = time.time()
             try:
                 items = self._get_supporter_items_curl_first(supporter, "collection_data")
                 if use_wishlist:
@@ -1590,6 +1493,7 @@ class SupporterRecommender:
             except Exception:
                 return [], supporter
 
+        started: Dict[str, float] = {}
         # Use ThreadPoolExecutor for parallel processing
         max_workers = min(_resolve_supporter_concurrency(), total_supporters) if total_supporters else 1
         
@@ -1599,11 +1503,13 @@ class SupporterRecommender:
                 for supporter in selected_supporters
             }
             
-            # Block on futures.wait instead of polling+sleep. Same per-future
-            # timeout semantics (30s), but no 0.5s idle pause between batches.
+            # Block on futures.wait instead of polling+sleep. The per-future
+            # timeout counts from when the worker STARTS (recorded in the
+            # worker): requests are paced, so a future can legitimately wait
+            # in the queue far longer than it runs. Each request is already
+            # bounded by its own wall-clock deadline.
             pending = set(future_to_supporter.keys())
-            future_start_times = {f: time.time() for f in pending}
-            max_future_time = 30
+            max_future_time = 90
 
             while pending:
                 done, _still_pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
@@ -1667,7 +1573,7 @@ class SupporterRecommender:
                 now = time.time()
                 timed_out = {
                     f for f in pending - done
-                    if now - future_start_times[f] > max_future_time
+                    if now - started.get(future_to_supporter[f], now) > max_future_time
                 }
                 for future in timed_out:
                     future.cancel()
@@ -1849,8 +1755,11 @@ class SupporterRecommender:
         return results
 
     def close(self):
-        """Close the webdriver and cleanup driver pool."""
-        self._driver_manager.close()
+        """Release the shared fallback browser if nobody is using it (it is
+        process-wide now; see bandcamp_recommender.browser)."""
+        from bandcamp_recommender import browser
+
+        browser.close_if_idle(0)
 
     def __enter__(self):
         """Context manager entry."""

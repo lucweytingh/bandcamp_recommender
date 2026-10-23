@@ -87,11 +87,12 @@ wheels = [
 
 [[package]]
 name = "bandcamp-recommender"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "blinker" },
+    { name = "requests" },
     { name = "selenium" },
     { name = "webdriver-manager" },
 ]
@@ -114,6 +115,7 @@ requires-dist = [
     { name = "blinker", specifier = "<1.8" },
     { name = "librosa", marker = "extra == 'bpm'", specifier = ">=0.10" },
     { name = "numpy", marker = "extra == 'bpm'", specifier = ">=1.24" },
+    { name = "requests", specifier = ">=2.31" },
     { name = "selenium", specifier = ">=4.39.0" },
     { name = "webdriver-manager", specifier = ">=4.0.2" },
 ]

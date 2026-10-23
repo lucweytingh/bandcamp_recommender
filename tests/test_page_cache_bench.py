@@ -38,15 +38,15 @@ def _run_scraper_pipeline(base_url: str) -> None:
 
     # Seed URL fetched three different ways (mirrors supporter+id+tags).
     seed = f"{base_url}/instant"
-    scraper.fetch_page_html(seed, timeout=5)
-    scraper.fetch_page_html(seed, timeout=5)
-    scraper.fetch_page_html(seed, timeout=5)
+    scraper.fetch_page_html(seed, timeout=5, expect=None)
+    scraper.fetch_page_html(seed, timeout=5, expect=None)
+    scraper.fetch_page_html(seed, timeout=5, expect=None)
 
     # Per-item: one fetch for tags, one for audio_url.
     for i in range(N_ITEMS):
         item = f"{base_url}/instant?item={i}"
-        scraper.fetch_page_html(item, timeout=5)
-        scraper.fetch_page_html(item, timeout=5)
+        scraper.fetch_page_html(item, timeout=5, expect=None)
+        scraper.fetch_page_html(item, timeout=5, expect=None)
 
 
 def _run_similar_recommendations_pipeline(base_url: str) -> None:
@@ -67,20 +67,30 @@ def _run_similar_recommendations_pipeline(base_url: str) -> None:
     seed = f"{base_url}/instant"
     # Seed: 4 redundant paths.
     for _ in range(4):
-        scraper.fetch_page_html(seed, timeout=5)
+        scraper.fetch_page_html(seed, timeout=5, expect=None)
 
     # Candidates: tag + audio_url + attach_audio_features re-resolve.
     for i in range(SIM_CANDIDATES):
         item = f"{base_url}/instant?cand={i}"
-        scraper.fetch_page_html(item, timeout=5)
-        scraper.fetch_page_html(item, timeout=5)
-        scraper.fetch_page_html(item, timeout=5)
+        scraper.fetch_page_html(item, timeout=5, expect=None)
+        scraper.fetch_page_html(item, timeout=5, expect=None)
+        scraper.fetch_page_html(item, timeout=5, expect=None)
 
 
 class PageCacheBenchmark(unittest.TestCase):
     def setUp(self):
+        from bandcamp_recommender import http
+
         os.environ["BANDCAMP_CURL_BREAKER_DISABLED"] = "1"
-        self.addCleanup(lambda: os.environ.pop("BANDCAMP_CURL_BREAKER_DISABLED", None))
+        # Measure the cache, not the politeness pacer.
+        os.environ["BANDCAMP_MIN_REQUEST_INTERVAL"] = "0"
+        http.reset()
+
+        def restore():
+            os.environ.pop("BANDCAMP_CURL_BREAKER_DISABLED", None)
+            os.environ.pop("BANDCAMP_MIN_REQUEST_INTERVAL", None)
+            http.reset()
+        self.addCleanup(restore)
 
     def _run(self, base: str, runner) -> tuple[float, float]:
         from bandcamp_recommender.recommendations import scraper

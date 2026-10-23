@@ -1,7 +1,10 @@
-"""File-backed circuit breaker for curl-based Bandcamp requests.
+"""File-backed circuit breaker for plain-HTTP Bandcamp requests.
 
-When Bandcamp blocks an IP, every curl call burns its full timeout before the
-caller can fall back to Selenium. This module tracks recent curl outcomes on
+(Module name kept from the curl era for compatibility.) What it counts now:
+bot-challenge responses (see :mod:`bandcamp_recommender.http`). When Bandcamp
+challenges every plain request, trying HTTP first just doubles the cost of
+each fetch before the browser fallback; the breaker skips straight to the
+browser for a while. This module tracks recent curl outcomes on
 disk so the trip survives process restarts (a CLI run is short — in-memory
 state would forget within minutes and re-pay the timeout tax on every
 invocation).
@@ -29,7 +32,13 @@ from typing import Optional
 
 _DEFAULT_THRESHOLD = 3
 _DEFAULT_WINDOW_S = 60.0
-_DEFAULT_COOLDOWN_S = 24 * 60 * 60  # 24 hours
+# Short: a stuck trip pins every fetch to the (slow, single) browser. 24 h
+# used to keep a radio in Selenium mode for a day after a blip.
+_DEFAULT_COOLDOWN_S = 15 * 60
+
+# State written by older versions (24 h trips keyed on curl failures) is
+# ignored rather than honoured.
+_STATE_VERSION = 2
 
 _lock = threading.Lock()
 
@@ -47,11 +56,11 @@ def _read_state() -> dict:
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
+        if isinstance(data, dict) and data.get("version") == _STATE_VERSION:
             return data
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
-    return {"recent_failures": [], "tripped_until": 0.0}
+    return {"version": _STATE_VERSION, "recent_failures": [], "tripped_until": 0.0}
 
 
 def _write_state(state: dict) -> None:
@@ -118,6 +127,8 @@ def record_outcome(success: bool, now: Optional[float] = None) -> None:
         state = _read_state()
         recent = [t for t in state.get("recent_failures", []) if now - t <= window_s]
         if success:
+            if not state.get("recent_failures") and not state.get("tripped_until"):
+                return  # already clean: don't rewrite the file on every success
             recent = []
             state["tripped_until"] = 0.0
         else:
@@ -126,6 +137,7 @@ def record_outcome(success: bool, now: Optional[float] = None) -> None:
                 state["tripped_until"] = now + cooldown_s
                 recent = []
         state["recent_failures"] = recent
+        state["version"] = _STATE_VERSION
         _write_state(state)
 
 

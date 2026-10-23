@@ -47,11 +47,12 @@ class DiversifyWiringTests(unittest.TestCase):
         self.rec = SupporterRecommender()
         self._patchers = [
             patch.object(SupporterRecommender, "get_recommendations", return_value=_cands()),
-            patch.object(SupporterRecommender, "_hydrate_audio_urls_for_items", return_value=None),
             patch.object(sr_module, "extract_tags", lambda url: []),
-            patch("bandcamp_recommender.features.extract_features", side_effect=_fake_features),
-            patch("bandcamp_recommender.recommendations.bpm.get_audio_url_for_item",
-                  lambda url, **kw: "https://audio/x.mp3"),
+            patch("bandcamp_recommender.features.features_for_item",
+                  side_effect=lambda url, tags=None, **kw: (
+                      _fake_features(None),
+                      {"audio_path": "https://audio/x.mp3", "track_id": 1, "title": "t"},
+                  )),
         ]
         for p in self._patchers:
             p.start()

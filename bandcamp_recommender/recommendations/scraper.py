@@ -4,16 +4,11 @@ import json
 import logging
 import os
 import re
-import shutil
-import subprocess
-import threading
-import time
-from collections import OrderedDict
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from bs4 import BeautifulSoup
 
-from . import curl_breaker
+from .. import http
 
 
 logger = logging.getLogger(__name__)
@@ -28,172 +23,30 @@ def _debug_exc_info() -> bool:
 _DEFAULT_CURL_TIMEOUT = 20
 
 
-# ---------------------------------------------------------------------------
-# Process-level page cache.
-#
-# The recommender pipeline fetches the same URLs multiple times per call:
-# the seed URL is hit by extract_supporters + extract_item_id + extract_tags
-# + get_audio_url_for_item, and every top-N item page is hit by both tag
-# hydration and audio-URL hydration. None of that duplication adds value —
-# the HTML is identical. A small bounded LRU keyed on (url, timeout)
-# eliminates the redundant subprocess + HTTP round-trips for the rest of
-# the session. We only cache successful fetches; failures still retry so
-# we don't pin a transient outage into the cache.
-# ---------------------------------------------------------------------------
-
-_DEFAULT_PAGE_CACHE_SIZE = 256
-_page_cache: "OrderedDict[tuple, str]" = OrderedDict()
-_page_cache_lock = threading.Lock()
-
-
-def _resolve_page_cache_size() -> int:
-    raw = os.environ.get("BANDCAMP_PAGE_CACHE_SIZE")
-    if raw is None:
-        return _DEFAULT_PAGE_CACHE_SIZE
-    try:
-        n = int(raw)
-        return max(0, n)
-    except ValueError:
-        return _DEFAULT_PAGE_CACHE_SIZE
-
-
-def _page_cache_get(key: tuple) -> Optional[str]:
-    with _page_cache_lock:
-        value = _page_cache.get(key)
-        if value is not None:
-            _page_cache.move_to_end(key)
-        return value
-
-
-def _page_cache_put(key: tuple, value: str, max_size: int) -> None:
-    if max_size <= 0:
-        return
-    with _page_cache_lock:
-        _page_cache[key] = value
-        _page_cache.move_to_end(key)
-        while len(_page_cache) > max_size:
-            _page_cache.popitem(last=False)
+# Every Bandcamp item page carries this attribute; a 200 without it is not
+# the page (bot challenge, error shell, parked domain).
+ITEM_PAGE_MARKER = "data-tralbum"
 
 
 def clear_page_cache() -> None:
-    """Drop every entry in the page cache. Used by tests + long-running radios."""
-    with _page_cache_lock:
-        _page_cache.clear()
-
-# Backoff schedule for the curl retry loop. Three attempts total — the
-# downstream radio worker confirmed 3 is the sweet spot: enough to ride
-# out a per-IP throttle, few enough to not extend the slice budget too far.
-_RETRY_BACKOFF_SECONDS = (0.4, 1.2, 3.0)
+    """Drop every cached page (tests + long-running consumers)."""
+    http.clear_page_cache()
 
 
-def fetch_page_html(url: str, timeout: int = _DEFAULT_CURL_TIMEOUT) -> Optional[str]:
-    """Fetch HTML content from a URL using curl, with bounded retry.
+def fetch_page_html(url: str, timeout: int = _DEFAULT_CURL_TIMEOUT,
+                    expect: Optional[str] = ITEM_PAGE_MARKER) -> Optional[str]:
+    """Fetch a Bandcamp page through the shared policy
+    (:func:`bandcamp_recommender.http.get_page`: plain HTTP, payload
+    validation, short-lived cache, browser fallback on a bot challenge).
 
-    Strategy:
-
-    * If the curl-breaker has tripped (IP blocked), skip straight to Selenium.
-    * Otherwise try curl up to 3 times with exponential backoff
-      (0.4 s → 1.2 s → 3.0 s) on subprocess timeout or non-zero exit.
-      Bandcamp custom domains (e.g. craigieknowes.com) can spike to 15–20 s
-      on a single request; a single transient timeout shouldn't fail the
-      whole pipeline.
-    * Parse failures are out of scope here — this layer only retries on
-      transport-level failure.
-
-    Args:
-        url: URL to fetch
-        timeout: Per-attempt request timeout in seconds (default 20 s,
-            up from 15 s to match real-world custom-domain latency).
-
-    Returns:
-        HTML content as string, or None if all attempts fail.
-    """
-    cache_size = _resolve_page_cache_size()
-    cache_key = (url, timeout)
-    if cache_size > 0:
-        cached = _page_cache_get(cache_key)
-        if cached is not None:
-            return cached
-
-    if curl_breaker.should_skip_curl():
-        html = _fetch_page_with_selenium(url)
-        if html is not None:
-            _page_cache_put(cache_key, html, cache_size)
-        return html
-
-    curl_cmd = [
-        "curl",
-        "-s",  # Silent mode
-        "-L",  # Follow redirects
-        # --fail: treat an HTTP error status (429/403/404/5xx) as a failure
-        # (exit 22, empty stdout) instead of exit 0 with the error-page body.
-        # Without this, a rate-limit (429) page is cached as if it were the
-        # real page, so extract_supporters/extract_tags parse it, find
-        # nothing, and the seed returns 0 results for the whole life of the
-        # (long-lived) process — even after the throttle clears. Routing HTTP
-        # errors through the non-zero-exit path means they retry with backoff
-        # and are never cached.
-        "--fail",
-        "--compressed",  # Automatically decompress gzip/deflate
-        "-H", "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "-H", "Accept-Language: en-US,en;q=0.5",
-        "-H", "Connection: keep-alive",
-        url,
-    ]
-
-    # Retry strategy: on transient HTTP-level failure (non-zero exit, but the
-    # subprocess didn't time out → the request completed, just badly), retry
-    # up to 3 times with backoff. On a hard timeout (subprocess.TimeoutExpired)
-    # we give up immediately — the per-call timeout (20 s default) is already
-    # generous enough for Bandcamp custom domains, and stacking 4 × 20 s on a
-    # dead URL would blow the per-supporter slice budget for everyone fanned
-    # out alongside it.
-    attempts = len(_RETRY_BACKOFF_SECONDS) + 1  # initial try + N backoffs
-    for attempt in range(attempts):
-        try:
-            result = subprocess.run(
-                curl_cmd, capture_output=True, text=True, timeout=timeout
-            )
-        except subprocess.TimeoutExpired:
-            curl_breaker.record_outcome(success=False)
-            logger.warning(
-                "curl timeout fetching %s (timeout=%ds, attempt %d/%d, not retrying timeouts)",
-                url,
-                timeout,
-                attempt + 1,
-                attempts,
-            )
-            return None
-        except Exception:
-            logger.warning(
-                "curl error fetching %s (attempt %d/%d)",
-                url,
-                attempt + 1,
-                attempts,
-                exc_info=_debug_exc_info(),
-            )
-            return None  # Non-timeout errors aren't worth retrying.
-
-        if result.returncode == 0:
-            curl_breaker.record_outcome(success=True)
-            _page_cache_put(cache_key, result.stdout, cache_size)
-            return result.stdout
-
-        curl_breaker.record_outcome(success=False)
-        logger.warning(
-            "curl returned %d for %s (attempt %d/%d): %s",
-            result.returncode,
-            url,
-            attempt + 1,
-            attempts,
-            result.stderr.strip()[:200],
-        )
-        if attempt < attempts - 1:
-            time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
-
-    logger.error("curl gave up after %d attempts: %s", attempts, url)
-    return None
+    Returns None on any failure; callers treat None as "no data". The
+    default ``expect`` suits item (album/track) pages; pass another marker,
+    or None, for other page types."""
+    try:
+        return http.get_page(url, expect=expect, timeout=timeout)
+    except http.FetchError as e:
+        logger.warning("page fetch failed: %s", e)
+        return None
 
 
 def extract_supporters(item_url: str) -> List[str]:
@@ -296,11 +149,9 @@ def extract_supporters(item_url: str) -> List[str]:
                             if username and username not in excluded:
                                 supporters.append(username)
 
-    # Selenium fallback if curl returned no supporters (e.g. datacenter IP blocked by Bandcamp)
-    if not supporters:
-        selenium_html = _fetch_page_with_selenium(item_url)
-        if selenium_html:
-            supporters = _parse_supporters_from_html(selenium_html)
+    # No Selenium retry here: a challenged fetch already went through the
+    # browser inside fetch_page_html, so an empty list is a real "no
+    # supporters" (or a failed fetch, logged there).
 
     # Remove duplicates while preserving order
     seen = set()
@@ -311,6 +162,30 @@ def extract_supporters(item_url: str) -> List[str]:
             unique_supporters.append(supporter)
 
     return unique_supporters
+
+
+def supporter_fan_ids(item_url: str) -> Dict[str, int]:
+    """``{username: fan_id}`` for the supporters shown on an item page, read
+    from the page cache only (``extract_supporters`` just fetched it). Lets a
+    supporter's collection be read with ONE API call instead of fan page +
+    API call. Empty when the page isn't cached or has no ids."""
+    html = http.peek_page(item_url)
+    if not html:
+        return {}
+    soup = BeautifulSoup(html, features="html.parser")
+    collectors_data = soup.find("div", id="collectors-data")
+    if not collectors_data:
+        return {}
+    try:
+        blob = json.loads(collectors_data.get("data-blob") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    out: Dict[str, int] = {}
+    for thumb in blob.get("thumbs", []) or []:
+        username, fan_id = thumb.get("username"), thumb.get("fan_id")
+        if username and fan_id:
+            out[username] = fan_id
+    return out
 
 
 def _parse_supporters_from_html(html: str) -> List[str]:
@@ -344,41 +219,16 @@ def _parse_supporters_from_html(html: str) -> List[str]:
     return supporters
 
 
-def _fetch_page_with_selenium(url: str) -> Optional[str]:
-    """Fetch page HTML using Selenium. Fallback for when curl is blocked (e.g. datacenter IPs).
-
-    Always cleans up the driver — even when ``driver.get(...)`` raises
-    ``TimeoutException`` because the page-load timeout fired. Pre-hardening
-    this routine could leak a chromedriver on every hung Bandcamp request.
-    """
-    from .driver_manager import DriverManager
-    from selenium.common.exceptions import TimeoutException, WebDriverException
-
-    dm = DriverManager()
-    try:
-        dm.init_driver()
-    except WebDriverException:
-        logger.warning("Selenium fallback: driver init failed", exc_info=_debug_exc_info())
-        return None
+def _fetch_page_with_selenium(url: str, expect: Optional[str] = None) -> Optional[str]:
+    """Fetch page HTML with the shared fallback browser (kept for callers of
+    the old helper; :func:`fetch_page_html` already falls back on its own)."""
+    from bandcamp_recommender import browser
 
     try:
-        dm.driver.get(url)
-        time.sleep(3)
-        return dm.driver.page_source
-    except TimeoutException:
-        logger.warning("Selenium fallback: page-load timeout on %s", url)
+        return browser.fetch_html(url, expect)
+    except http.FetchError as e:
+        logger.warning("Selenium fallback failed for %s: %s", url, e)
         return None
-    except WebDriverException as e:
-        logger.warning("Selenium fallback: webdriver error on %s: %s", url, e)
-        return None
-    except Exception:
-        logger.warning("Selenium fallback failed", exc_info=_debug_exc_info())
-        return None
-    finally:
-        try:
-            dm.close()
-        except Exception:
-            logger.warning("Selenium fallback: driver close failed", exc_info=_debug_exc_info())
 
 
 def extract_item_id(item_url: str) -> Optional[str]:
