@@ -53,6 +53,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 self._send(200, b"data-tralbum ok")
         elif path == "/always-429":
             self._send(429, headers=[("Retry-After", "1")])
+        elif path == "/loop":
+            self._send(301, headers=[("Location", "/loop")])
         elif path == "/404":
             self._send(404)
         elif path == "/trickle":
@@ -122,6 +124,12 @@ class HttpClientTests(unittest.TestCase):
             with self.assertRaises(bchttp.HTTPStatus) as ctx:
                 bchttp.get_html(f"{base}/404")
         self.assertEqual(ctx.exception.status, 404)
+
+    def test_redirect_loop_is_bounded(self):
+        with server() as base:
+            with self.assertRaises(bchttp.FetchError):
+                bchttp.get_html(f"{base}/loop")
+        self.assertLessEqual(_Handler.hits.get("/loop", 0), 6)  # one attempt, max_redirects=5
 
     def test_utf8_decoded_without_declared_charset(self):
         with server() as base:

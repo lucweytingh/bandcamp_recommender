@@ -201,6 +201,11 @@ def _state():
         if _session is None:
             concurrency = int(_env_float("BANDCAMP_MAX_CONCURRENCY", _DEFAULT_MAX_CONCURRENCY))
             session = requests.Session()
+            # Redirects are followed inside ONE paced slot. Some custom artist
+            # domains ping-pong forever with their *.bandcamp.com twin
+            # (303 -> 301 -> ...); the default of 30 turned each into a
+            # 30-request burst against a ~1 req/s limit.
+            session.max_redirects = 5
             adapter = requests.adapters.HTTPAdapter(
                 pool_connections=16, pool_maxsize=max(8, concurrency * 2)
             )
@@ -345,6 +350,9 @@ def request(method: str, url: str, *, timeout: float, **kwargs: Any) -> Response
         except requests.Timeout as e:
             count("timeouts")
             raise Timeout(f"timeout after {timeout}s: {url}") from e
+        except requests.TooManyRedirects as e:
+            count("errors")  # deterministic: a loop doesn't heal on retry
+            raise FetchError(f"redirect loop: {url}") from e
         except requests.RequestException as e:
             if transport_failures >= len(_TRANSPORT_BACKOFF_S):
                 count("errors")
