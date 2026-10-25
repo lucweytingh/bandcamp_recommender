@@ -121,8 +121,10 @@ def _bpm_rerank_score(
 
 from bs4 import BeautifulSoup
 
+from bandcamp_recommender.artists import artist_tokens
 from bandcamp_recommender.items import normalize_item_url
 from bandcamp_recommender.recommendations.scraper import (
+    extract_artist,
     extract_item_id,
     extract_supporters,
     extract_tags,
@@ -131,6 +133,30 @@ from bandcamp_recommender.recommendations.scraper import (
 )
 from bandcamp_recommender.recommendations.mood_tags import tag_mood_score
 from bandcamp_recommender.recommendations.tags import calculate_tag_similarity, normalize_tag
+
+
+def _cap_per_artist(
+    ranked: List[tuple],
+    band_of: Callable[[str], str],
+    max_per_artist: int,
+    limit: int,
+) -> List[tuple]:
+    """The first ``limit`` of ``ranked`` (``(item_id, count)``, best first)
+    keeping at most ``max_per_artist`` releases per artist token. A release
+    credited to several artists counts for each of them and is skipped once
+    any of them is at the cap; credits without tokens ("Various Artists", "")
+    are never capped."""
+    kept: List[tuple] = []
+    per_artist: Counter = Counter()
+    for iid, cnt in ranked:
+        if len(kept) >= limit:
+            break
+        tokens = artist_tokens(band_of(iid))
+        if any(per_artist[t] >= max_per_artist for t in tokens):
+            continue
+        per_artist.update(tokens)
+        kept.append((iid, cnt))
+    return kept
 
 
 class SupporterRecommender:
@@ -170,6 +196,8 @@ class SupporterRecommender:
         event_callback: Optional[Callable[[dict], None]] = None,
         collection_page_size: int = _DEFAULT_COLLECTION_PAGE_SIZE,
         candidate_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        exclude_seed_artist: bool = False,
+        max_per_artist: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Get recommendations based on supporter purchases.
 
@@ -234,10 +262,24 @@ class SupporterRecommender:
                 ranked candidates BEFORE the result is cut to
                 ``max_recommendations``, so the caller's exclusions (e.g.
                 recently played) don't waste result slots or downstream work.
+            exclude_seed_artist: If True, drop candidates by the seed's own
+                artist (credits whose :func:`~bandcamp_recommender.artists.artist_tokens`
+                intersect the seed page's artist, so collabs count) before
+                ``candidate_filter`` and the cut. A seed's supporters mostly
+                own its artist's other releases, which can otherwise fill the
+                result. A compilation seed ("Various Artists") excludes
+                nothing. Default False (unchanged behaviour).
+            max_per_artist: If set (>= 1), keep at most this many releases
+                per artist token, best-ranked first, after ``candidate_filter``
+                and before the cut, so a few artists' back catalogues can't
+                fill the result. A collab counts for each of its artists;
+                compilations are never capped. Default None (no cap).
 
         Returns:
             List of recommendation dictionaries with item_title, band_name, item_url, supporters_count
         """
+        if max_per_artist is not None and max_per_artist < 1:
+            raise ValueError(f"max_per_artist must be >= 1 or None, got {max_per_artist!r}")
         self._begin_call(collection_page_size)
         # Get supporters of the wishlist item
         if progress_callback:
@@ -420,17 +462,32 @@ class SupporterRecommender:
             if normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
         ]
 
+        def band_of(iid: str) -> str:
+            return (self.item_cache.get(iid) or {}).get("band_name") or ""
+
+        # Before candidate_filter, so the caller's filter (which may keep
+        # state) only sees candidates the library keeps. The artist comes
+        # from the seed page extract_supporters already read (page-cache hit).
+        if exclude_seed_artist:
+            seed_artist = artist_tokens(extract_artist(wishlist_item_url))
+            if seed_artist:
+                sorted_items = [
+                    (iid, cnt) for (iid, cnt) in sorted_items
+                    if not artist_tokens(band_of(iid)) & seed_artist
+                ]
+
         if candidate_filter is not None:
             sorted_items = [
                 (iid, cnt) for (iid, cnt) in sorted_items
                 if candidate_filter(self.item_cache.get(iid) or {})
             ]
 
-        if bpm_match:
-            expanded_pool_size = max(50, max_recommendations * 3)
-            top_items = sorted_items[:expanded_pool_size]
-        else:
-            top_items = sorted_items[:max_recommendations]
+        pool_size = max(50, max_recommendations * 3) if bpm_match else max_recommendations
+        # After the caller's filter, so a release it rejects doesn't use up
+        # its artist's slots.
+        if max_per_artist is not None:
+            sorted_items = _cap_per_artist(sorted_items, band_of, max_per_artist, pool_size)
+        top_items = sorted_items[:pool_size]
 
         if event_callback:
             top_meta = []
@@ -608,6 +665,8 @@ class SupporterRecommender:
         progress_callback: Optional[Callable] = None,
         collection_page_size: int = _DEFAULT_COLLECTION_PAGE_SIZE,
         candidate_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        exclude_seed_artist: bool = False,
+        max_per_artist: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Get recommendations ordered by feature-vector similarity to a source.
 
@@ -654,9 +713,10 @@ class SupporterRecommender:
         back to the ``BANDCAMP_DIVERSIFY`` env var. See
         :mod:`bandcamp_recommender.recommendations.diversity`.
 
-        ``collection_page_size`` and ``candidate_filter`` are passed to
-        :meth:`get_recommendations` (the filter runs before the pool is cut,
-        so every hydrated + decoded candidate is one the caller can use).
+        ``collection_page_size``, ``candidate_filter``, ``exclude_seed_artist``
+        and ``max_per_artist`` are passed to :meth:`get_recommendations`; all
+        apply before the ``candidate_pool_size`` cut, so every hydrated +
+        decoded candidate is one the caller can use.
 
         Audio features describe each item's featured preview track (the one
         ``audio_url`` points at) and are cached on disk per (item, track).
@@ -684,6 +744,8 @@ class SupporterRecommender:
             progress_callback=progress_callback,
             collection_page_size=collection_page_size,
             candidate_filter=candidate_filter,
+            exclude_seed_artist=exclude_seed_artist,
+            max_per_artist=max_per_artist,
         )
         t_pool = time.monotonic() - t0
 
