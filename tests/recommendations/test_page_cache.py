@@ -88,6 +88,17 @@ class GetPageCacheTests(unittest.TestCase):
             with self.assertRaises(http.Challenged):
                 http.get_page("https://x.test/c", fallback=False)
 
+    def test_challenge_without_fallback_does_not_block_a_fallback_read(self):
+        from bandcamp_recommender import browser
+
+        with patch.object(http, "get_html", side_effect=http.Challenged("x")), \
+             patch("bandcamp_recommender.recommendations.curl_breaker.record_outcome"), \
+             patch.object(browser, "fetch_html", return_value="<html>real</html>") as fb:
+            with self.assertRaises(http.Challenged):
+                http.get_page("https://x.test/c", fallback=False)
+            self.assertEqual(http.get_page("https://x.test/c"), "<html>real</html>")
+        fb.assert_called_once_with("https://x.test/c", None)
+
     def test_cache_hit_rechecks_expected_marker(self):
         get_html, calls = self._fake("<html>pagedata</html>")
         with patch.object(http, "get_html", side_effect=get_html):

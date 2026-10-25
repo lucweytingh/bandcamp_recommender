@@ -533,10 +533,11 @@ def get_page(url: str, expect: Optional[str] = None, timeout: float = 20,
         try:
             body = get_html(url, expect=expect, timeout=timeout)
             curl_breaker.record_outcome(success=True)
-        except Challenged as e:
+        except Challenged:
             curl_breaker.record_outcome(success=False)
             if not fallback:
-                _remember_failure(url, e)
+                # Not remembered: the page itself may be fine through the
+                # browser, which a caller with fallback=True would get.
                 raise
             logger.warning("bot challenge on %s; using the fallback browser", url)
         except FetchError as e:
