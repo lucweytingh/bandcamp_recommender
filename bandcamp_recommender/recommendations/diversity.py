@@ -225,9 +225,10 @@ def select_stratified(pool: Sequence[Track], seed: Track, k: int) -> List[Track]
     relevant member, then takes one track per bucket (most relevant first),
     never repeating an artist. Artists are compared by
     :func:`~bandcamp_recommender.artists.artist_tokens`, so "Siu Mata & Amor
-    Satyr" blocks a later "SIU MATA", and "Various Artists" never blocks
-    another compilation. Falls back to filling from leftovers if there are
-    fewer buckets than k.
+    Satyr" blocks a later "SIU MATA". Placeholder credits ("Various
+    Artists", "Unknown Artist") are told apart by release page: one label's
+    comps block each other, different labels' comps do not. Falls back to
+    filling from leftovers if there are fewer buckets than k.
     """
     if not pool:
         return []

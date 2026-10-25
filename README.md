@@ -141,7 +141,10 @@ r.last_call_stats["pool"]       # {"seed_artist", "seed_artist_dropped", "artist
 ```
 
 Artists are compared with `artists.artist_tokens` ("A & B", "A feat. B" count
-for both A and B; "Various Artists" is never an artist). The seed's artist is
+for both A and B). A placeholder credit ("Various Artists", "Unknown Artist",
+"V/A", blank) is identified by its release page's host instead: one label's
+placeholder releases count as one act (capped and excluded together), while
+comps from different pages stay distinct. The seed's artist is
 read from the seed page, which the call has just read anyway: no extra
 request. Defaults (`False` / `None`) give the same result as before.
 
@@ -291,7 +294,8 @@ read).
   `exclude_seed_artist=True` drops the seed's own artist and
   `max_per_artist=N` keeps each artist's N best-ranked releases (artists
   compared by `artists.artist_tokens`, so collabs count for each member and
-  "Various Artists" is never one artist). Audio features describe each
+  placeholder credits such as "Various Artists" are grouped by release page
+  host, not into one artist). Audio features describe each
   item's featured track (`preview_track_id`); `audio_url` is only set when
   the page was read during the call (stream URLs are signed and expire).
 - `http.snapshot()` / `http.diff()` expose request counters (`requests`,
@@ -304,14 +308,22 @@ read).
 
 ## Upgrading to 0.8.0
 
-- The HTTP session now uses Python's standard TLS handshake (`ssl.create_default_context()` with certifi's CA bundle, full certificate and hostname checks). urllib3's own SSL context is answered with Bandcamp's bot challenge from residential IPs, which sent every page read on a laptop to the fallback Chrome. Datacenter IPs passed either way.
-
 Pin `bandcamp-recommender[bpm] @ git+https://github.com/lucweytingh/bandcamp_recommender.git@v0.8.0`.
 New: `items.item_info` / `parse_item_html` / `art_url` / `feature_tags`,
 `fans.fan_library`, `artists.artist_tokens`, the `exclude_seed_artist` /
 `max_per_artist` options, `chrome_procs.reap_orphans`. Every public 0.7.0
 signature is unchanged, and so is every default result, except these
 deliberate changes:
+
+- The HTTP session uses Python's standard TLS handshake
+  (`ssl.create_default_context()` with certifi's CA bundle, full certificate
+  and hostname checks). urllib3's own SSL context is answered with
+  Bandcamp's bot challenge from residential IPs, which sent every page read
+  on a laptop to the fallback Chrome; datacenter IPs passed either way.
+  `verify="<bundle>"` / `REQUESTS_CA_BUNDLE` get a context trusting exactly
+  that bundle; `verify=False` or a client `cert` use urllib3's own context.
+  Requires `requests>=2.32.3` (2.32.0-2.32.2 override a custom context) and
+  declares `certifi`.
 
 - The fallback Chrome quits itself after `BANDCAMP_BROWSER_IDLE_S` (120) s
   unused; it used to live until `browser.close()`, a recommender's
@@ -336,8 +348,14 @@ deliberate changes:
   the browser.
 - Page tags are read from the tag block and de-duplicated ignoring case
   (identical output on every real page tested).
-- `diversify="stratified"` compares artists with `artist_tokens` (collabs
-  and case variants are one artist; compilations no longer block each other).
+- `diversify="stratified"` compares artists with
+  `artist_tokens(artist, item_url)`: collabs and case variants are one
+  artist, and a placeholder credit ("Various Artists", "Unknown Artist",
+  "V/A", blank) is its release page host (`{"@label.bandcamp.com"}`), so one
+  label's placeholder releases block each other and other labels' comps no
+  longer do. The same identity drives the new `exclude_seed_artist` and
+  `max_per_artist`. `artist_tokens` without a URL gives placeholders no
+  identity (an empty set).
 - `items.normalize_item_url` also strips surrounding whitespace; every disk
   cache key stays valid.
 
@@ -348,7 +366,7 @@ The codebase is organized into modular components:
 - `bandcamp_recommender/features.py` - Vector similarity API (`extract_features`, `distance`, `project_mood`)
 - `bandcamp_recommender/items.py` - The one item-page parse (`parse_item_html`, `item_info`), cached item metadata, and `normalize_item_url`, the one canonical item URL for comparisons and cache keys
 - `bandcamp_recommender/fans.py` - A fan's own wishlist + collection (`fan_library`), with list entry times
-- `bandcamp_recommender/artists.py` - `artist_tokens`, artist identity: collaboration credits split into their members, case folded, "Various Artists" dropped (two credits are the same artist when their tokens intersect)
+- `bandcamp_recommender/artists.py` - `artist_tokens`, artist identity: collaboration credits split into their members, case folded, placeholder credits ("Various Artists", "Unknown Artist") identified by their release page host (two credits are the same artist when their tokens intersect)
 - `bandcamp_recommender/recommendations/supporter_recommender.py` - Main recommendation engine
 - `bandcamp_recommender/recommendations/mood_tags.py` - Everynoise-derived tag-mood + tag-spikiness lexicon
 - `bandcamp_recommender/recommendations/intensity.py` - Audio energy / texture feature extraction (librosa)

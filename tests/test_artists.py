@@ -88,6 +88,32 @@ def test_real_credits_ignore_the_page():
     assert artist_tokens("Siu Mata & Amor Satyr", "https://label.bandcamp.com/album/a") == {"siu mata", "amor satyr"}
 
 
+def test_placeholder_spellings_are_placeholders():
+    # Each of these used to be one literal token shared across labels, so two
+    # labels' "V.A" comps were capped and excluded as one act.
+    url = "https://label.bandcamp.com/album/a"
+    for s in ("V.A", "VA.", "Various Artists.", "Unknown Artists", "Anonymous",
+              "-", "?", "...", "N/A", "VV.AA.", "Various Artists / V/A", " v / a "):
+        assert artist_tokens(s) == set(), s
+        assert artist_tokens(s, url) == {"@label.bandcamp.com"}, s
+
+
+def test_v_a_abbreviation_inside_a_credit_is_dropped():
+    assert artist_tokens("Siu Mata / V/A") == {"siu mata"}
+    assert artist_tokens("V/Aqua") == {"v", "aqua"}  # not the abbreviation
+
+
+def test_symbol_only_band_names_stay_real():
+    assert artist_tokens("!!!", "https://label.bandcamp.com/a") == {"!!!"}
+
+
+def test_page_identity_ignores_www_and_survives_a_malformed_url():
+    assert artist_tokens("", "https://www.label.com/album/a") == {"@label.com"}
+    assert artist_tokens("Unknown Artist", "https://[bad/x") == set()
+    # The URL the library synthesizes for an item without one is no page.
+    assert artist_tokens("Unknown Artist", "https://bandcamp.com/album/123") == set()
+
+
 def test_without_a_url_placeholders_stay_empty():
     assert artist_tokens("Unknown Artist") == set()
     assert artist_tokens("Various Artists", None) == set()

@@ -140,7 +140,9 @@ def _cap_per_artist(
     keeping at most ``max_per_artist`` releases per artist token, and how many
     releases the cap skipped on the way. A release credited to several
     artists counts for each of them and is skipped once any of them is at the
-    cap; credits without tokens ("Various Artists", "") are never capped."""
+    cap. A placeholder credit ("Various Artists", "Unknown Artist", "") counts
+    as its release page (see artist_tokens), so one label's placeholder
+    releases share a cap; a release with no tokens at all is never capped."""
     kept: List[tuple] = []
     skipped = 0
     per_artist: Counter = Counter()
@@ -269,14 +271,19 @@ class SupporterRecommender:
                 intersect the seed page's artist, so collabs count) before
                 ``candidate_filter`` and the cut. A seed's supporters mostly
                 own its artist's other releases, which can otherwise fill the
-                result. A compilation seed ("Various Artists") excludes
-                nothing; a seed page without an artist excludes nothing and
-                logs a warning. Default False (unchanged behaviour).
+                result. A placeholder seed credit ("Various Artists",
+                "Unknown Artist") or a seed page without a readable artist
+                (logged as a warning) is identified by the seed's page host,
+                so only placeholder or blank credits from that same page are
+                dropped (one label's comps are one act); other pages' comps
+                stay. Default False (unchanged behaviour).
             max_per_artist: If set (>= 1), keep at most this many releases
                 per artist token, best-ranked first, after ``candidate_filter``
                 and before the cut, so a few artists' back catalogues can't
                 fill the result. A collab counts for each of its artists;
-                compilations are never capped. Default None (no cap).
+                placeholder credits are capped per release page (one label's
+                comps together, different labels' apart). Default None (no
+                cap).
 
         Returns:
             List of recommendation dictionaries with item_title, band_name, item_url, supporters_count
@@ -316,7 +323,8 @@ class SupporterRecommender:
             seed_artist = extract_artist(wishlist_item_url)
             if not seed_artist:
                 logger.warning("exclude_seed_artist: no artist on the seed page %s, "
-                               "excluding nothing", wishlist_item_url)
+                               "excluding only placeholder or blank credits from "
+                               "that page", wishlist_item_url)
             self._pool_stats["seed_artist"] = seed_artist
         # URL-normalized seed key, computed once. Used to drop the seed from
         # the per-supporter supporter_done emit (the animation's cloud), the
