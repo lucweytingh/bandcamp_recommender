@@ -1,12 +1,14 @@
 """The one item-page parse (items.parse_item_html) and its live wrapper
 (items.item_info).
 
-Fixtures mirror the structure of real pages read on 2026-10-25 (field
-values copied from them): a label's album page (data-band = the label, the
-release artist in data-tralbum), a track page whose album holds the
-description, a preorder with unreleased tracks (``file`` is ``[]``, ``id``
-is null), and the location tag Bandcamp appends to every release's tags
-(``Berlin`` for a band in "Berlin, Germany", linked like any genre tag).
+Fixtures are shaped like real pages read on 2026-10-25, with some values
+added for coverage (the real Pleasure Note page has only the "Berlin" tag;
+the genre tags here are made up): a label's album page (data-band = the
+label, the release artist in data-tralbum), a track page whose album holds
+the description, a preorder with unreleased tracks (``file`` is ``[]``,
+``id`` is null), and the location tag Bandcamp appends to every release's
+tags (``Berlin`` for a band in "Berlin, Germany", linked like any genre
+tag).
 """
 
 from __future__ import annotations
@@ -48,12 +50,16 @@ def _track(n, track_id, title, *, playable=True, link=True, duration=300.0):
     }
 
 
+def _og(image_id, size=5):
+    return f"https://f4.bcbits.com/img/{image_id}_{size}.jpg"
+
+
 def _page(tralbum, *, band=None, ld=None, tags=(), band_location=None, og_art=None,
           tags_block=True):
     """An item page with the parts the parser reads, shaped like Bandcamp's."""
     head = []
     if og_art:
-        head.append(f'<meta property="og:image" content="https://f4.bcbits.com/img/{og_art}_5.jpg">')
+        head.append(f'<meta property="og:image" content="{_og(og_art)}">')
     if ld is not None:
         head.append(f'<script type="application/ld+json">{json.dumps(ld)}</script>')
     attrs = f'data-tralbum="{htmllib.escape(json.dumps(tralbum))}"'
@@ -200,7 +206,18 @@ class ParseAlbumPageTests(unittest.TestCase):
 
     def test_art_id_falls_back_to_og_image(self):
         html = _page(_label_album(art_id=None, current={"title": "x"}), og_art="a0223816436")
-        self.assertEqual(items.parse_item_html(html)["art_id"], 223816436)
+        info = items.parse_item_html(html)
+        self.assertEqual(info["art_id"], 223816436)
+        self.assertEqual(info["og_image_url"], _og("a0223816436"))
+
+    def test_og_image_that_is_not_cover_art_gives_no_art_id(self):
+        # An unprefixed id is another CDN namespace (band photo): no cover id
+        # is made up from it, but the picture itself stays available.
+        html = _page(_label_album(art_id=None, current={"title": "x"}), og_art="0012345678")
+        info = items.parse_item_html(html)
+        self.assertIsNone(info["art_id"])
+        self.assertIsNone(items.art_url(info["art_id"]))
+        self.assertEqual(info["og_image_url"], _og("0012345678"))
 
     def test_matches_the_legacy_helpers(self):
         html = _album_html()
@@ -229,6 +246,20 @@ class ParseEdgeCaseTests(unittest.TestCase):
         info = items.parse_item_html(_page(_label_album(), tags=["noise rock", "Chicago"],
                                            band_location="Chicago, Illinois"))
         self.assertEqual((info["tags"], info["location"]), (["noise rock"], "Chicago"))
+
+    def test_location_from_ld_json_alone(self):
+        # No #band-name-location on the page: publisher.foundingLocation decides.
+        info = items.parse_item_html(_track_album_html(), TRACK_ALBUM)
+        self.assertEqual((info["tags"], info["location"]), ([], "Berlin"))
+
+    def test_artist_tag_equal_to_the_location_keeps_the_location(self):
+        info = items.parse_item_html(_page(_label_album(), tags=["detroit", "techno", "Detroit"],
+                                           band_location="Detroit, Michigan"))
+        self.assertEqual((info["tags"], info["location"]), (["detroit", "techno"], "Detroit"))
+        # Once each in the feature input.
+        self.assertEqual(items.feature_tags(info), ["detroit", "techno"])
+        info = items.parse_item_html(_page(_label_album(), tags=["dub", "Dub", "techno"]))
+        self.assertEqual(info["tags"], ["dub", "techno"])
 
     def test_unplayable_tracks(self):
         # A preorder: released tracks stream, unreleased ones have file=[],
@@ -268,12 +299,32 @@ class ParseEdgeCaseTests(unittest.TestCase):
         self.assertEqual(info["tracks"], [])
         self.assertEqual(info["tags"], [])
         for key in ("item_id", "title", "artist", "page_name", "album_url", "preview",
-                    "location", "description", "art_id", "release_date", "featured_track_id"):
+                    "location", "description", "art_id", "og_image_url", "release_date",
+                    "featured_track_id"):
             self.assertIsNone(info[key], key)
         self.assertEqual(info["item_type"], "album")  # from the URL
         for junk in ("", "<html>", '<script data-tralbum="{not json"></script>',
                      '<script data-tralbum="[1, 2]"></script>'):
             self.assertEqual(items.parse_item_html(junk)["tracks"], [])
+
+    def test_wrongly_typed_fields_never_raise(self):
+        track = _track(1, 1, "One")
+        for bad_link in (5, ["/track/one"], {"x": 1}):
+            tralbum = _label_album(featured_track_id=None, album_url=7,
+                                   trackinfo=[dict(track, title_link=bad_link)])
+            info = items.parse_item_html(_page(tralbum), ALBUM)
+            self.assertIsNone(info["tracks"][0]["url"])
+            self.assertFalse(info["tracks"][0]["playable"])
+            self.assertIsNone(info["preview"])
+            self.assertIsNone(items.preview_from_tralbum(tralbum))
+        # A page URL urljoin rejects (unbalanced IPv6 bracket) and a non-str one.
+        for bad_url in ("https://[bandcamp.com/album/x", 12):
+            tralbum = _label_album(url=bad_url, item_type="track",
+                                   album_url="/album/y", trackinfo=[track])
+            info = items.parse_item_html(_page(tralbum))
+            self.assertEqual(info["tracks"][0]["url"], "/track/one")
+            self.assertEqual(info["album_url"], "/album/y")
+            self.assertEqual(items.preview_from_tralbum(tralbum)["track_id"], 1)
 
     def test_older_pagedata_shape(self):
         blob = {"tralbum_data": {"featured_track_id": 2, "trackinfo": [

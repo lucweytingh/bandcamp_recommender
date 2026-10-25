@@ -175,16 +175,20 @@ from bandcamp_recommender import http, items
 
 try:
     info = items.item_info("https://artist.bandcamp.com/track/x")
-except http.FetchError as e:  # Challenged / RateLimited / Timeout / HTTPStatus / Unexpected
+except http.FetchError as e:  # e.g. Challenged / RateLimited / Timeout / HTTPStatus
     ...
 info["artist"], info["title"], info["release_date"]   # "by ..." artist, ISO date
-info["preview"]["audio_path"]    # what plays: featured track if playable, else first playable
+(info["preview"] or {}).get("audio_path")  # featured track if playable, else first playable; None on preorders
 info["tracks"]                   # every track: playable, duration, url, files, ...
 info["tags"], info["location"]   # genre tags; the location tag ("Berlin") apart
 info["description"]              # a track page gets its album's (one extra read)
-items.art_url(info["art_id"], size=10)  # 10 = 1200 px, 2 = 700 px
+items.art_url(info["art_id"], size=10) or info["og_image_url"]  # 10 = 1200 px, 2 = 700 px
 items.feature_tags(info)         # tags + location: the tag-feature input
 ```
+
+A track page on an album costs two paced reads (its own + the album's, for the
+description); consumers that don't show the description should pass
+`follow_album_description=False` (one read per page).
 
 `items.parse_item_html(html, item_url)` is the same parse without I/O; it
 never raises (missing pieces are None / empty). `item_info` reads through

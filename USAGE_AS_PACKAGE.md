@@ -349,11 +349,13 @@ info = items.item_info("https://label.bandcamp.com/album/x")
 # album_url   a track page's album, else None
 # tracks      [{track_id, title, artist, track_num, duration, url, files,
 #               audio_path, playable}, ...] every track, in order
-# featured_track_id, preview (featured if playable, else first playable)
+# featured_track_id, preview (featured if playable, else first playable;
+#             None when nothing streams, e.g. a preorder)
 # tags        genre tags; location: the location tag ("Berlin") or None
 # description full text (a track page takes its album's: one more read,
 #             skip with follow_album_description=False)
 # art_id      -> items.art_url(art_id, size=10)  (10 = 1200 px, 2 = 700 px)
+# og_image_url the page's og:image as given (a last-resort picture)
 # release_date ISO date or None
 items.feature_tags(info)  # tags + location, the tag-feature input
 ```

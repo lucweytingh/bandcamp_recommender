@@ -3,8 +3,10 @@
 :func:`parse_item_html` is the single reading of an item page (tracks,
 preview choice, tags, location, artist, art, description, release date);
 everything in the library that needs a piece of an item page goes through
-it, and :func:`item_info` exposes it to consumers on top of the shared page
-policy (:func:`bandcamp_recommender.http.get_page`).
+it, except :func:`bandcamp_recommender.recommendations.scraper.extract_item_id`
+(the seed-exclusion id, kept on pagedata on purpose). :func:`item_info`
+exposes it to consumers on top of the shared page policy
+(:func:`bandcamp_recommender.http.get_page`).
 
 :func:`item_meta` is the stable subset every similarity call needs for ~30
 candidates: the featured preview track and the tags. Bandcamp allows ~1
@@ -33,9 +35,11 @@ logger = logging.getLogger(__name__)
 ITEM_PAGE_MARKER = "data-tralbum"
 
 # Cover art lives on Bandcamp's image CDN as a{art_id}_{size}.jpg (the URL
-# pattern is undocumented, hence the og:image fallback for the id).
+# pattern is undocumented, hence the og:image fallback for the id). The "a"
+# is the art namespace: an unprefixed id (0012345678_20.jpg) is another
+# image (a band photo), so it never becomes an art id.
 _ART_URL = "https://f4.bcbits.com/img/a{art_id}_{size}.jpg"
-_OG_ART_RE = re.compile(r"/img/a?(\d+)_\d+\.\w+")
+_OG_ART_RE = re.compile(r"/img/a(\d+)_\d+\.\w+")
 _MONTHS = {m: i for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
 # Bandcamp's own date format: "19 Feb 2022 00:00:00 GMT".
@@ -52,6 +56,17 @@ def _str(value: Any) -> Optional[str]:
 
 def _dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _join(base_url: Optional[str], link: Optional[str]) -> Optional[str]:
+    """``link`` made absolute against ``base_url`` when both are known; a
+    malformed base (urljoin raises ValueError) leaves ``link`` as it is."""
+    if not (link and base_url):
+        return link
+    try:
+        return urljoin(base_url, link)
+    except ValueError:
+        return link
 
 
 def art_url(art_id: Any, size: int = 10) -> Optional[str]:
@@ -97,7 +112,8 @@ def _tracks(trackinfo: Any, base_url: Optional[str]) -> List[Dict[str, Any]]:
             continue
         raw_files = t.get("file")
         files = {k: v for k, v in raw_files.items() if v} if isinstance(raw_files, dict) else {}
-        link = t.get("title_link") or None
+        link = t.get("title_link")
+        link = link if isinstance(link, str) and link else None
         audio_path = _find_audio_path(files)
         out.append({
             "track_id": t.get("track_id") or t.get("id"),
@@ -107,7 +123,7 @@ def _tracks(trackinfo: Any, base_url: Optional[str]) -> List[Dict[str, Any]]:
             "track_num": t.get("track_num"),
             # Unreleased tracks report 0.0: unknown, not zero seconds.
             "duration": t.get("duration") or None,
-            "url": urljoin(base_url, link) if link and base_url else link,
+            "url": _join(base_url, link),
             "files": files,
             "audio_path": audio_path,
             "playable": bool(link and audio_path),
@@ -145,15 +161,20 @@ def _ld_json(soup) -> Dict[str, Any]:
 
 
 def _page_tags(soup) -> List[str]:
-    """Tag link texts in page order (case-insensitively unique), from the
-    release's tags block when there is one."""
+    """Tag link texts in page order, from the release's tags block when
+    there is one."""
     scope = soup.find(class_="tralbum-tags") or soup
+    texts = (a.get_text(strip=True) for a in scope.find_all("a", class_="tag"))
+    return [t for t in texts if t]
+
+
+def _unique(tags: List[str]) -> List[str]:
+    """``tags`` without case-insensitive repeats, first occurrence kept."""
     out, seen = [], set()
-    for a in scope.find_all("a", class_="tag"):
-        text = a.get_text(strip=True)
-        if text and text.casefold() not in seen:
-            seen.add(text.casefold())
-            out.append(text)
+    for tag in tags:
+        if tag.casefold() not in seen:
+            seen.add(tag.casefold())
+            out.append(tag)
     return out
 
 
@@ -183,7 +204,7 @@ def _album_url(tralbum: Dict[str, Any], ld: Dict[str, Any], base_url: Optional[s
     and standalone singles."""
     raw = _str(tralbum.get("album_url"))
     if raw:
-        return urljoin(base_url, raw) if base_url else raw
+        return _join(base_url, raw)
     releases = _dict(ld.get("inAlbum")).get("albumRelease")
     first = _dict(releases[0]) if isinstance(releases, list) and releases else {}
     candidate = _str(first.get("@id"))
@@ -218,12 +239,16 @@ def parse_item_html(html: str, item_url: Optional[str] = None) -> Dict[str, Any]
         ``featured_track_id`` the artist's featured track (album pages)
         ``preview``           the track that plays: featured if playable,
                               else the first playable (one of ``tracks``)
-        ``tags``              genre tags, page order, location excluded
+        ``tags``              genre tags, page order, case-insensitively
+                              unique, location excluded
         ``location``          the location tag ("Berlin"), or None
         ``description``       the page's own description (ld+json, else the
                               "about" text); :func:`item_info` gives a track
                               page its album's
         ``art_id``            cover art id, see :func:`art_url`
+        ``og_image_url``      the page's og:image as given: the cover when
+                              there is one, else whatever image Bandcamp
+                              shows for the page (a last-resort picture)
         ``release_date``      ISO date, or None
 
     ``feature_tags(info)`` gives the tag list the tag features expect
@@ -248,20 +273,24 @@ def parse_item_html(html: str, item_url: Optional[str] = None) -> Dict[str, Any]
     if band_location is None:
         loc = soup.select_one("#band-name-location .location")
         band_location = _str(loc.get_text()) if loc else None
+    # The location is the LAST raw tag; split it off before the repeats go,
+    # so an artist tag equal to it ("detroit" ... "Detroit") can't hide it.
     tags = _page_tags(soup)
     location = _location_tag(tags, band_location)
     if location is not None:
         tags = tags[:-1]
+    tags = _unique(tags)
 
     item_type = _str(tralbum.get("item_type")) or _str(current.get("type"))
     if item_type not in ("album", "track"):
         path = base_url or ""
         item_type = "track" if "/track/" in path else "album" if "/album/" in path else None
 
+    og = soup.find("meta", attrs={"property": "og:image"})
+    og_image_url = _str(og.get("content")) if og else None
     art_id = current.get("art_id") or tralbum.get("art_id")
     if not art_id:
-        og = soup.find("meta", attrs={"property": "og:image"})
-        m = _OG_ART_RE.search(og.get("content") or "") if og else None
+        m = _OG_ART_RE.search(og_image_url or "")
         art_id = int(m.group(1)) if m else None
 
     return {
@@ -280,6 +309,7 @@ def parse_item_html(html: str, item_url: Optional[str] = None) -> Dict[str, Any]
         "location": location,
         "description": _str(ld.get("description")) or _str(current.get("about")),
         "art_id": art_id or None,
+        "og_image_url": og_image_url,
         "release_date": _release_date(
             current.get("release_date"), tralbum.get("album_release_date"), ld.get("datePublished"),
         ),
@@ -287,12 +317,15 @@ def parse_item_html(html: str, item_url: Optional[str] = None) -> Dict[str, Any]
 
 
 def feature_tags(info: Dict[str, Any]) -> List[str]:
-    """Every tag the page shows, location last: the input the tag features
-    (``recommendations.mood_tags``) expect. The location is kept there on
-    purpose: it pairs with genre tags into place genres ("detroit" +
-    "techno", "chicago" + "house", "japan" + "jazz")."""
+    """Every tag the page shows, once each, location last: the input the tag
+    features (``recommendations.mood_tags``) expect. The location is kept
+    there on purpose: it pairs with genre tags into place genres ("detroit"
+    + "techno", "chicago" + "house", "japan" + "jazz")."""
     tags = list(info.get("tags") or [])
-    return tags + [info["location"]] if info.get("location") else tags
+    location = info.get("location")
+    if location and location.casefold() not in {t.casefold() for t in tags}:
+        tags.append(location)
+    return tags
 
 
 def item_info(item_url: str, *, follow_album_description: bool = True) -> Dict[str, Any]:
@@ -305,9 +338,10 @@ def item_info(item_url: str, *, follow_album_description: bool = True) -> Dict[s
     (one more page read); if that page can't be read the track's own
     description (usually None) stays.
 
-    Raises :class:`bandcamp_recommender.http.FetchError` (typed: Challenged,
-    RateLimited, Timeout, HTTPStatus, Unexpected) when the item page itself
-    can't be read; never returns a dict parsed from a junk page."""
+    Raises :class:`bandcamp_recommender.http.FetchError` (e.g.
+    ``http.Challenged``, ``http.RateLimited``, ``http.Timeout``,
+    ``browser.BrowserUnavailable``) when the item page itself can't be read;
+    never returns a dict parsed from a junk page."""
     info = parse_item_html(http.get_page(item_url, expect=ITEM_PAGE_MARKER), item_url)
     if follow_album_description and info["item_type"] == "track" and info["album_url"]:
         try:
