@@ -304,6 +304,8 @@ read).
 
 ## Upgrading to 0.8.0
 
+- The HTTP session now uses Python's standard TLS handshake (`ssl.create_default_context()` with certifi's CA bundle, full certificate and hostname checks). urllib3's own SSL context is answered with Bandcamp's bot challenge from residential IPs, which sent every page read on a laptop to the fallback Chrome. Datacenter IPs passed either way.
+
 Pin `bandcamp-recommender[bpm] @ git+https://github.com/lucweytingh/bandcamp_recommender.git@v0.8.0`.
 New: `items.item_info` / `parse_item_html` / `art_url` / `feature_tags`,
 `fans.fan_library`, `artists.artist_tokens`, the `exclude_seed_artist` /

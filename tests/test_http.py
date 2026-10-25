@@ -244,3 +244,26 @@ class PacerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StdlibTLSTests(unittest.TestCase):
+    """urllib3's own SSL context is challenged by Bandcamp's CDN from
+    residential IPs; the session must use the stdlib handshake while keeping
+    full certificate + hostname verification."""
+
+    def setUp(self):
+        bchttp.reset()
+        self.addCleanup(bchttp.reset)
+
+    def test_https_adapter_uses_a_verifying_stdlib_context(self):
+        import ssl
+
+        session, _ = bchttp._state()
+        adapter = session.get_adapter("https://bandcamp.com/")
+        self.assertIsInstance(adapter, bchttp._StdlibTLSAdapter)
+        ctx = adapter.poolmanager.connection_pool_kw.get("ssl_context")
+        self.assertIsInstance(ctx, ssl.SSLContext)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+        # The urllib3 context disables session tickets; the stdlib one doesn't.
+        self.assertFalse(ctx.options & ssl.OP_NO_TICKET)

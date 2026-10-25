@@ -35,12 +35,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import ssl
 import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
+import certifi
 import requests
 import urllib3
 
@@ -199,6 +201,26 @@ _pacer: Optional[Pacer] = None
 _init_lock = threading.Lock()
 
 
+class _StdlibTLSAdapter(requests.adapters.HTTPAdapter):
+    """HTTPAdapter whose TLS handshake is Python's standard one.
+
+    urllib3 builds its own SSL context (create_urllib3_context), and its
+    ClientHello is distinctive enough that Bandcamp's CDN answers it with the
+    JS bot challenge from residential IPs (measured 2026-10-25 from a home
+    connection: urllib3's context challenged with and without ALPN, the
+    stdlib's ssl.create_default_context passed; datacenter IPs passed both).
+    Certificate and hostname verification are unchanged: the stdlib context
+    requires both, loaded with certifi's CA bundle like requests' default."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs.setdefault("ssl_context", ssl.create_default_context(cafile=certifi.where()))
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs.setdefault("ssl_context", ssl.create_default_context(cafile=certifi.where()))
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
 def _state():
     global _session, _pacer
     with _init_lock:
@@ -210,7 +232,7 @@ def _state():
             # (303 -> 301 -> ...); the default of 30 turned each into a
             # 30-request burst against a ~1 req/s limit.
             session.max_redirects = 5
-            adapter = requests.adapters.HTTPAdapter(
+            adapter = _StdlibTLSAdapter(
                 pool_connections=16, pool_maxsize=max(8, concurrency * 2)
             )
             session.mount("https://", adapter)
