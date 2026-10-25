@@ -56,7 +56,9 @@ _DEFAULT_MAX_CONCURRENCY = 3
 _MAX_RETRY_AFTER_S = 10.0
 _MAX_429_ATTEMPTS = 3
 _TRANSPORT_BACKOFF_S = (0.4, 1.2)
-_MAX_BODY_BYTES = 32 * 1024 * 1024
+# A full fan collection is ~2.5 KB/item (measured); the API's 10000-item
+# maximum is ~25 MB. Leave headroom.
+_MAX_BODY_BYTES = 64 * 1024 * 1024
 _CHUNK = 64 * 1024
 
 # Fastly's JS challenge serves its assets from /_fs-ch-<token>/. Only used to
