@@ -204,6 +204,8 @@ their own.
 The codebase is organized into modular components:
 
 - `bandcamp_recommender/features.py` - Vector similarity API (`extract_features`, `distance`, `project_mood`)
+- `bandcamp_recommender/items.py` - Cached item metadata + `normalize_item_url`, the one canonical item URL for comparisons and cache keys
+- `bandcamp_recommender/artists.py` - `artist_tokens`, artist identity: collaboration credits split into their members, case folded, "Various Artists" dropped (two credits are the same artist when their tokens intersect)
 - `bandcamp_recommender/recommendations/supporter_recommender.py` - Main recommendation engine
 - `bandcamp_recommender/recommendations/mood_tags.py` - Everynoise-derived tag-mood + tag-spikiness lexicon
 - `bandcamp_recommender/recommendations/intensity.py` - Audio energy / texture feature extraction (librosa)

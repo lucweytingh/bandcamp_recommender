@@ -25,6 +25,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+from bandcamp_recommender.artists import artist_tokens
 from bandcamp_recommender.features import distance as _feature_distance
 from bandcamp_recommender.recommendations.intensity import (
     score_intensity_from_features,
@@ -221,7 +222,10 @@ def select_stratified(pool: Sequence[Track], seed: Track, k: int) -> List[Track]
 
     Groups the pool by primary bucket (genre), ranks buckets by their most
     relevant member, then takes one track per bucket (most relevant first),
-    never repeating an artist. Falls back to filling from leftovers if there are
+    never repeating an artist. Artists are compared by
+    :func:`~bandcamp_recommender.artists.artist_tokens`, so "Siu Mata & Amor
+    Satyr" blocks a later "SIU MATA", and "Various Artists" never blocks
+    another compilation. Falls back to filling from leftovers if there are
     fewer buckets than k.
     """
     if not pool:
@@ -248,11 +252,11 @@ def select_stratified(pool: Sequence[Track], seed: Track, k: int) -> List[Track]
             while i < len(b):
                 t = b[i]
                 i += 1
-                if t.artist and t.artist in used_artists:
+                tokens = artist_tokens(t.artist)
+                if tokens & used_artists:
                     continue
                 selected.append(t)
-                if t.artist:
-                    used_artists.add(t.artist)
+                used_artists |= tokens
                 progressed = True
                 break
             bucket_cursors[id(b)] = i
