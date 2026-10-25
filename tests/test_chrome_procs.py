@@ -1,0 +1,403 @@
+"""Ownership and cleanup of the library's Chrome (bandcamp_recommender.chrome_procs).
+
+Runs against a fake /proc tree and fake drivers; never starts or kills a
+real process."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import signal
+import stat
+import subprocess
+import threading
+import time
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+from selenium.common.exceptions import WebDriverException
+
+from bandcamp_recommender import browser, chrome_procs
+from bandcamp_recommender.recommendations import driver_manager
+
+ME = os.getpid()
+SYSTEMD_USER = 986  # the systemd user manager: a subreaper, not pid 1
+OTHER = 4242  # another live process using the library
+DEAD = 999_990  # a library process that died (not in the table)
+
+
+class FakeProc:
+    """A /proc tree; SIGKILL removes the process, as its exit would."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.killed: list = []
+        self.wait_calls: list = []
+        self.waited: list = []
+        root.mkdir()
+
+    def add(self, pid, comm, ppid, *argv, state="S"):
+        d = self.root / str(pid)
+        d.mkdir()
+        (d / "stat").write_text(f"{pid} ({comm}) {state} {ppid} {pid} {pid} 0 -1 4194560 0 0\n")
+        (d / "cmdline").write_bytes(b"".join(a.encode() + b"\0" for a in argv))
+        return pid
+
+    def kill(self, pid, sig):
+        d = self.root / str(pid)
+        if not d.exists():
+            raise ProcessLookupError(pid)
+        if sig == signal.SIGKILL:
+            self.killed.append(pid)
+            shutil.rmtree(d)
+
+    def waitpid(self, pid, options):
+        self.wait_calls.append(pid)
+        d = self.root / str(pid)
+        if pid > 0 and d.exists() and f") Z {ME} " in (d / "stat").read_text():
+            self.waited.append(pid)
+            shutil.rmtree(d)
+            return pid, 0
+        raise ChildProcessError(pid)
+
+
+@pytest.fixture
+def proc(tmp_path, monkeypatch):
+    fake = FakeProc(tmp_path / "proc")
+    fake.add(1, "systemd", 0, "/sbin/init")
+    fake.add(SYSTEMD_USER, "systemd", 1, "/usr/lib/systemd/systemd", "--user")
+    fake.add(ME, "python3", SYSTEMD_USER, "python3", "-m", "pytest")
+    fake.add(OTHER, "python3", SYSTEMD_USER, "python3", "app.py")
+    monkeypatch.setattr(chrome_procs, "_PROC", str(fake.root))
+    monkeypatch.setattr(chrome_procs.os, "kill", fake.kill)
+    monkeypatch.setattr(chrome_procs.os, "waitpid", fake.waitpid)
+    return fake
+
+
+def _profile(owner, token="aaaaaaaa"):
+    return str(chrome_procs.profiles_root() / f"bcr-chrome-{owner}-{token}")
+
+
+def _driver_tree(proc, base, owner_pid, parent, token="aaaaaaaa"):
+    """What one driver looks like on snap Chromium (seen on the server):
+    chromedriver -> browser -> renderer all carry the profile; the browser's
+    double-forked crashpad handler (reparented to init) doesn't, and exits
+    with it. Returns the marked pids."""
+    profile = _profile(owner_pid, token)
+    proc.add(base, "chromedriver", parent, "chromedriver", "--port=1",
+             f"{chrome_procs.CHROMEDRIVER_SWITCH}={profile}")
+    proc.add(base + 1, "chrome", base, "chrome", "--headless=new", f"--user-data-dir={profile}")
+    proc.add(base + 2, "chrome", base + 1, "chrome", "--type=renderer", f"--user-data-dir={profile}")
+    proc.add(base + 3, "chrome_crashpad", 1, "chrome_crashpad_handler", "--monitor-self")
+    return [base, base + 1, base + 2]
+
+
+# ---- the reaper -------------------------------------------------------------
+
+
+def test_reaps_a_dead_owners_tree_and_spares_everyone_else(proc):
+    dead_tree = _driver_tree(proc, 5000, DEAD, SYSTEMD_USER)
+    _driver_tree(proc, 6000, OTHER, OTHER, token="bbbbbbbb")
+    proc.add(7001, "chrome", 1, "/opt/google/chrome/chrome")  # the user's own browser
+    proc.add(7002, "chrome-headless", 1, "chrome-headless-shell",
+             "--user-data-dir=/tmp/playwright_chromiumdev_profile-x")
+    proc.add(7003, "bash", SYSTEMD_USER, "ls", _profile(DEAD))  # not Chrome
+
+    assert chrome_procs.reap_orphans() == 3
+    assert sorted(proc.killed) == dead_tree
+
+
+def test_own_browser_is_spared_while_its_driver_lives(proc):
+    profile = chrome_procs.new_profile()
+    name = os.path.basename(profile)
+    token = name.rsplit("-", 1)[1]
+    tree = _driver_tree(proc, 5000, ME, ME, token=token)
+
+    assert chrome_procs.reap_orphans() == 0
+    assert proc.killed == []
+    # The driver is gone (its quit failed): what still runs on it is a leak.
+    chrome_procs._live.pop(name)
+    assert chrome_procs.reap_orphans() == 3
+    assert sorted(proc.killed) == tree
+
+
+def test_unmarked_chromedriver_whose_spawner_died_goes_with_its_browser(proc):
+    proc.add(8001, "chromedriver", SYSTEMD_USER, "chromedriver", "--port=2")
+    proc.add(8002, "chrome", 8001, "chrome", "--user-data-dir=/tmp/.org.chromium.Chromium.scoped_dir.x")
+    proc.add(8003, "chrome", 8002, "chrome", "--type=renderer")
+    proc.add(8101, "chromedriver", 1, "chromedriver", "--port=3")
+    proc.add(8201, "chromedriver", OTHER, "chromedriver", "--port=4")  # its process is alive
+    proc.add(8202, "chrome", 8201, "chrome", "--user-data-dir=/tmp/.org.chromium.Chromium.scoped_dir.y")
+
+    chrome_procs.reap_orphans()
+    assert sorted(proc.killed) == [8001, 8002, 8003, 8101]
+
+
+def test_in_a_container_pid_1_may_be_a_live_library_process(proc):
+    shutil.rmtree(proc.root / "1")
+    proc.add(1, "python3", 0, "python3", "app.py")
+    proc.add(8001, "chromedriver", 1, "chromedriver", "--port=2")
+
+    chrome_procs.reap_orphans()
+    assert proc.killed == []
+
+
+def test_waits_only_our_own_chromium_zombies(proc):
+    proc.add(9001, "chromedriver", ME, state="Z")
+    proc.add(9002, "ffmpeg", ME, state="Z")  # the caller's own subprocess
+    proc.add(9003, "chromedriver", OTHER, state="Z")
+
+    assert chrome_procs.reap_orphans() == 1
+    assert proc.wait_calls == [9001]  # never waitpid(-1), never someone else's child
+    assert proc.killed == []
+
+
+def test_sweeps_stale_profiles_only(proc):
+    root = chrome_procs.profiles_root()
+    root.mkdir(parents=True)
+    mine = os.path.basename(chrome_procs.new_profile())
+    names = {
+        "dead": f"bcr-chrome-{DEAD}-aaaaaaaa",
+        "starting": f"bcr-chrome-{OTHER}-bbbbbbbb",
+        "reused_pid": f"bcr-chrome-{OTHER}-cccccccc",
+        "in_use": f"bcr-chrome-{OTHER}-dddddddd",
+        "my_leftover": f"bcr-chrome-{ME}-eeeeeeee",
+        "unrelated": "something-else",
+    }
+    for name in names.values():
+        (root / name).mkdir()
+    old = time.time() - 2 * chrome_procs._LAUNCH_GRACE_S
+    for key in ("reused_pid", "in_use"):
+        os.utime(root / names[key], (old, old))
+    proc.add(6001, "chrome", OTHER, "chrome", f"--user-data-dir={root / names['in_use']}")
+
+    chrome_procs.reap_orphans()
+    left = {p.name for p in root.iterdir()}
+    assert left == {mine, names["starting"], names["in_use"], names["unrelated"]}
+
+
+def test_release_profile_kills_leftovers_and_deletes_the_dir(proc):
+    profile = chrome_procs.new_profile()
+    name = os.path.basename(profile)
+    tree = _driver_tree(proc, 5000, ME, ME, token=name.rsplit("-", 1)[1])
+    other = _driver_tree(proc, 6000, OTHER, OTHER, token="bbbbbbbb")
+
+    chrome_procs.release_profile(profile)
+    assert sorted(proc.killed) == tree
+    assert not os.path.exists(profile)
+    assert name not in chrome_procs._live
+    assert all((proc.root / str(pid)).exists() for pid in other)
+
+
+def test_quit_driver_cleans_up_even_when_quit_fails(proc):
+    profile = chrome_procs.new_profile()
+    driver = MagicMock()
+    driver.quit.side_effect = WebDriverException("chromedriver is gone")
+    setattr(driver, chrome_procs.PROFILE_ATTR, profile)
+
+    chrome_procs.quit_driver(driver)
+    driver.quit.assert_called_once()
+    assert not os.path.exists(profile)
+
+
+def test_at_exit_nothing_this_process_started_survives(proc):
+    profile = chrome_procs.new_profile()
+    tree = _driver_tree(proc, 5000, ME, ME, token=os.path.basename(profile).rsplit("-", 1)[1])
+    # A forked child inherits the parent's registry; it must not kill the
+    # parent's browser when it exits.
+    chrome_procs._live[f"bcr-chrome-{OTHER}-bbbbbbbb"] = _profile(OTHER, "bbbbbbbb")
+    other = _driver_tree(proc, 6000, OTHER, OTHER, token="bbbbbbbb")
+
+    chrome_procs._release_all()
+    assert sorted(proc.killed) == tree
+    assert not os.path.exists(profile)
+    assert all((proc.root / str(pid)).exists() for pid in other)
+
+
+def test_first_profile_reaps_once_per_process(monkeypatch):
+    monkeypatch.setattr(chrome_procs, "_swept", False)
+    reap = MagicMock(return_value=0)
+    monkeypatch.setattr(chrome_procs, "reap_orphans", reap)
+
+    first = chrome_procs.new_profile()
+    chrome_procs.new_profile()
+    assert reap.call_count == 1
+    assert os.path.basename(first).startswith(f"bcr-chrome-{ME}-")
+    assert stat.S_IMODE(os.stat(first).st_mode) == 0o700
+
+
+def test_profiles_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(chrome_procs.Path, "home", lambda: tmp_path / "home")
+    monkeypatch.setattr(chrome_procs, "_SNAP_CHROMIUM", str(tmp_path / "no-snap"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    assert chrome_procs.profiles_root() == tmp_path / "chrome-profiles"  # conftest override
+
+    monkeypatch.delenv("BANDCAMP_BROWSER_PROFILE_DIR")
+    monkeypatch.setattr(chrome_procs.sys, "platform", "darwin")
+    assert chrome_procs.profiles_root() == tmp_path / "cache" / "bandcamp_recommender" / "chrome-profiles"
+    monkeypatch.setattr(chrome_procs.sys, "platform", "linux")
+    assert chrome_procs.profiles_root() == tmp_path / "cache" / "bandcamp_recommender" / "chrome-profiles"
+    # Snap Chromium can't write hidden dirs under $HOME: use its own dir.
+    (tmp_path / "home" / "snap" / "chromium").mkdir(parents=True)
+    assert chrome_procs.profiles_root() == (
+        tmp_path / "home" / "snap" / "chromium" / "common" / "bandcamp_recommender" / "chrome-profiles"
+    )
+
+
+def test_ps_fallback_without_proc(tmp_path, monkeypatch):
+    """macOS: no /proc; comm is a full path with spaces."""
+    helper = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper (Renderer)"
+    profile = _profile(DEAD)
+    outputs = {
+        "pid=,ppid=,stat=,comm=": (
+            f"    1     0 Ss   /sbin/launchd\n"
+            f"  501     1 S    /Users/me/.wdm/chromedriver\n"
+            f"  502   501 S    /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n"
+            f"  503   502 S    {helper}\n"
+            f"  600     1 S    /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n"
+            f"  700     1 S    /bin/zsh\n"
+        ),
+        "pid=,args=": (
+            f"    1 /sbin/launchd\n"
+            f"  501 /Users/me/.wdm/chromedriver --port=5 {chrome_procs.CHROMEDRIVER_SWITCH}={profile}\n"
+            f"  502 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir={profile}\n"
+            f"  503 {helper} --type=renderer --user-data-dir={profile}\n"
+            f"  600 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n"
+            f"  700 -zsh {profile}\n"
+        ),
+    }
+
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=outputs[cmd[-1]], stderr="")
+
+    monkeypatch.setattr(chrome_procs, "_PROC", str(tmp_path / "no-proc"))
+    monkeypatch.setattr(chrome_procs.shutil, "which", lambda name: "/bin/ps")
+    monkeypatch.setattr(chrome_procs.subprocess, "run", run)
+    table = chrome_procs._processes()
+    assert table[503].comm == "google chrome helper (renderer)"
+    assert table[502].state == "S" and table[502].ppid == 501
+    assert table[700].cmdline == b""  # not Chrome: never inspected
+
+    killed = []
+    monkeypatch.setattr(chrome_procs.os, "kill", lambda pid, sig: killed.append(pid) if sig else None)
+    monkeypatch.setattr(chrome_procs, "_wait_gone", lambda pids: None)
+    assert chrome_procs.reap_orphans() == 3
+    assert sorted(killed) == [501, 502, 503]  # not the user's Chrome (600), not the shell
+
+
+# ---- every driver gets its own profile ---------------------------------------
+
+
+def _fake_chrome():
+    fake = MagicMock(name="FakeChrome")
+    fake.current_url = "about:blank"
+    fake.page_source = "<html></html>"
+    return fake
+
+
+def test_each_driver_gets_its_own_profile_and_chromedriver(proc):
+    fakes = [_fake_chrome() for _ in range(3)]
+    with patch.object(driver_manager.webdriver, "Chrome", side_effect=fakes) as chrome:
+        dm = driver_manager.DriverManager()
+        pool = dm.get_driver_pool(pool_size=3)
+    assert pool.qsize() == 3
+
+    profiles, services = [], []
+    for call, fake in zip(chrome.call_args_list, fakes):
+        options, service = call.kwargs["options"], call.kwargs["service"]
+        profile = getattr(fake, chrome_procs.PROFILE_ATTR)
+        assert f"--user-data-dir={profile}" in options.arguments
+        assert f"{chrome_procs.CHROMEDRIVER_SWITCH}={profile}" in service.service_args
+        assert os.path.isdir(profile)
+        profiles.append(profile)
+        services.append(service)
+    assert len(set(profiles)) == 3
+    assert len({id(s) for s in services}) == 3  # a shared Service only stops its last chromedriver
+
+    dm.close()
+    for fake, profile in zip(fakes, profiles):
+        fake.quit.assert_called_once()
+        assert not os.path.exists(profile)
+
+
+def test_failed_launch_releases_its_profile(proc):
+    with patch.object(driver_manager.webdriver, "Chrome", side_effect=WebDriverException("no chrome")):
+        with pytest.raises(WebDriverException):
+            driver_manager.DriverManager().create_driver()
+    assert chrome_procs._live == {}
+    assert list(chrome_procs.profiles_root().iterdir()) == []
+
+
+def test_driver_manager_reap_orphans_delegates(proc):
+    _driver_tree(proc, 5000, DEAD, SYSTEMD_USER)
+    assert driver_manager.DriverManager.reap_orphans() == 3
+    assert browser.reap_orphans is chrome_procs.reap_orphans
+
+
+# ---- the shared browser closes itself when idle ------------------------------
+
+
+@pytest.fixture
+def shared_browser(monkeypatch):
+    monkeypatch.setenv("BANDCAMP_MIN_REQUEST_INTERVAL", "0")
+    browser.close()
+    yield
+    browser.close()
+
+
+def _wait_for(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_idle_browser_is_closed_and_cleaned_up(shared_browser, monkeypatch):
+    monkeypatch.setenv("BANDCAMP_BROWSER_IDLE_S", "0.2")
+    fake = _fake_chrome()
+    with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
+        with browser.session() as driver:
+            profile = getattr(driver, chrome_procs.PROFILE_ATTR)
+    assert _wait_for(lambda: browser._driver is None)
+    fake.quit.assert_called_once()
+    assert not os.path.exists(profile)
+
+
+def test_browser_in_use_is_not_closed(shared_browser, monkeypatch):
+    monkeypatch.setenv("BANDCAMP_BROWSER_IDLE_S", "0.1")
+    fake = _fake_chrome()
+    with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
+        with browser.session():
+            pass
+        with browser.session():
+            time.sleep(0.4)  # well past the idle timeout, but in use
+            assert browser._driver is fake
+            fake.quit.assert_not_called()
+    assert _wait_for(lambda: browser._driver is None)
+
+
+def test_idle_close_can_be_disabled(shared_browser, monkeypatch):
+    monkeypatch.setenv("BANDCAMP_BROWSER_IDLE_S", "0")
+    fake = _fake_chrome()
+    with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
+        with browser.session():
+            pass
+    time.sleep(0.3)
+    assert browser._driver is fake
+    assert browser.close_if_idle() is True
+    fake.quit.assert_called_once()
+
+
+def test_idle_watch_survives_driver_restarts(shared_browser, monkeypatch):
+    monkeypatch.setenv("BANDCAMP_BROWSER_IDLE_S", "0.2")
+    fakes = [_fake_chrome(), _fake_chrome()]
+    with patch.object(driver_manager.webdriver, "Chrome", side_effect=fakes):
+        for fake in fakes:
+            with browser.session():
+                pass
+            assert _wait_for(lambda: browser._driver is None)
+            fake.quit.assert_called_once()
+    assert sum(t.name == "bandcamp-browser-idle" for t in threading.enumerate()) == 1
