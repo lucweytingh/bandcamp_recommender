@@ -1,6 +1,5 @@
 """Main recommendation engine for Bandcamp based on supporter purchases."""
 
-import json
 import logging
 import os
 import random
@@ -58,9 +57,6 @@ _DEFAULT_BPM_RERANK_ALPHA = 0.05
 # whale bias pass a smaller page (the feed is newest-first).
 _DEFAULT_COLLECTION_PAGE_SIZE = 10000
 _DEFAULT_SELENIUM_FALLBACK_BUDGET = 8
-# Full collections take Bandcamp ~3 s per 1000 items to serve (measured:
-# 2789 items = 8.7 s, 7 MB); the 10000-item maximum is ~30 s, more under load.
-_COLLECTION_API_TIMEOUT_S = 120
 # Items on a fan page's first page (what ``first_page_only`` reads).
 _FIRST_PAGE_SIZE = 20
 
@@ -119,8 +115,7 @@ def _bpm_rerank_score(
     return supporters_count - penalty
 
 
-from bs4 import BeautifulSoup
-
+from bandcamp_recommender import fans
 from bandcamp_recommender.recommendations.scraper import (
     extract_item_id,
     extract_supporters,
@@ -870,10 +865,7 @@ class SupporterRecommender:
     # disk (bandcamp_recommender.cache), so recurring seeds and overlapping
     # scenes stop re-downloading the same collections.
 
-    _API_URLS = {
-        "collection_data": "https://bandcamp.com/api/fancollection/1/collection_items",
-        "wishlist_data": "https://bandcamp.com/api/fancollection/1/wishlist_items",
-    }
+    _LIST_NAMES = {"collection_data": "collection", "wishlist_data": "wishlist"}
     # Hidden/removed items make the API return slightly fewer ids than the
     # advertised count; a read much shorter than expected is partial.
     _COMPLETE_FRACTION = 0.9
@@ -971,16 +963,9 @@ class SupporterRecommender:
         ``(ids, True)``, or None when the API answers without an item list
         (the page path then decides private vs. broken). Raises
         ``http.FetchError`` subclasses like the page path."""
-        from bandcamp_recommender import http
-
         count = _FIRST_PAGE_SIZE if first_page_only else self._collection_page_size
-        payload = {
-            "fan_id": self._fan_ids[username],
-            "older_than_token": f"{int(time.time()) + 86400}::a::",
-            "count": count,
-        }
-        data = http.post_json(
-            self._API_URLS[data_key], payload, timeout=_COLLECTION_API_TIMEOUT_S,
+        data = fans.read_list_page(
+            self._LIST_NAMES[data_key], self._fan_ids[username], fans.newest_first_token(), count,
             referer=f"https://bandcamp.com/{username}",
         )
         items = (data or {}).get("items") if isinstance(data, dict) else None
@@ -1007,7 +992,7 @@ class SupporterRecommender:
         private, deleted or empty fan page."""
         from bandcamp_recommender import browser, http
 
-        url = f"https://bandcamp.com/{username}/wishlist"
+        url = fans.fan_page_url(username)
         try:
             if driver is None:
                 html = http.get_html(url, timeout=20)
@@ -1017,13 +1002,8 @@ class SupporterRecommender:
             if e.status in (404, 410):
                 raise _NoFanData(username) from e
             raise
-        soup = BeautifulSoup(html, features="html.parser")
-        pagedata_elem = soup.find(id="pagedata")
-        if not pagedata_elem:
-            raise _NoFanData(username)
-        try:
-            pagedata = json.loads(pagedata_elem.get("data-blob", "{}"))
-        except ValueError:
+        pagedata = fans.parse_pagedata(html)
+        if pagedata is None:
             raise _NoFanData(username)
         parsed = self._parse_collection_pagedata(pagedata, data_key)
         if parsed is None:
@@ -1036,17 +1016,11 @@ class SupporterRecommender:
             return ids, True
         page_size = self._collection_page_size
         if parsed["last_token"] and parsed["fan_id"] and first_len < item_count:
-            payload = {
-                "fan_id": parsed["fan_id"],
-                "older_than_token": parsed["last_token"],
-                "count": page_size,
-            }
-            api_url = self._API_URLS[data_key]
             try:
-                if driver is None:
-                    data = http.post_json(api_url, payload, timeout=_COLLECTION_API_TIMEOUT_S, referer=url)
-                else:
-                    data = browser.post_json(driver, api_url, payload, timeout=_COLLECTION_API_TIMEOUT_S)
+                data = fans.read_list_page(
+                    self._LIST_NAMES[data_key], parsed["fan_id"], parsed["last_token"], page_size,
+                    referer=url, driver=driver,
+                )
             except http.Challenged:
                 raise
             except http.FetchError as e:
