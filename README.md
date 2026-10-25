@@ -166,6 +166,39 @@ The full feature universe (each in a documented normalized range):
 Audio features need the `bpm` extra installed; tag features work on
 their own.
 
+## Network behaviour (0.7.0)
+
+- **Plain HTTP, honest User-Agent.** Every Bandcamp page and API call goes
+  through `bandcamp_recommender.http` (requests, HTTP/1.1). Bandcamp's CDN
+  serves its JavaScript bot challenge (as HTTP 200) to clients that claim to
+  be a browser but don't look like one; the old curl transport spoofed a
+  Chrome UA and was challenged from datacenter IPs. Payloads are validated
+  (`get_page(url, expect=...)`), and failures are typed (`Challenged`,
+  `RateLimited`, `Timeout`, `HTTPStatus`, `Unexpected`).
+- **Paced to ~1 request/second** (measured limit; `429 Retry-After: 3`
+  beyond it), at most 3 in flight, AIMD backoff on 429. Interactive callers
+  will feel this on cold calls: an 80-supporter seed costs ~80-110 requests.
+  Tune with `BANDCAMP_MIN_REQUEST_INTERVAL` / `BANDCAMP_MAX_CONCURRENCY`.
+- **Disk cache** (`~/.cache/bandcamp_recommender/cache.sqlite`,
+  `BANDCAMP_CACHE_PATH`, `BANDCAMP_CACHE_DISABLED=1`): supporter
+  collections 7 d, item metadata (featured track, tags) 30 d, audio features
+  90 d. A repeated seed costs a couple of requests.
+- **Selenium is a fallback only**: one shared driver per process
+  (`bandcamp_recommender.browser`), used when plain HTTP is challenged, at
+  most `BANDCAMP_SELENIUM_FALLBACK_BUDGET` (8) supporters per call. Call
+  `browser.close()` / `close_if_idle()` in long-running processes.
+- `collection_page_size` (default 10000 = everything) limits how many of each
+  supporter's newest items are read; `candidate_filter` drops items before
+  the candidate pool is cut. Audio features describe each item's featured
+  track (`preview_track_id`); `audio_url` is only set when the page was read
+  during the call (stream URLs are signed and expire).
+- `http.snapshot()` / `http.diff()` expose request counters (`requests`,
+  `rate_limited`, `challenged`, `selenium_fallbacks`, `supporter_api`, ...);
+  `SupporterRecommender.last_call_stats` has per-phase timings of the last
+  similarity call.
+- A `SupporterRecommender` keeps per-call state: don't share one instance
+  across threads for concurrent calls.
+
 ## Architecture
 
 The codebase is organized into modular components:

@@ -140,57 +140,74 @@ def _process_trackinfo(trackinfo: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "audio_path": audio_path,
                     "track_num": track.get("track_num", 0),
                     "title": track.get("title", ""),
+                    "track_id": track.get("track_id") or track.get("id"),
                 })
     return tracks
 
 
-def extract_track_info(item_url: str) -> List[Dict[str, Any]]:
-    """Extract track information including audio URLs from a Bandcamp page.
-    
-    Args:
-        item_url: URL of the Bandcamp album or track page
-        
-    Returns:
-        List of track info dictionaries with keys:
-        - url: Track URL (title_link)
-        - audio_path: Audio file URL (from bcbits.com)
-        - track_num: Track number
-        - title: Track title (if available)
-    """
-    html = fetch_page_html(item_url)
-    if not html:
-        return []
-    
+def _parse_tracks(html: str) -> Tuple[List[Dict[str, Any]], Optional[Any]]:
+    """``(playable tracks, featured_track_id)`` from an item page."""
     soup = BeautifulSoup(html, features="html.parser")
-    tracks = []
-    
-    # Method 1: Extract from data-tralbum attribute (most reliable for album/track pages)
     tralbum_elem = soup.find(attrs={"data-tralbum": True})
     if tralbum_elem:
         tralbum_json = tralbum_elem.get("data-tralbum")
         if tralbum_json:
             try:
                 tralbum = json.loads(tralbum_json)
-                trackinfo = tralbum.get("trackinfo", [])
-                tracks = _process_trackinfo(trackinfo)
-            except (json.JSONDecodeError, KeyError):
+                tracks = _process_trackinfo(tralbum.get("trackinfo", []))
+                if tracks:
+                    return tracks, tralbum.get("featured_track_id")
+            except (json.JSONDecodeError, KeyError, AttributeError):
                 pass
-    
-    # Method 2: Fallback to pagedata (for other page types)
+
+    # Fallback to pagedata (for other page types)
+    pagedata_elem = soup.find(id="pagedata")
+    if pagedata_elem:
+        data_blob = pagedata_elem.get("data-blob")
+        if data_blob:
+            try:
+                tralbum_data = json.loads(data_blob).get("tralbum_data", {})
+                return (
+                    _process_trackinfo(tralbum_data.get("trackinfo", [])),
+                    tralbum_data.get("featured_track_id"),
+                )
+            except (json.JSONDecodeError, KeyError, AttributeError):
+                pass
+    return [], None
+
+
+def extract_track_info(item_url: str) -> List[Dict[str, Any]]:
+    """Extract track information including audio URLs from a Bandcamp page.
+
+    Returns playable tracks in page order, each a dict with ``url``,
+    ``audio_path`` (bcbits preview), ``track_num``, ``title``, ``track_id``.
+    """
+    html = fetch_page_html(item_url)
+    if not html:
+        return []
+    return _parse_tracks(html)[0]
+
+
+def select_preview_track(tracks: List[Dict[str, Any]], featured_track_id: Any) -> Optional[Dict[str, Any]]:
+    """The release's featured track if it is playable, else the first
+    playable one. This is the track a listener hears when they open the page,
+    so it is the one worth describing (and, downstream, airing)."""
     if not tracks:
-        pagedata_elem = soup.find(id="pagedata")
-        if pagedata_elem:
-            data_blob = pagedata_elem.get("data-blob")
-            if data_blob:
-                try:
-                    pagedata = json.loads(data_blob)
-                    tralbum_data = pagedata.get("tralbum_data", {})
-                    trackinfo = tralbum_data.get("trackinfo", [])
-                    tracks = _process_trackinfo(trackinfo)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-    
-    return tracks
+        return None
+    if featured_track_id is not None:
+        for track in tracks:
+            if str(track.get("track_id")) == str(featured_track_id):
+                return track
+    return tracks[0]
+
+
+def get_preview_for_item(item_url: str) -> Optional[Dict[str, Any]]:
+    """The preview track for an item (see :func:`select_preview_track`), as a
+    track dict from :func:`extract_track_info`, or None if nothing plays."""
+    html = fetch_page_html(item_url)
+    if not html:
+        return None
+    return select_preview_track(*_parse_tracks(html))
 
 
 def get_bpm_for_url(
@@ -842,13 +859,17 @@ def extract_features(
 
 def get_audio_url_for_item(
     item_url: str,
-    track_index: int = 0,
+    track_index: Optional[int] = None,
 ) -> Optional[str]:
     """Return the preview audio URL for a Bandcamp item.
 
-    Defaults to the first track. Returns ``None`` if the page exposes no
-    playable preview (e.g. a tracks-only release that isn't streamable).
+    By default the featured track (see :func:`select_preview_track`); pass
+    ``track_index`` for a specific playable track. Returns ``None`` if the
+    page exposes no playable preview.
     """
+    if track_index is None:
+        preview = get_preview_for_item(item_url)
+        return preview.get("audio_path") if preview else None
     tracks = extract_track_info(item_url)
     if not tracks or track_index >= len(tracks):
         return None

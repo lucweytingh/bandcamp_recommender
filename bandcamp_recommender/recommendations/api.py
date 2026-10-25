@@ -3,7 +3,6 @@
 import json
 import logging
 import os
-import subprocess
 from typing import Dict, List, Optional
 
 from bs4 import BeautifulSoup
@@ -13,7 +12,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from . import curl_breaker
 
 
 logger = logging.getLogger(__name__)
@@ -186,46 +184,13 @@ def _fetch_via_curl(
     referer_url: str,
     timeout: int
 ) -> List[Dict]:
-    """Fetch via curl subprocess (original approach, may 403 on headless servers)."""
-    if curl_breaker.should_skip_curl():
-        return []
-
-    cookie_string = "; ".join([f"{k}={v}" for k, v in cookies.items()])
-    curl_cmd = [
-        "curl",
-        "-s",
-        "-X",
-        "POST",
-        "-H",
-        "Content-Type: application/json",
-        "-H",
-        f"Cookie: {cookie_string}",
-        "-H",
-        "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "-H",
-        f"Referer: {referer_url}",
-        "-d",
-        json.dumps(payload),
-        api_url,
-    ]
+    """Fetch via the shared HTTP client (name kept from the curl era).
+    Returns [] on any failure (legacy contract of this helper)."""
+    from bandcamp_recommender import http
 
     try:
-        result = subprocess.run(
-            curl_cmd, capture_output=True, text=True, timeout=timeout
-        )
-    except subprocess.TimeoutExpired:
-        curl_breaker.record_outcome(success=False)
+        data = http.post_json(api_url, payload, timeout=timeout, referer=referer_url)
+    except http.FetchError as e:
+        logger.warning("collection API fetch failed: %s", e)
         return []
-
-    if result.returncode == 0:
-        try:
-            data = json.loads(result.stdout)
-            curl_breaker.record_outcome(success=True)
-            return data.get("items", [])
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-    curl_breaker.record_outcome(success=False)
-    return []
-
-
+    return (data or {}).get("items", []) or []

@@ -32,7 +32,7 @@ from the same vector.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # Default per-feature weights for the distance function. Tuned by hand:
 # audio features dominate because they're more reliable than tags; the
@@ -112,9 +112,27 @@ def extract_features(
     vector["bpm"] = None  # Raw tempo, populated when audio is available.
     vector.update(extract_tag_features(item.get("tags") or []))
 
-    audio_url = item.get("audio_url")
+    audio = extract_audio_features(
+        item.get("audio_url"),
+        intensity_duration=intensity_duration,
+        bpm_duration=bpm_duration,
+    )
+    if audio:
+        vector.update(audio)
+    return vector
+
+
+def extract_audio_features(
+    audio_url: Optional[str],
+    *,
+    intensity_duration: float = 60.0,
+    bpm_duration: float = 60.0,
+) -> Optional[Dict[str, Optional[float]]]:
+    """The audio half of the vector (intensity sub-features, ``bpm_norm``,
+    ``bpm_folded_norm`` and the raw ``bpm``), from ONE download + decode of
+    the preview. None when there is no URL or the audio can't be decoded."""
     if not audio_url:
-        return vector
+        return None
 
     # One download + decode, two feature paths. Match
     # ``intensity.attach_audio_features`` and use the longer of the two
@@ -132,10 +150,10 @@ def extract_features(
     decode_duration = max(intensity_duration, bpm_duration)
     decoded = _load_audio_segment(audio_url, duration=decode_duration)
     if decoded is None:
-        return vector
+        return None
     samples, sr = decoded
 
-    vector.update(intensity_features_from_samples(samples, sr))
+    audio: Dict[str, Optional[float]] = dict(intensity_features_from_samples(samples, sr))
 
     # Joe Sullivan first (fast, kick-driven music). Fall back to
     # librosa on the same buffer for non-kick tracks (ambient, jazz,
@@ -149,9 +167,77 @@ def extract_features(
     else:
         raw_bpm = detect_bpm_librosa_from_samples(samples, sr)
 
-    vector.update(bpm_to_features(raw_bpm))
-    vector["bpm"] = raw_bpm
-    return vector
+    audio.update(bpm_to_features(raw_bpm))
+    audio["bpm"] = raw_bpm
+    return audio
+
+
+def features_for_item(
+    item_url: str,
+    tags: Optional[list] = None,
+    *,
+    intensity_duration: float = 60.0,
+    bpm_duration: float = 60.0,
+) -> Tuple[Dict[str, Optional[float]], Optional[Dict[str, Any]]]:
+    """Feature vector for a Bandcamp item, plus the preview track it was
+    computed from (``{"track_id", "title", "audio_path"}``, or None when the
+    item has no playable preview / its page can't be read).
+
+    The preview is the release's featured track (what a listener hears on the
+    page, and what a radio airs). Its identity and the item's tags come from
+    the cached item metadata (:mod:`bandcamp_recommender.items`); its audio
+    features are cached per (item, track) because they are a pure function of
+    the preview and the expensive part (download + a decode serialized
+    process-wide). So a warm item costs no request at all, and then
+    ``audio_path`` is None (stream URLs are signed and expire; read the page
+    when you need to play it). ``tags`` overrides the cached tags. Decode
+    failures are not cached (a CDN hiccup must not stick)."""
+    from bandcamp_recommender import cache
+    from bandcamp_recommender.items import item_meta, normalize_item_url
+    from bandcamp_recommender.recommendations.bpm import get_preview_for_item
+    from bandcamp_recommender.recommendations.mood_tags import (
+        extract_features as extract_tag_features,
+    )
+
+    meta = item_meta(item_url) or {}
+    vector: Dict[str, Optional[float]] = _empty_vector()
+    vector["bpm"] = None
+    vector.update(extract_tag_features(tags if tags else (meta.get("tags") or [])))
+
+    track_id = meta.get("track_id")
+    if track_id is None:
+        return vector, None
+    preview = {"track_id": track_id, "title": meta.get("title"), "audio_path": meta.get("audio_path")}
+    key = f"{normalize_item_url(item_url)}#{track_id}"
+    audio = cache.get_audio_features(key)
+    if audio is None and not preview["audio_path"]:
+        # Need the (signed, uncached) stream URL. The page may have moved its
+        # featured track since the metadata was cached: adopt the fresh
+        # preview wholesale so the features, the returned track id and what
+        # a radio airs all describe the same track.
+        fresh = get_preview_for_item(item_url)
+        if not fresh:
+            return vector, None
+        preview = {"track_id": fresh.get("track_id"), "title": fresh.get("title"),
+                   "audio_path": fresh.get("audio_path")}
+        if str(preview["track_id"]) != str(track_id):
+            cache.put_item_meta(normalize_item_url(item_url), {
+                "track_id": preview["track_id"], "title": preview["title"],
+                "tags": meta.get("tags") or [],
+            })
+            key = f"{normalize_item_url(item_url)}#{preview['track_id']}"
+            audio = cache.get_audio_features(key)
+    if audio is None:
+        audio = extract_audio_features(
+            preview["audio_path"],
+            intensity_duration=intensity_duration,
+            bpm_duration=bpm_duration,
+        )
+        if audio:
+            cache.put_audio_features(key, audio)
+    if audio:
+        vector.update(audio)
+    return vector, preview
 
 
 def distance(

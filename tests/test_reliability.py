@@ -220,54 +220,92 @@ class DriverManagerTimeoutTests(unittest.TestCase):
         fake.set_script_timeout.assert_called_once_with(7)
 
 
-# ---------- Phase 1 + 2: scraper Selenium fallback never leaks a driver ----------
+# ---------- Phase 1 + 2: the fallback browser is one shared, bounded driver ----------
 
 
-class ScraperSeleniumFallbackTests(unittest.TestCase):
-    def test_fallback_quits_driver_on_timeout(self):
+class SharedBrowserTests(unittest.TestCase):
+    def setUp(self):
+        from bandcamp_recommender import browser, http as bchttp
+
+        browser.close()
+        self.addCleanup(browser.close)
+        patcher = patch.dict(os.environ, {"BANDCAMP_MIN_REQUEST_INTERVAL": "0"})
+        patcher.start()
+        bchttp.reset()
+        self.addCleanup(bchttp.reset)
+        self.addCleanup(patcher.stop)
+
+    def test_failed_loads_reuse_one_driver_and_close_quits_it(self):
+        from bandcamp_recommender import browser
         from bandcamp_recommender.recommendations import driver_manager, scraper
 
         fake = _make_fake_chrome()
         fake.get.side_effect = TimeoutException("simulated page-load timeout")
-
-        with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
+        with patch.object(driver_manager.webdriver, "Chrome", return_value=fake) as chrome:
             with wall_clock_budget(2.0, "scraper fallback on hang"):
-                result = scraper._fetch_page_with_selenium("http://localhost/anything")
+                self.assertIsNone(scraper._fetch_page_with_selenium("http://localhost/a"))
+                self.assertIsNone(scraper._fetch_page_with_selenium("http://localhost/b"))
+            self.assertEqual(chrome.call_count, 1, "fallback must not start a Chrome per page")
+            browser.close()
+        fake.quit.assert_called_once()
+        self.assertIsNone(browser._driver)
 
-        self.assertIsNone(result)
-        fake.quit.assert_called()
+    def test_dead_driver_is_quit_and_replaced(self):
+        from bandcamp_recommender import browser
+        from bandcamp_recommender.recommendations import driver_manager
 
-    def test_fallback_quits_driver_on_unexpected_exception(self):
-        from bandcamp_recommender.recommendations import driver_manager, scraper
+        dead = _make_fake_chrome()
+        type(dead).current_url = property(lambda self: (_ for _ in ()).throw(WebDriverException("gone")))
+        alive = _make_fake_chrome()
+        alive.page_source = "<html>marker</html>"
+        with patch.object(driver_manager.webdriver, "Chrome", side_effect=[dead, alive]):
+            with browser.session():
+                pass  # first session hands out `dead`; liveness check on exit quits it
+            self.assertEqual(browser.fetch_html("http://localhost/x", "marker"), "<html>marker</html>")
+        dead.quit.assert_called()
 
-        fake = _make_fake_chrome()
-        fake.get.side_effect = WebDriverException("simulated webdriver crash")
+    def test_busy_browser_times_out_instead_of_blocking_forever(self):
+        from bandcamp_recommender import browser, http as bchttp
+        from bandcamp_recommender.recommendations import driver_manager
 
-        with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
-            result = scraper._fetch_page_with_selenium("http://localhost/anything")
+        with patch.dict(os.environ, {"BANDCAMP_BROWSER_ACQUIRE_TIMEOUT": "0.2"}), \
+             patch.object(driver_manager.webdriver, "Chrome", return_value=_make_fake_chrome()):
+            with browser.session():
+                errors = []
 
-        self.assertIsNone(result)
-        fake.quit.assert_called()
+                def other():
+                    try:
+                        with browser.session():
+                            pass
+                    except bchttp.FetchError as e:
+                        errors.append(e)
+
+                t = threading.Thread(target=other)
+                t.start()
+                t.join(timeout=3)
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], browser.BrowserUnavailable)
 
 
-# ---------- curl-side timeouts (already in place, verify against the local server) ----------
+# ---------- HTTP path timeouts, against the local server ----------
 
 
-class CurlPathReliabilityTests(unittest.TestCase):
+class HttpPathReliabilityTests(unittest.TestCase):
     def setUp(self):
-        # Don't let stale breaker state in the user's cache trip us.
         os.environ["BANDCAMP_CURL_BREAKER_DISABLED"] = "1"
         self.addCleanup(lambda: os.environ.pop("BANDCAMP_CURL_BREAKER_DISABLED", None))
+        from bandcamp_recommender import http as bchttp
+
+        bchttp.reset()
+        bchttp.clear_page_cache()
+        self.addCleanup(bchttp.reset)
 
     def test_fetch_page_html_against_hang_returns_under_budget(self):
         from bandcamp_recommender.recommendations import scraper
 
         with local_http_server() as base:
-            # Hard timeouts are not retried — single 2 s call, returns None
-            # well under the budget.
-            with wall_clock_budget(4.0, "fetch_page_html against /hang"):
-                result = scraper.fetch_page_html(f"{base}/hang", timeout=2)
-
+            with wall_clock_budget(5.0, "fetch_page_html against /hang"):
+                result = scraper.fetch_page_html(f"{base}/hang", timeout=2, expect=None)
         self.assertIsNone(result)
 
     def test_fetch_page_html_against_instant_returns_body(self):
@@ -275,53 +313,32 @@ class CurlPathReliabilityTests(unittest.TestCase):
 
         with local_http_server() as base:
             with wall_clock_budget(2.0, "fetch_page_html against /instant"):
-                result = scraper.fetch_page_html(f"{base}/instant", timeout=2)
-
-        self.assertIsNotNone(result)
+                result = scraper.fetch_page_html(f"{base}/instant", timeout=2, expect=None)
         self.assertIn("ok", result)
 
-    def test_fetch_page_html_retries_on_transient_then_succeeds(self):
-        """Transient curl failure (non-zero exit) retries with backoff."""
+    def test_page_without_expected_marker_is_none(self):
         from bandcamp_recommender.recommendations import scraper
-
-        call_count = {"n": 0}
-        real_run = scraper.subprocess.run
-
-        def flaky_run(cmd, *args, **kwargs):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                # First call: return a fake CompletedProcess with non-zero exit.
-                from subprocess import CompletedProcess
-                return CompletedProcess(cmd, returncode=7, stdout="", stderr="simulated network blip")
-            return real_run(cmd, *args, **kwargs)
 
         with local_http_server() as base:
-            with patch.object(scraper.subprocess, "run", side_effect=flaky_run):
-                with wall_clock_budget(6.0, "fetch_page_html with one transient failure"):
-                    result = scraper.fetch_page_html(f"{base}/instant", timeout=2)
+            self.assertIsNone(scraper.fetch_page_html(f"{base}/instant", timeout=2))
 
-        self.assertIsNotNone(result)
-        self.assertIn("ok", result)
-        self.assertEqual(call_count["n"], 2, "expected exactly one retry")
-
-    def test_fetch_page_html_gives_up_after_repeated_transient(self):
-        """All-failing transient: returns None after 4 attempts (1 + 3 retries)."""
+    def test_forbidden_is_none_and_not_retried_forever(self):
         from bandcamp_recommender.recommendations import scraper
-        from subprocess import CompletedProcess
 
-        call_count = {"n": 0}
+        with local_http_server() as base:
+            with wall_clock_budget(2.0, "403"):
+                self.assertIsNone(scraper.fetch_page_html(f"{base}/forbidden", timeout=2, expect=None))
 
-        def always_fail(cmd, *args, **kwargs):
-            call_count["n"] += 1
-            return CompletedProcess(cmd, returncode=7, stdout="", stderr="boom")
+    def test_transport_error_retries_then_gives_up(self):
+        import requests
+        from bandcamp_recommender import http as bchttp
 
-        with patch.object(scraper.subprocess, "run", side_effect=always_fail):
-            with wall_clock_budget(8.0, "fetch_page_html giving up"):
-                result = scraper.fetch_page_html("http://invalid.test/x", timeout=2)
-
-        self.assertIsNone(result)
-        # 1 initial + 3 retries = 4 attempts total.
-        self.assertEqual(call_count["n"], 4)
+        session, _ = bchttp._state()
+        with patch.object(session, "request", side_effect=requests.ConnectionError("reset")) as req:
+            with wall_clock_budget(4.0, "transport retries"):
+                with self.assertRaises(bchttp.FetchError):
+                    bchttp.get_html("http://127.0.0.1:9/x", timeout=1)
+        self.assertEqual(req.call_count, 3)  # 1 + 2 backoffs
 
 
 # ---------- Phase 3: audio download ----------
@@ -363,59 +380,6 @@ class AudioDownloadTimeoutTests(unittest.TestCase):
         defaults = bpm._download_audio_bytes.__defaults__
         # signature: (max_bytes=..., timeout=...)
         self.assertIn(30, defaults, msg=f"expected 30 in defaults, got {defaults!r}")
-
-
-# ---------- Phase 5: retry on Selenium fallback ----------
-
-
-class SupporterRetryTests(unittest.TestCase):
-    """Hangs on the first Selenium attempt should retry once with a fresh driver."""
-
-    def test_retry_once_on_first_driver_timeout(self):
-        from bandcamp_recommender.recommendations import supporter_recommender
-
-        # Two drivers: first hangs on .get, second succeeds.
-        driver_a = _make_fake_chrome()
-        driver_a.get.side_effect = TimeoutException("first try hangs")
-
-        driver_b = _make_fake_chrome()
-        # Minimal pagedata blob with one tralbum_id so the parse path succeeds.
-        driver_b.page_source = (
-            '<html><body>'
-            '<div id="pagedata" data-blob=\'{"fan_data":{"fan_id":42},'
-            '"collection_data":{"sequence":["k1"],"pending_sequence":[],'
-            '"last_token":"","item_count":1},'
-            '"item_cache":{"collection":{"k1":{"tralbum_id":12345,'
-            '"item_title":"T","band_name":"B","item_url":"https://x/album/y"}}}}\'></div>'
-            '</body></html>'
-        )
-
-        # Bypass the curl-first path so we hit Selenium fallback directly.
-        with patch.object(
-            supporter_recommender.SupporterRecommender,
-            "_get_supporter_items_via_curl",
-            return_value=None,
-        ):
-            # Mock the DriverManager pool: hand out driver_a first, then driver_b.
-            rec = supporter_recommender.SupporterRecommender()
-            from queue import Queue
-
-            pool: Queue = Queue()
-            pool.put(driver_a)
-            pool.put(driver_b)
-            with patch.object(
-                rec._driver_manager,
-                "get_driver_pool",
-                return_value=pool,
-            ):
-                items = rec._get_supporter_items_curl_first(
-                    "someuser", "collection_data"
-                )
-
-        self.assertEqual(items, ["12345"])
-        # Both drivers were used (first failed, retry on second succeeded).
-        driver_a.get.assert_called()
-        driver_b.get.assert_called()
 
 
 # ---------- Phase 2: orphan reaper ----------
