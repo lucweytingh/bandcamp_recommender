@@ -128,17 +128,9 @@ from bandcamp_recommender.recommendations.scraper import (
     fetch_page_html,
     supporter_fan_ids,
 )
+from bandcamp_recommender.items import normalize_item_url
 from bandcamp_recommender.recommendations.mood_tags import tag_mood_score
 from bandcamp_recommender.recommendations.tags import calculate_tag_similarity, normalize_tag
-
-
-def _normalize_item_url(url: str) -> str:
-    """Lowercase + strip query/fragment/trailing slash so two spellings of the
-    same Bandcamp item URL compare equal.
-    """
-    if not url:
-        return ""
-    return url.split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
 
 
 class SupporterRecommender:
@@ -277,7 +269,7 @@ class SupporterRecommender:
         # the per-supporter supporter_done emit (the animation's cloud), the
         # same way it's dropped from the ranked results below. Cosmetic only —
         # ranking/counting still happen on the full purchase set.
-        seed_key = _normalize_item_url(wishlist_item_url)
+        seed_key = normalize_item_url(wishlist_item_url)
 
         # Get purchases from all supporters (with metadata) - parallel processing
         all_purchases = []
@@ -362,7 +354,7 @@ class SupporterRecommender:
                                 # searched track never appears as a live graph
                                 # node. The ranked results already drop it.
                                 if iid == original_item_id or (
-                                    _normalize_item_url(info.get("item_url", "")) == seed_key
+                                    normalize_item_url(info.get("item_url", "")) == seed_key
                                 ):
                                     continue
                                 items_meta.append({
@@ -425,7 +417,7 @@ class SupporterRecommender:
         # Done before the slice so the result count stays at max_recommendations.
         sorted_items = [
             (iid, cnt) for (iid, cnt) in sorted_items
-            if _normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
+            if normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
         ]
 
         if candidate_filter is not None:
@@ -699,10 +691,10 @@ class SupporterRecommender:
         # extract_item_id can't read the source's tralbum_id (curl 403,
         # page structure shift) the seed slips through and ranks #1 with
         # near-zero feature distance to itself.
-        source_key = _normalize_item_url(source_url)
+        source_key = normalize_item_url(source_url)
         candidates = [
             c for c in candidates
-            if _normalize_item_url(c.get("item_url", "")) != source_key
+            if normalize_item_url(c.get("item_url", "")) != source_key
         ]
 
         if not candidates:
@@ -1446,7 +1438,7 @@ class SupporterRecommender:
         # id-based pop / url backstop on the counts still happens below
         # (after the loop); this is purely cosmetic for the emit.
         seed_id = extract_item_id(item_url)
-        seed_key = _normalize_item_url(item_url)
+        seed_key = normalize_item_url(item_url)
 
         # Get items from selected supporters
         all_items = []
@@ -1530,7 +1522,7 @@ class SupporterRecommender:
                                     # Drop the seed from the emitted cloud
                                     # nodes too — by id and by normalized url.
                                     if iid == seed_id or (
-                                        _normalize_item_url(info.get("item_url", "")) == seed_key
+                                        normalize_item_url(info.get("item_url", "")) == seed_key
                                     ):
                                         continue
                                     items_meta.append({
@@ -1602,7 +1594,7 @@ class SupporterRecommender:
         # (seed_key computed once before the fetch loop).
         item_counts = Counter({
             iid: cnt for iid, cnt in item_counts.items()
-            if _normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
+            if normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
         })
 
         # Filter by min_overlap if specified, with fallback if enabled
