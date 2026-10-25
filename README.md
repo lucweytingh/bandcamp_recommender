@@ -197,11 +197,16 @@ their own.
   whatever still runs on its profile and deletes it. `browser.reap_orphans()`
   kills Chrome left by library processes that died and deletes their
   profiles; it never touches a live process's browser or a Chrome the
-  library didn't start, and runs by itself once per process on the first
-  Bandcamp request. `DriverManager.reap_orphans()` (the opt-in cold-start
-  reaper) does the same and also kills what earlier versions leave behind:
-  an unmarked chromedriver whose spawner died, or a Chrome on a chromedriver
-  temp profile whose chromedriver died.
+  library didn't start. It runs by itself before every driver start and on
+  the first Bandcamp request of a process (a cache hit doesn't count),
+  so a long-lived service should also call it once at startup: after a
+  restart it may make no request for a long time.
+  `DriverManager.reap_orphans()` (the opt-in cold-start reaper) does the
+  same and also kills what earlier versions leave behind: an unmarked
+  chromedriver whose spawner died, or a Chrome on a chromedriver temp
+  profile whose chromedriver died. That includes a chromedriver run as a
+  service straight under init, systemd or launchd (e.g. a Selenium Grid
+  node).
 - `collection_page_size` (default 10000 = everything) limits how many of each
   supporter's newest items are read; `candidate_filter` drops items before
   the candidate pool is cut. Audio features describe each item's featured

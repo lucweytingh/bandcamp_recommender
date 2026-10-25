@@ -28,7 +28,12 @@ DEAD = 999_990  # a library process that died (not in the table)
 
 
 class FakeProc:
-    """A /proc tree; SIGKILL removes the process, as its exit would."""
+    """A /proc tree; SIGKILL removes the process, as its exit would.
+
+    ``linger``: a killed process still shows as running for that many
+    liveness polls, as a real one does for a moment after SIGKILL.
+    ``zombie_on_kill``: it then stays in the table as a zombie (its parent
+    hasn't waited it) instead of vanishing."""
 
     def __init__(self, root: Path):
         self.root = root
@@ -36,6 +41,10 @@ class FakeProc:
         self.wait_calls: list = []
         self.waited: list = []
         self.unkillable: set = set()
+        self.linger = 0
+        self.zombie_on_kill = False
+        self._dying: dict = {}
+        self._real_is_running = chrome_procs._is_running
         root.mkdir()
 
     def add(self, pid, comm, ppid, *argv, state="S"):
@@ -53,7 +62,27 @@ class FakeProc:
             raise PermissionError(pid)
         if sig == signal.SIGKILL:
             self.killed.append(pid)
+            if self.linger:
+                self._dying[pid] = self.linger
+            else:
+                self._exit(pid)
+
+    def _exit(self, pid):
+        d = self.root / str(pid)
+        if self.zombie_on_kill:
+            stat = (d / "stat").read_text()
+            rparen = stat.rfind(")")
+            (d / "stat").write_text(stat[:rparen + 2] + "Z" + stat[rparen + 3:])
+        else:
             shutil.rmtree(d)
+
+    def is_running(self, pid):
+        if pid in self._dying:
+            self._dying[pid] -= 1
+            if not self._dying[pid]:
+                del self._dying[pid]
+                self._exit(pid)
+        return self._real_is_running(pid)
 
     def waitpid(self, pid, options):
         self.wait_calls.append(pid)
@@ -75,6 +104,7 @@ def proc(tmp_path, monkeypatch):
     monkeypatch.setattr(chrome_procs, "_PROC", str(fake.root))
     monkeypatch.setattr(chrome_procs.os, "kill", fake.kill)
     monkeypatch.setattr(chrome_procs.os, "waitpid", fake.waitpid)
+    monkeypatch.setattr(chrome_procs, "_is_running", fake.is_running)
     return fake
 
 
@@ -102,6 +132,8 @@ def _driver_tree(proc, base, owner_pid, parent, token="aaaaaaaa"):
 def test_reaps_a_dead_owners_tree_and_spares_everyone_else(proc):
     dead_tree = _driver_tree(proc, 5000, DEAD, SYSTEMD_USER)
     _driver_tree(proc, 6000, OTHER, OTHER, token="bbbbbbbb")
+    os.makedirs(_profile(DEAD))
+    os.makedirs(_profile(OTHER, "bbbbbbbb"))
     proc.add(7001, "chrome", 1, "/opt/google/chrome/chrome")  # the user's own browser
     proc.add(7002, "chrome-headless", 1, "chrome-headless-shell",
              "--user-data-dir=/tmp/playwright_chromiumdev_profile-x")
@@ -109,6 +141,32 @@ def test_reaps_a_dead_owners_tree_and_spares_everyone_else(proc):
 
     assert chrome_procs.reap_orphans() == 3
     assert sorted(proc.killed) == dead_tree
+    # Its profile goes in the same pass, once nothing runs on it.
+    assert not os.path.exists(_profile(DEAD))
+    assert os.path.isdir(_profile(OTHER, "bbbbbbbb"))
+
+
+@pytest.mark.parametrize("zombie", [False, True], ids=["exits", "lingers-as-zombie"])
+def test_profile_goes_once_its_killed_processes_are_gone(proc, zombie):
+    """SIGKILL is asynchronous: right after it the process still runs. The
+    profile must go once it is dead, also while it lingers as a zombie
+    nobody waited yet."""
+    os.makedirs(_profile(DEAD))
+    tree = _driver_tree(proc, 5000, DEAD, SYSTEMD_USER)
+    proc.linger = 3
+    proc.zombie_on_kill = zombie
+
+    assert chrome_procs.reap_orphans() == 3
+    assert sorted(proc.killed) == tree
+    assert not os.path.exists(_profile(DEAD))
+
+
+def test_an_owner_that_died_unwaited_counts_as_dead(proc):
+    owner = proc.add(4343, "python3", SYSTEMD_USER, "python3", "app.py", state="Z")
+    tree = _driver_tree(proc, 5000, owner, SYSTEMD_USER)  # its children were reparented
+
+    assert chrome_procs.reap_orphans() == 3
+    assert sorted(proc.killed) == tree
 
 
 def test_own_browser_is_spared_while_its_driver_lives(proc):
@@ -235,6 +293,35 @@ def test_release_profile_kills_leftovers_and_deletes_the_dir(proc):
     assert all((proc.root / str(pid)).exists() for pid in other)
 
 
+def test_release_profile_waits_our_dead_chromedriver(proc):
+    """Its chromedriver died behind Selenium's back (OOM kill): a zombie
+    child of ours, while the browser it started still runs on the profile."""
+    profile = chrome_procs.new_profile()
+    proc.add(5000, "chromedriver", ME, state="Z")
+    proc.add(5001, "chrome", SYSTEMD_USER, "chrome", f"--user-data-dir={profile}")
+
+    chrome_procs.release_profile(profile)
+    assert proc.waited == [5000]
+    assert proc.killed == [5001]
+    assert not os.path.exists(profile)
+
+
+def test_release_profile_without_a_process_list_leaves_it_to_the_next_reap(proc):
+    profile = chrome_procs.new_profile()
+    name = os.path.basename(profile)
+    tree = _driver_tree(proc, 5000, ME, ME, token=name.rsplit("-", 1)[1])  # its quit failed
+
+    with patch.object(chrome_procs, "_processes", return_value={}):  # e.g. ps timed out
+        chrome_procs.release_profile(profile)
+    assert proc.killed == []
+    assert os.path.isdir(profile)  # nothing seen on it doesn't mean nothing runs on it
+    assert name not in chrome_procs._live
+
+    assert chrome_procs.reap_orphans() == 3  # e.g. before the next driver start
+    assert sorted(proc.killed) == tree
+    assert not os.path.exists(profile)
+
+
 def test_quit_driver_cleans_up_even_when_quit_fails(proc):
     profile = chrome_procs.new_profile()
     driver = MagicMock()
@@ -274,14 +361,17 @@ def test_at_exit_nothing_this_process_started_survives(proc):
     assert all((proc.root / str(pid)).exists() for pid in other)
 
 
-def test_first_profile_reaps_once_per_process(monkeypatch):
+def test_every_driver_start_reaps_first(monkeypatch):
+    """So whatever an earlier reap or release had to leave is retried, and
+    the first Bandcamp request doesn't scan again."""
     monkeypatch.setattr(chrome_procs, "_swept", False)
     reap = MagicMock(return_value=0)
     monkeypatch.setattr(chrome_procs, "reap_orphans", reap)
 
     first = chrome_procs.new_profile()
     chrome_procs.new_profile()
-    assert reap.call_count == 1
+    chrome_procs.sweep_once()
+    assert reap.call_count == 2
     assert os.path.basename(first).startswith(f"bcr-chrome-{ME}-")
     assert stat.S_IMODE(os.stat(first).st_mode) == 0o700
 
@@ -503,8 +593,13 @@ def test_idle_close_can_be_disabled(shared_browser, monkeypatch):
     fake.quit.assert_called_once()
 
 
+def _watchers():
+    return sum(t.name == "bandcamp-browser-idle" for t in threading.enumerate())
+
+
 def test_idle_watch_survives_driver_restarts(shared_browser, monkeypatch):
     monkeypatch.setenv("BANDCAMP_BROWSER_IDLE_S", "0.2")
+    before = _watchers()
     fakes = [_fake_chrome(), _fake_chrome()]
     with patch.object(driver_manager.webdriver, "Chrome", side_effect=fakes):
         for fake in fakes:
@@ -512,4 +607,39 @@ def test_idle_watch_survives_driver_restarts(shared_browser, monkeypatch):
                 pass
             assert _wait_for(lambda: browser._driver is None)
             fake.quit.assert_called_once()
-    assert sum(t.name == "bandcamp-browser-idle" for t in threading.enumerate()) == 1
+    assert _watchers() == max(before, 1)  # one per process, not one per driver
+
+
+def test_idle_watch_survives_a_failed_close(shared_browser, monkeypatch):
+    monkeypatch.setenv("BANDCAMP_BROWSER_IDLE_S", "0.1")
+    fake = _fake_chrome()
+    real_quit = chrome_procs.quit_driver
+    calls = []
+
+    def flaky_quit(driver):
+        calls.append(driver)
+        if len(calls) == 1:
+            raise RuntimeError("unexpected")
+        real_quit(driver)
+
+    monkeypatch.setattr(chrome_procs, "quit_driver", flaky_quit)
+    with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
+        with browser.session():
+            pass
+        assert _wait_for(lambda: len(calls) == 1)
+        with browser.session():
+            pass
+    assert _wait_for(lambda: browser._driver is None)
+    fake.quit.assert_called_once()
+
+
+def test_a_gone_idle_watcher_is_restarted(shared_browser, monkeypatch):
+    """A forked child inherits the Thread object, not the thread."""
+    monkeypatch.setenv("BANDCAMP_BROWSER_IDLE_S", "0.1")
+    monkeypatch.setattr(browser, "_idle_thread", threading.Thread(target=lambda: None))
+    fake = _fake_chrome()
+    with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
+        with browser.session():
+            pass
+    assert browser._idle_thread.is_alive()
+    assert _wait_for(lambda: browser._driver is None)

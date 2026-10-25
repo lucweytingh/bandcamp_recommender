@@ -226,13 +226,16 @@ class DriverManager:
     def reap_orphans() -> int:
         """SIGKILL chromedriver / Chrome left behind by library processes that
         died (a previous crashed run), and delete their profiles. Spares the
-        browser of every live process. Opt-in: callers run this on cold start.
+        browser of every live library process. Opt-in: callers run this on
+        cold start.
 
         Unlike :func:`bandcamp_recommender.browser.reap_orphans` this keeps
         reaching what versions without profile markers leave behind: an
         unmarked chromedriver whose spawner died, or a Chrome on a
         chromedriver temp profile whose chromedriver died (reparented to init
-        or a subreaper), with their descendants. It no longer kills any other
+        or a subreaper), with their descendants. Caveat: that also kills a
+        chromedriver run as a service straight under init, systemd or
+        launchd (e.g. a Selenium Grid node). It no longer kills any other
         Chrome with PPID 1 (on macOS that included the user's own Chrome
         launched from the Dock).
 

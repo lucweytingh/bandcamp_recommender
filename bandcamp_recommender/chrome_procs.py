@@ -16,10 +16,14 @@ of "who spawned this?":
   stale profile dirs. It spares the Chrome of every live process (two
   processes using the library no longer kill each other's browsers) and
   anything without the marker (your own Chrome, Playwright, ...). It runs
-  once per process, on the first Bandcamp request or driver start.
+  before every driver start and once on the first Bandcamp request; a
+  long-lived service should also call it at startup, since a restart may be
+  followed by a long stretch without either.
 
 Owner liveness is a pid lookup, so processes in different pid namespaces
-(containers) must not share a profiles root.
+(containers) must not share a profiles root. A dead owner whose pid was
+reused (more likely on macOS, whose pids wrap at 99999) looks alive: its
+Chrome is spared until the new holder of that pid exits.
 
 Why explicit profiles: without one, chromedriver makes a temp profile
 (``.org.chromium.Chromium.scoped_dir.*``) that only a clean quit deletes.
@@ -107,7 +111,7 @@ def profiles_root() -> Path:
 
 def sweep_once() -> None:
     """Reap what dead library processes left behind, once per process (on the
-    first Bandcamp request or driver start, whichever comes first)."""
+    first Bandcamp request, unless a driver start already did)."""
     global _swept
     if _swept:
         return
@@ -115,6 +119,10 @@ def sweep_once() -> None:
         if _swept:
             return
         _swept = True
+    _reap_quietly()
+
+
+def _reap_quietly() -> None:
     try:
         reap_orphans()
     except Exception:
@@ -122,8 +130,14 @@ def sweep_once() -> None:
 
 
 def new_profile() -> str:
-    """Create a fresh profile dir owned by this process; return its path."""
-    sweep_once()
+    """Create a fresh profile dir owned by this process; return its path.
+
+    Reaps first, every time: one process scan against a Chrome start of a
+    few seconds, and it retries whatever an earlier reap or release had to
+    leave (a failed listing, a process that outlived its kill)."""
+    global _swept
+    _swept = True
+    _reap_quietly()
     name = f"{PROFILE_PREFIX}{os.getpid()}-{secrets.token_hex(4)}"
     path = profiles_root() / name
     # Registered before it exists, so a concurrent sweep never takes it.
@@ -146,21 +160,34 @@ def chromedriver_args(profile: str) -> List[str]:
 
 def release_profile(profile: str) -> None:
     """Kill whatever still runs on ``profile`` (a driver whose quit failed, a
-    browser whose chromedriver died) and delete the dir."""
+    browser whose chromedriver died) and delete the dir.
+
+    If that can't be done now, the dir is kept but no longer counts as in
+    use, so the next reap (every driver start runs one) kills what is left
+    on it and deletes it."""
     name = os.path.basename(profile)
-    survivors = []
+    keep = None
     if os.name != "nt":
         try:
             table = _processes()
-            on_it = [p.pid for p in _running_chrome(table) if _marker(p) == name]
-            _kill(on_it)
-            survivors = [pid for pid in on_it if _is_running(pid)]
-            _reap_zombies(table, os.getpid())
         except Exception:
-            logger.warning("cleanup of browser profile %s failed", name, exc_info=_debug())
-    if survivors:
-        # Not under a live process; once it is gone a later sweep takes it.
-        logger.warning("browser profile %s still in use by pid(s) %s; kept", name, survivors)
+            table = {}
+        if os.getpid() not in table:
+            # A failed listing would show nothing on the profile while the
+            # browser of a failed quit may still run on it.
+            keep = "could not list processes"
+        else:
+            try:
+                on_it = [p.pid for p in _running_chrome(table) if _marker(p) == name]
+                _kill(on_it)
+                survivors = [pid for pid in on_it if _is_running(pid)]
+                if survivors:
+                    keep = f"still in use by pid(s) {survivors}"
+                _reap_zombies(table, os.getpid())
+            except Exception:
+                logger.warning("cleanup of browser profile %s failed", name, exc_info=_debug())
+    if keep:
+        logger.warning("browser profile %s %s; kept for a later sweep", name, keep)
     else:
         shutil.rmtree(profile, ignore_errors=True)
     with _live_lock:
@@ -384,6 +411,9 @@ def _wait_gone(pids: Iterable[int], timeout: float = _KILL_WAIT_S) -> None:
 
 
 def _is_running(pid: int) -> bool:
+    """False once ``pid`` exited, even if it lingers as a zombie (Linux).
+    ``kill(pid, 0)`` elsewhere can't tell a zombie from a live process, so a
+    profile may be kept there until its dead process is waited."""
     if os.path.isdir(_PROC):
         try:
             with open(os.path.join(_PROC, str(pid), "stat"), "rb") as f:

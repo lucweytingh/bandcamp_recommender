@@ -48,7 +48,8 @@ _idle_wake = threading.Event()
 _idle_thread: Optional[threading.Thread] = None
 
 # Kill Chrome left behind by library processes that died; spares live ones.
-# Runs by itself once per process (first Bandcamp request or driver start).
+# Runs by itself before every driver start and on the first Bandcamp request;
+# a long-lived service should also call it once at startup.
 reap_orphans = chrome_procs.reap_orphans
 
 
@@ -80,9 +81,10 @@ def _drop() -> None:
 def _start_idle_watch() -> None:
     """Caller holds ``_lock``. One watcher thread per process, started with
     the first driver; it sleeps until a session ends when there's nothing
-    to watch."""
+    to watch. Restarted if it is gone (e.g. in a forked child, which
+    inherits the Thread object but not the thread)."""
     global _idle_thread
-    if _idle_thread is None:
+    if _idle_thread is None or not _idle_thread.is_alive():
         _idle_thread = threading.Thread(target=_idle_watch, name="bandcamp-browser-idle", daemon=True)
         _idle_thread.start()
 
@@ -95,23 +97,35 @@ def _idle_watch() -> None:
         # Cleared before reading the state, so a session ending from here on
         # sets it again: no lost wake-up.
         _idle_wake.clear()
-        idle_s = _idle_timeout()
-        if idle_s <= 0 or _driver is None:
-            timeout = None
-            continue
-        left = _last_used + idle_s - time.monotonic()
-        if left > 0:
-            timeout = min(left, 86400.0)  # Event.wait overflows on huge values
-            continue
-        timeout = None  # quit now, or in use: the end of that session wakes us
-        if not _lock.acquire(blocking=False):
-            continue
         try:
-            if _driver is not None and time.monotonic() - _last_used >= idle_s:
-                _drop()
-                logger.info("closed the fallback browser after %.0f s idle", idle_s)
-        finally:
-            _lock.release()
+            timeout = _idle_check()
+        except Exception:  # never let the watcher die silently
+            logger.warning(
+                "idle check of the fallback browser failed",
+                exc_info=os.environ.get("BANDCAMP_DEBUG") == "1",
+            )
+            timeout = None
+
+
+def _idle_check() -> Optional[float]:
+    """Quit the driver if it is idle; return how long to wait before the
+    next check (None: until a session ends)."""
+    idle_s = _idle_timeout()
+    if idle_s <= 0 or _driver is None:
+        return None
+    left = _last_used + idle_s - time.monotonic()
+    if left > 0:
+        return min(left, 86400.0)  # Event.wait overflows on huge values
+    # Quit now, or in use: the end of that session wakes us.
+    if not _lock.acquire(blocking=False):
+        return None
+    try:
+        if _driver is not None and time.monotonic() - _last_used >= idle_s:
+            _drop()
+            logger.info("closed the fallback browser after %.0f s idle", idle_s)
+    finally:
+        _lock.release()
+    return None
 
 
 @contextlib.contextmanager
