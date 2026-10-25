@@ -27,4 +27,3 @@ class TestNormalizeItemUrl:
         assert normalize_item_url(None) == ""
         assert normalize_item_url("") == ""
         assert normalize_item_url("u0") == "u0"
-

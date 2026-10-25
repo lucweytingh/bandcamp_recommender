@@ -121,6 +121,7 @@ def _bpm_rerank_score(
 
 from bs4 import BeautifulSoup
 
+from bandcamp_recommender.items import normalize_item_url
 from bandcamp_recommender.recommendations.scraper import (
     extract_item_id,
     extract_supporters,
@@ -128,7 +129,6 @@ from bandcamp_recommender.recommendations.scraper import (
     fetch_page_html,
     supporter_fan_ids,
 )
-from bandcamp_recommender.items import normalize_item_url
 from bandcamp_recommender.recommendations.mood_tags import tag_mood_score
 from bandcamp_recommender.recommendations.tags import calculate_tag_similarity, normalize_tag
 
