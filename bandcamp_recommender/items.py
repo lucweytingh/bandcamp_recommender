@@ -1,7 +1,7 @@
 """Bandcamp item (album/track) pages: the one parse, and cached metadata.
 
 :func:`parse_item_html` is the single reading of an item page (tracks,
-preview choice, tags, location, artist, art, description, release date);
+preview choice, tags, location, artist, art, description);
 everything in the library that needs a piece of an item page goes through
 it, except :func:`bandcamp_recommender.recommendations.scraper.extract_item_id`
 (the seed-exclusion id, kept on pagedata on purpose). :func:`item_info`
@@ -40,10 +40,6 @@ ITEM_PAGE_MARKER = "data-tralbum"
 # image (a band photo), so it never becomes an art id.
 _ART_URL = "https://f4.bcbits.com/img/a{art_id}_{size}.jpg"
 _OG_ART_RE = re.compile(r"/img/a(\d+)_\d+\.\w+")
-_MONTHS = {m: i for i, m in enumerate(
-    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
-# Bandcamp's own date format: "19 Feb 2022 00:00:00 GMT".
-_BC_DATE_RE = re.compile(r"(\d{1,2}) ([A-Za-z]{3})[a-z]* (\d{4})")
 
 
 def normalize_item_url(url: Optional[str]) -> str:
@@ -189,23 +185,34 @@ def _unique(tags: List[str]) -> List[str]:
 
 
 def _location_tag(tags: List[str], band_location: Optional[str]) -> Optional[str]:
-    """Bandcamp appends the artist's location ("Berlin" for "Berlin,
-    Germany") as the last tag; its link looks like any genre tag's. It is
-    split off only when it matches the page's band location, so a page
-    without a known location keeps all of its tags."""
-    if not tags or not band_location:
+    """Bandcamp appends the artist's location as the last tag, linked like
+    any genre tag, as a place name: "Berlin" for "Berlin, Germany", but
+    also "United Kingdom" for "England, UK", and "United States" on a page
+    that shows no location at all. Genre tags are lowercase (none of the
+    8,978 genre tags on 1,531 releases a radio aired had a capital,
+    2026-10), so a last tag with a capital is the location; so is one that
+    matches the band location (a place name in a script without case).
+    Anything else stays a genre tag: a page without a location tag keeps
+    all of its tags."""
+    if not tags:
         return None
-    names = {band_location.casefold()} | {p.strip().casefold() for p in band_location.split(",")}
-    return tags[-1] if tags[-1].casefold() in names else None
+    last = tags[-1]
+    if last != last.lower():
+        return last
+    if band_location:
+        names = {band_location.casefold()} | {p.strip().casefold() for p in band_location.split(",")}
+        if last.casefold() in names:
+            return last
+    return None
 
 
-def _release_date(*raw: Any) -> Optional[str]:
-    """ISO date (YYYY-MM-DD) from the first parseable Bandcamp date."""
-    for value in raw:
-        m = _BC_DATE_RE.search(value) if isinstance(value, str) else None
-        month = _MONTHS.get(m.group(2).lower()) if m else None
-        if month:
-            return f"{int(m.group(3)):04d}-{month:02d}-{int(m.group(1)):02d}"
+def _art_id(value: Any) -> Optional[int]:
+    """A positive art id as an int (the blob holds an int; tolerate a digit
+    string), else None."""
+    if isinstance(value, str) and value.isdecimal():
+        value = int(value)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
     return None
 
 
@@ -255,11 +262,10 @@ def parse_item_html(html: str, item_url: Optional[str] = None) -> Dict[str, Any]
         ``description``       the page's own description (ld+json, else the
                               "about" text); :func:`item_info` gives a track
                               page its album's
-        ``art_id``            cover art id, see :func:`art_url`
+        ``art_id``            cover art id (int), see :func:`art_url`
         ``og_image_url``      the page's og:image as given: the cover when
                               there is one, else whatever image Bandcamp
                               shows for the page (a last-resort picture)
-        ``release_date``      ISO date, or None
 
     ``feature_tags(info)`` gives the tag list the tag features expect
     (location included)."""
@@ -298,10 +304,10 @@ def parse_item_html(html: str, item_url: Optional[str] = None) -> Dict[str, Any]
 
     og = soup.find("meta", attrs={"property": "og:image"})
     og_image_url = _str(og.get("content")) if og else None
-    art_id = current.get("art_id") or tralbum.get("art_id")
-    if not art_id:
+    art_id = _art_id(current.get("art_id")) or _art_id(tralbum.get("art_id"))
+    if art_id is None:
         m = _OG_ART_RE.search(og_image_url or "")
-        art_id = int(m.group(1)) if m else None
+        art_id = _art_id(int(m.group(1))) if m else None
 
     return {
         "item_url": base_url,
@@ -318,11 +324,8 @@ def parse_item_html(html: str, item_url: Optional[str] = None) -> Dict[str, Any]
         "tags": tags,
         "location": location,
         "description": _str(ld.get("description")) or _str(current.get("about")),
-        "art_id": art_id or None,
+        "art_id": art_id,
         "og_image_url": og_image_url,
-        "release_date": _release_date(
-            current.get("release_date"), tralbum.get("album_release_date"), ld.get("datePublished"),
-        ),
     }
 
 
@@ -338,15 +341,15 @@ def feature_tags(info: Dict[str, Any]) -> List[str]:
     return tags
 
 
-def item_info(item_url: str, *, follow_album_description: bool = True) -> Dict[str, Any]:
+def item_info(item_url: str, *, follow_album_description: bool = False) -> Dict[str, Any]:
     """:func:`parse_item_html` of the live page, read through the shared page
     policy (plain HTTP, payload validation, short-lived cache, the shared
-    browser on a bot challenge).
+    browser on a bot challenge). One page read.
 
-    A track page describes its album, so with ``follow_album_description``
-    a track page that belongs to an album takes the album page's description
-    (one more page read); if that page can't be read the track's own
-    description (usually None) stays.
+    A track page's own description is usually None: Bandcamp describes the
+    album. With ``follow_album_description`` a track page that belongs to
+    an album takes the album page's description (one more paced read); if
+    that page can't be read the track's own description stays.
 
     Raises :class:`bandcamp_recommender.http.FetchError` (e.g.
     ``http.Challenged``, ``http.RateLimited``, ``http.Timeout``,

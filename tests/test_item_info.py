@@ -175,7 +175,6 @@ class ParseAlbumPageTests(unittest.TestCase):
         self.assertEqual(info["artist"], "Rene Wise")
         self.assertEqual(info["page_name"], "SK_eleven")
         self.assertIsNone(info["album_url"])
-        self.assertEqual(info["release_date"], "2021-04-02")
 
     def test_tracks_and_featured_preview(self):
         tracks = self.info["tracks"]
@@ -210,6 +209,13 @@ class ParseAlbumPageTests(unittest.TestCase):
         self.assertEqual(info["art_id"], 223816436)
         self.assertEqual(info["og_image_url"], _og("a0223816436"))
 
+    def test_art_id_is_a_positive_int_or_none(self):
+        for raw, expected in ((3022586874, 3022586874), ("3022586874", 3022586874),
+                              ([1], None), ("12a", None), ("\u00b2", None), (True, None),
+                              (-5, None), (1.5, None)):
+            html = _page(_label_album(art_id=None, current={"title": "x", "art_id": raw}))
+            self.assertEqual(items.parse_item_html(html)["art_id"], expected, raw)
+
     def test_og_image_that_is_not_cover_art_gives_no_art_id(self):
         # An unprefixed id is another CDN namespace (band photo): no cover id
         # is made up from it, but the picture itself stays available.
@@ -235,17 +241,32 @@ class ParseEdgeCaseTests(unittest.TestCase):
         self.assertIsNone(info["location"])
         self.assertEqual(items.feature_tags(info), [])
 
-    def test_last_tag_is_only_a_location_when_it_matches_the_band(self):
-        # No known band location: nothing is guessed away.
-        info = items.parse_item_html(_page(_label_album(), tags=["dub", "techno"]))
-        self.assertEqual((info["tags"], info["location"]), (["dub", "techno"], None))
-        # A band location that the last tag isn't (artist didn't get one).
+    def test_a_lowercase_last_tag_stays_a_genre_tag(self):
+        # No location tag (Boards of Canada, unsupervisedmusic, ...): the
+        # radio's old "last tag = country" rule aired "electronic" as one.
+        info = items.parse_item_html(_page(_label_album(), tags=["alternative", "electronic"]))
+        self.assertEqual((info["tags"], info["location"]), (["alternative", "electronic"], None))
         info = items.parse_item_html(_page(_label_album(), tags=["dub", "techno"],
                                            band_location="Chicago, Illinois"))
         self.assertEqual((info["tags"], info["location"]), (["dub", "techno"], None))
-        info = items.parse_item_html(_page(_label_album(), tags=["noise rock", "Chicago"],
-                                           band_location="Chicago, Illinois"))
-        self.assertEqual((info["tags"], info["location"]), (["noise rock"], "Chicago"))
+
+    def test_the_location_tag_is_the_place_name_bandcamp_appends(self):
+        # Real pages (2026-10-25): the tag is Bandcamp's place name, which
+        # need not match the band location the page shows.
+        cases = [
+            # (raw tags, band location, location)
+            (["noise rock", "Chicago"], "Chicago, Illinois", "Chicago"),
+            (["electronic", "techno", "Montreal"], "Montreal, Québec", "Montreal"),
+            (["electronic", "techno", "Netherlands"], "Netherlands", "Netherlands"),
+            (["dubstep.", "electronic", "United Kingdom"], "England, UK", "United Kingdom"),
+            # c418: the page shows no location, the tag is still there.
+            (["ambient", "video game soundtrack", "United States"], None, "United States"),
+            # A place name without case matches the band location instead.
+            (["city pop", "東京"], "東京, 日本", "東京"),
+        ]
+        for tags, band_location, location in cases:
+            info = items.parse_item_html(_page(_label_album(), tags=tags, band_location=band_location))
+            self.assertEqual((info["tags"], info["location"]), (tags[:-1], location), tags)
 
     def test_location_from_ld_json_alone(self):
         # No #band-name-location on the page: publisher.foundingLocation decides.
@@ -299,7 +320,7 @@ class ParseEdgeCaseTests(unittest.TestCase):
         self.assertEqual(info["tracks"], [])
         self.assertEqual(info["tags"], [])
         for key in ("item_id", "title", "artist", "page_name", "album_url", "preview",
-                    "location", "description", "art_id", "og_image_url", "release_date",
+                    "location", "description", "art_id", "og_image_url",
                     "featured_track_id"):
             self.assertIsNone(info[key], key)
         self.assertEqual(info["item_type"], "album")  # from the URL
@@ -354,7 +375,7 @@ class ItemInfoTests(unittest.TestCase):
 
     def test_track_page_follows_its_album_for_the_description(self):
         calls = self._serve({TRACK: _track_html(), TRACK_ALBUM: _track_album_html()})
-        info = items.item_info(TRACK)
+        info = items.item_info(TRACK, follow_album_description=True)
         self.assertEqual(calls, [TRACK, TRACK_ALBUM])
         self.assertEqual(info["item_type"], "track")
         self.assertEqual(info["album_url"], TRACK_ALBUM)
@@ -362,30 +383,29 @@ class ItemInfoTests(unittest.TestCase):
         self.assertEqual(info["title"], "Franz Jäger & Egotot - Floating Point")
         self.assertEqual(info["preview"]["track_id"], 3523713060)
         self.assertEqual(info["art_id"], 3613931539)
-        self.assertEqual(info["release_date"], "2022-02-19")
         self.assertEqual((info["tags"], info["location"]), ([], "Berlin"))
 
-    def test_no_follow_costs_one_request(self):
+    def test_by_default_a_track_page_costs_one_request(self):
         calls = self._serve({TRACK: _track_html(), TRACK_ALBUM: _track_album_html()})
-        info = items.item_info(TRACK, follow_album_description=False)
+        info = items.item_info(TRACK)
         self.assertEqual(calls, [TRACK])
         self.assertIsNone(info["description"])
 
     def test_unreadable_album_page_keeps_the_track_info(self):
         self._serve({TRACK: _track_html(), TRACK_ALBUM: http.RateLimited(TRACK_ALBUM)})
-        info = items.item_info(TRACK)
+        info = items.item_info(TRACK, follow_album_description=True)
         self.assertIsNone(info["description"])
         self.assertEqual(info["preview"]["track_id"], 3523713060)
 
     def test_standalone_single_is_not_followed(self):
         calls = self._serve({TRACK: _track_html(album_url=None)})
-        info = items.item_info(TRACK)
+        info = items.item_info(TRACK, follow_album_description=True)
         self.assertEqual(calls, [TRACK])
         self.assertIsNone(info["album_url"])
 
     def test_album_page_costs_one_request(self):
         calls = self._serve({ALBUM: _album_html()})
-        info = items.item_info(ALBUM)
+        info = items.item_info(ALBUM, follow_album_description=True)
         self.assertEqual(calls, [ALBUM])
         self.assertEqual(info["artist"], "Rene Wise")
 
