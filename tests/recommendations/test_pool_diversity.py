@@ -271,6 +271,14 @@ class ExtractArtistTests(unittest.TestCase):
         with patch.object(scraper, "fetch_page_html", return_value=page):
             self.assertEqual(scraper.extract_artist(SEED), "Siu Mata")
 
+    def test_reads_the_one_item_page_parse(self):
+        # The same artist items.parse_item_html gives, e.g. from ld+json on a
+        # page shape without data-tralbum.
+        ld = {"@type": "MusicAlbum", "byArtist": {"@type": "MusicGroup", "name": "Rene Wise"}}
+        page = f'<script type="application/ld+json">{json.dumps(ld)}</script>'
+        with patch.object(scraper, "fetch_page_html", return_value=page):
+            self.assertEqual(scraper.extract_artist(SEED), "Rene Wise")
+
     def test_unreadable_page_is_none(self):
         with patch.object(scraper, "fetch_page_html", return_value=None):
             self.assertIsNone(scraper.extract_artist(SEED))

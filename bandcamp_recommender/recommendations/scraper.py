@@ -281,25 +281,17 @@ def extract_item_id(item_url: str) -> Optional[str]:
 
 def extract_artist(item_url: str) -> Optional[str]:
     """The release's artist credit, in the form the fan-collection API
-    reports as ``band_name``: ``data-tralbum``'s ``artist``. ``data-band``'s
-    ``name`` is the page's account, which on a label's page is the label
-    (measured: dbh-music.bandcamp.com/track/mothafucka is by "Paul Johnson",
-    account "dbh-music"), so it is only the fallback. None when the page
-    can't be read."""
+    reports as ``band_name``: the ``artist`` of
+    :func:`bandcamp_recommender.items.parse_item_html` (``data-tralbum``'s
+    ``artist`` first). ``data-band``'s ``name`` is the page's account, which
+    on a label's page is the label (measured:
+    dbh-music.bandcamp.com/track/mothafucka is by "Paul Johnson", account
+    "dbh-music"), so it is only the last fallback. None when the page can't
+    be read."""
     html = fetch_page_html(item_url, timeout=_DEFAULT_CURL_TIMEOUT)
     if not html:
         return None
-    script = BeautifulSoup(html, features="html.parser").find("script", attrs={"data-tralbum": True})
-    if script is None:
-        return None
-    for attr, key in (("data-tralbum", "artist"), ("data-band", "name")):
-        try:
-            blob = json.loads(script.get(attr) or "{}")
-        except ValueError:
-            continue
-        if isinstance(blob, dict) and blob.get(key):
-            return str(blob[key])
-    return None
+    return parse_item_html(html, item_url)["artist"]
 
 
 def extract_tags(item_url: str) -> List[str]:
