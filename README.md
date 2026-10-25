@@ -189,7 +189,11 @@ their own.
   `browser.close()` / `close_if_idle()` in long-running processes.
 - `collection_page_size` (default 10000 = everything) limits how many of each
   supporter's newest items are read; `candidate_filter` drops items before
-  the candidate pool is cut. Audio features describe each item's featured
+  the candidate pool is cut. Opt-in pool diversity, also before the cut:
+  `exclude_seed_artist=True` drops the seed's own artist and
+  `max_per_artist=N` keeps each artist's N best-ranked releases (artists
+  compared by `artists.artist_tokens`, so collabs count for each member and
+  "Various Artists" is never one artist). Audio features describe each item's featured
   track (`preview_track_id`); `audio_url` is only set when the page was read
   during the call (stream URLs are signed and expire).
 - `http.snapshot()` / `http.diff()` expose request counters (`requests`,
