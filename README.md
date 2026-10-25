@@ -123,6 +123,26 @@ in `docs/diversity-eval-results.md`. Backward-compatible: `diversify=None` (the
 default) is the unchanged similarity ranking; the `BANDCAMP_DIVERSIFY` env var
 sets a global default when the param is unset.
 
+### A fan's own lists (wishlist + collection)
+
+```python
+from bandcamp_recommender import fans
+
+lib = fans.fan_library("someuser")            # lists=("wishlist", "collection")
+lib["fan_id"], lib["username"]
+lib["hidden"]                                 # e.g. ["wishlist"]: private, so []
+for item in lib["collection"]:                # full list, newest first
+    item["item_url"], item["item_title"], item["band_name"], item["item_type"]
+    item["added_ts"]                          # epoch s it entered the list, or None
+```
+
+One fan page read plus one API call per non-empty visible list; the lists are
+read fresh on every call. `added_ts` is the list entry time (bought, for the
+collection; wishlisted, for the wishlist). Failures raise (the `http` errors,
+or `fans.FanNotFound` for an unknown username when the page answers 404 over
+plain HTTP; through the fallback browser, which can't see the status, an
+unknown username raises `http.Unexpected`). A list is never silently empty.
+
 ### Feature vectors (similarity matching, mood projection)
 
 ```python
