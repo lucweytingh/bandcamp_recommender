@@ -58,6 +58,9 @@ _DEFAULT_BPM_RERANK_ALPHA = 0.05
 # whale bias pass a smaller page (the feed is newest-first).
 _DEFAULT_COLLECTION_PAGE_SIZE = 10000
 _DEFAULT_SELENIUM_FALLBACK_BUDGET = 8
+# Full collections take Bandcamp ~3 s per 1000 items to serve (measured:
+# 2789 items = 8.7 s, 7 MB); the 10000-item maximum is ~30 s, more under load.
+_COLLECTION_API_TIMEOUT_S = 120
 # Items on a fan page's first page (what ``first_page_only`` reads).
 _FIRST_PAGE_SIZE = 20
 
@@ -977,7 +980,7 @@ class SupporterRecommender:
             "count": count,
         }
         data = http.post_json(
-            self._API_URLS[data_key], payload, timeout=60,
+            self._API_URLS[data_key], payload, timeout=_COLLECTION_API_TIMEOUT_S,
             referer=f"https://bandcamp.com/{username}",
         )
         items = (data or {}).get("items") if isinstance(data, dict) else None
@@ -1041,9 +1044,9 @@ class SupporterRecommender:
             api_url = self._API_URLS[data_key]
             try:
                 if driver is None:
-                    data = http.post_json(api_url, payload, timeout=60, referer=url)
+                    data = http.post_json(api_url, payload, timeout=_COLLECTION_API_TIMEOUT_S, referer=url)
                 else:
-                    data = browser.post_json(driver, api_url, payload)
+                    data = browser.post_json(driver, api_url, payload, timeout=_COLLECTION_API_TIMEOUT_S)
             except http.Challenged:
                 raise
             except http.FetchError as e:
