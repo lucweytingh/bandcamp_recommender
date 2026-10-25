@@ -193,13 +193,14 @@ their own.
   `exclude_seed_artist=True` drops the seed's own artist and
   `max_per_artist=N` keeps each artist's N best-ranked releases (artists
   compared by `artists.artist_tokens`, so collabs count for each member and
-  "Various Artists" is never one artist). Audio features describe each item's featured
-  track (`preview_track_id`); `audio_url` is only set when the page was read
-  during the call (stream URLs are signed and expire).
+  "Various Artists" is never one artist). Audio features describe each
+  item's featured track (`preview_track_id`); `audio_url` is only set when
+  the page was read during the call (stream URLs are signed and expire).
 - `http.snapshot()` / `http.diff()` expose request counters (`requests`,
   `rate_limited`, `challenged`, `selenium_fallbacks`, `supporter_api`, ...);
   `SupporterRecommender.last_call_stats` has per-phase timings of the last
-  similarity call.
+  similarity call, and under `pool` what the pool options did (`seed_artist`,
+  `seed_artist_dropped`, `filtered`, `artist_capped`).
 - A `SupporterRecommender` keeps per-call state: don't share one instance
   across threads for concurrent calls.
 

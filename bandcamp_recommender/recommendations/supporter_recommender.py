@@ -8,7 +8,7 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from threading import Lock
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -140,23 +140,25 @@ def _cap_per_artist(
     band_of: Callable[[str], str],
     max_per_artist: int,
     limit: int,
-) -> List[tuple]:
+) -> Tuple[List[tuple], int]:
     """The first ``limit`` of ``ranked`` (``(item_id, count)``, best first)
-    keeping at most ``max_per_artist`` releases per artist token. A release
-    credited to several artists counts for each of them and is skipped once
-    any of them is at the cap; credits without tokens ("Various Artists", "")
-    are never capped."""
+    keeping at most ``max_per_artist`` releases per artist token, and how many
+    releases the cap skipped on the way. A release credited to several
+    artists counts for each of them and is skipped once any of them is at the
+    cap; credits without tokens ("Various Artists", "") are never capped."""
     kept: List[tuple] = []
+    skipped = 0
     per_artist: Counter = Counter()
     for iid, cnt in ranked:
         if len(kept) >= limit:
             break
         tokens = artist_tokens(band_of(iid))
         if any(per_artist[t] >= max_per_artist for t in tokens):
+            skipped += 1
             continue
         per_artist.update(tokens)
         kept.append((iid, cnt))
-    return kept
+    return kept, skipped
 
 
 class SupporterRecommender:
@@ -176,6 +178,9 @@ class SupporterRecommender:
         self._selenium_budget = _resolve_selenium_fallback_budget()
         # username -> fan_id from the seed page (one-call collection reads).
         self._fan_ids: Dict[str, int] = {}
+        # What the last get_recommendations pool steps did (seed artist, drop
+        # counts); get_similar_recommendations reports it in last_call_stats.
+        self._pool_stats: Dict[str, Any] = {}
 
     def get_recommendations(
         self,
@@ -268,7 +273,8 @@ class SupporterRecommender:
                 ``candidate_filter`` and the cut. A seed's supporters mostly
                 own its artist's other releases, which can otherwise fill the
                 result. A compilation seed ("Various Artists") excludes
-                nothing. Default False (unchanged behaviour).
+                nothing; a seed page without an artist excludes nothing and
+                logs a warning. Default False (unchanged behaviour).
             max_per_artist: If set (>= 1), keep at most this many releases
                 per artist token, best-ranked first, after ``candidate_filter``
                 and before the cut, so a few artists' back catalogues can't
@@ -307,6 +313,14 @@ class SupporterRecommender:
         if progress_callback:
             progress_callback("Extracting item ID...", 0, 0, 0)
         original_item_id = extract_item_id(wishlist_item_url)
+        # Read now, moments after extract_supporters fetched the seed page, so
+        # it's a page-cache hit (after a long supporter phase it may not be).
+        if exclude_seed_artist:
+            seed_artist = extract_artist(wishlist_item_url)
+            if not seed_artist:
+                logger.warning("exclude_seed_artist: no artist on the seed page %s, "
+                               "excluding nothing", wishlist_item_url)
+            self._pool_stats["seed_artist"] = seed_artist
         # URL-normalized seed key, computed once. Used to drop the seed from
         # the per-supporter supporter_done emit (the animation's cloud), the
         # same way it's dropped from the ranked results below. Cosmetic only —
@@ -466,28 +480,34 @@ class SupporterRecommender:
             return (self.item_cache.get(iid) or {}).get("band_name") or ""
 
         # Before candidate_filter, so the caller's filter (which may keep
-        # state) only sees candidates the library keeps. The artist comes
-        # from the seed page extract_supporters already read (page-cache hit).
+        # state) only sees candidates the library keeps.
         if exclude_seed_artist:
-            seed_artist = artist_tokens(extract_artist(wishlist_item_url))
-            if seed_artist:
+            seed_tokens = artist_tokens(seed_artist)
+            before = len(sorted_items)
+            if seed_tokens:
                 sorted_items = [
                     (iid, cnt) for (iid, cnt) in sorted_items
-                    if not artist_tokens(band_of(iid)) & seed_artist
+                    if not artist_tokens(band_of(iid)) & seed_tokens
                 ]
+            self._pool_stats["seed_artist_dropped"] = before - len(sorted_items)
 
         if candidate_filter is not None:
+            before = len(sorted_items)
             sorted_items = [
                 (iid, cnt) for (iid, cnt) in sorted_items
                 if candidate_filter(self.item_cache.get(iid) or {})
             ]
+            self._pool_stats["filtered"] = before - len(sorted_items)
 
         pool_size = max(50, max_recommendations * 3) if bpm_match else max_recommendations
-        # After the caller's filter, so a release it rejects doesn't use up
-        # its artist's slots.
-        if max_per_artist is not None:
-            sorted_items = _cap_per_artist(sorted_items, band_of, max_per_artist, pool_size)
-        top_items = sorted_items[:pool_size]
+        if max_per_artist is None:
+            top_items = sorted_items[:pool_size]
+        else:
+            # After the caller's filter, so a release it rejects doesn't use
+            # up its artist's slots.
+            top_items, self._pool_stats["artist_capped"] = _cap_per_artist(
+                sorted_items, band_of, max_per_artist, pool_size
+            )
 
         if event_callback:
             top_meta = []
@@ -716,7 +736,10 @@ class SupporterRecommender:
         ``collection_page_size``, ``candidate_filter``, ``exclude_seed_artist``
         and ``max_per_artist`` are passed to :meth:`get_recommendations`; all
         apply before the ``candidate_pool_size`` cut, so every hydrated +
-        decoded candidate is one the caller can use.
+        decoded candidate is one the caller can use. ``last_call_stats["pool"]``
+        reports what they did: ``seed_artist`` (None if unreadable) and
+        ``seed_artist_dropped``, ``filtered``, ``artist_capped`` (releases
+        skipped while filling the pool), each only when its option is set.
 
         Audio features describe each item's featured preview track (the one
         ``audio_url`` points at) and are cached on disk per (item, track).
@@ -844,6 +867,7 @@ class SupporterRecommender:
             "candidates": len(candidates),
             "with_audio": with_audio,
             "http": http.diff(counters_before),
+            "pool": dict(self._pool_stats),
         }
         if progress_callback:
             progress_callback(
@@ -936,6 +960,7 @@ class SupporterRecommender:
         """Per-call knobs + fallback budget (entry points call this first)."""
         self._collection_page_size = max(1, int(collection_page_size))
         self._fan_ids = {}
+        self._pool_stats = {}
         with self._budget_lock:
             self._selenium_budget = _resolve_selenium_fallback_budget()
 
