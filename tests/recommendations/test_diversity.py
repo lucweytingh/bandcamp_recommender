@@ -205,6 +205,31 @@ def test_stratified_never_repeats_artist_with_duplicates():
     assert "B" in artists  # the other artist is reached rather than repeating A
 
 
+def test_stratified_treats_collab_credits_and_case_as_one_artist():
+    # "A & B" and "a" are the same act as "A": once one airs, the others
+    # wait until every other artist had its turn.
+    pool = [
+        mk(mood=-0.8, artist="Siu Mata & Amor Satyr", genre="dub", dist=0.10, id="collab"),
+        mk(mood=0.8, artist="SIU MATA", genre="rave", dist=0.11, id="solo"),
+        mk(mood=0.0, artist="Amor Satyr", genre="house", dist=0.12, id="other_member"),
+        mk(mood=0.4, artist="Someone Else", genre="techno", dist=0.30, id="else"),
+    ]
+    picked = [t.id for t in select_stratified(pool, mk(), k=2)]
+    assert picked == ["collab", "else"]
+
+
+def test_stratified_compilations_never_block_each_other():
+    # "Various Artists" names no artist, so two comps are not "the same
+    # artist" (raw-string compare used to keep only one of them).
+    pool = [
+        mk(mood=-0.8, artist="Various Artists", genre="dub", dist=0.10, id="comp1"),
+        mk(mood=0.8, artist="Various Artists", genre="rave", dist=0.11, id="comp2"),
+        mk(mood=0.0, artist="Someone", genre="house", dist=0.30, id="solo"),
+    ]
+    picked = [t.id for t in select_stratified(pool, mk(), k=2)]
+    assert picked == ["comp1", "comp2"]
+
+
 def test_stratified_fills_k_when_distinct_artists_short():
     # Only TWO distinct artists but k=3: prefer distinct, but never return a
     # short slice — fall back to filling the last slot (so its set is the same

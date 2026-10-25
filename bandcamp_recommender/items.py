@@ -46,8 +46,18 @@ _MONTHS = {m: i for i, m in enumerate(
 _BC_DATE_RE = re.compile(r"(\d{1,2}) ([A-Za-z]{3})[a-z]* (\d{4})")
 
 
-def normalize_item_url(url: str) -> str:
-    return (url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
+def normalize_item_url(url: Optional[str]) -> str:
+    """Canonical form of a Bandcamp item URL, for equality checks and cache
+    keys: surrounding whitespace, query, fragment and trailing slashes
+    stripped, everything lowercased. Store and fetch the raw URL; compare and
+    key on this.
+
+    Lowercasing the path is safe because Bandcamp slugs are lowercase: of
+    426,732 distinct item URLs the fan-collection API returned (2026-10),
+    none had an uppercase letter, a query, a fragment or a trailing slash.
+    So only hand-typed URLs differ by case, and folding them can't merge two
+    releases. It is also the form every disk-cache key has always used."""
+    return (url or "").strip().split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
 
 
 def _str(value: Any) -> Optional[str]:

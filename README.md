@@ -239,13 +239,18 @@ page it sits on (the label's, for label releases).
   `browser.close()` / `close_if_idle()` in long-running processes.
 - `collection_page_size` (default 10000 = everything) limits how many of each
   supporter's newest items are read; `candidate_filter` drops items before
-  the candidate pool is cut. Audio features describe each item's featured
-  track (`preview_track_id`); `audio_url` is only set when the page was read
-  during the call (stream URLs are signed and expire).
+  the candidate pool is cut. Opt-in pool diversity, also before the cut:
+  `exclude_seed_artist=True` drops the seed's own artist and
+  `max_per_artist=N` keeps each artist's N best-ranked releases (artists
+  compared by `artists.artist_tokens`, so collabs count for each member and
+  "Various Artists" is never one artist). Audio features describe each
+  item's featured track (`preview_track_id`); `audio_url` is only set when
+  the page was read during the call (stream URLs are signed and expire).
 - `http.snapshot()` / `http.diff()` expose request counters (`requests`,
   `rate_limited`, `challenged`, `selenium_fallbacks`, `supporter_api`, ...);
   `SupporterRecommender.last_call_stats` has per-phase timings of the last
-  similarity call.
+  similarity call, and under `pool` what the pool options did (`seed_artist`,
+  `seed_artist_dropped`, `filtered`, `artist_capped`).
 - A `SupporterRecommender` keeps per-call state: don't share one instance
   across threads for concurrent calls.
 
@@ -254,6 +259,8 @@ page it sits on (the label's, for label releases).
 The codebase is organized into modular components:
 
 - `bandcamp_recommender/features.py` - Vector similarity API (`extract_features`, `distance`, `project_mood`)
+- `bandcamp_recommender/items.py` - Cached item metadata + `normalize_item_url`, the one canonical item URL for comparisons and cache keys
+- `bandcamp_recommender/artists.py` - `artist_tokens`, artist identity: collaboration credits split into their members, case folded, "Various Artists" dropped (two credits are the same artist when their tokens intersect)
 - `bandcamp_recommender/recommendations/supporter_recommender.py` - Main recommendation engine
 - `bandcamp_recommender/recommendations/mood_tags.py` - Everynoise-derived tag-mood + tag-spikiness lexicon
 - `bandcamp_recommender/recommendations/intensity.py` - Audio energy / texture feature extraction (librosa)

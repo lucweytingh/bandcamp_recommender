@@ -89,6 +89,8 @@ with SupporterRecommender() as recommender:
 - `max_recommendations` (int, default=10): Maximum number of recommendations
 - `min_supporters` (int, default=2): Minimum number of supporters who must have purchased an item
 - `progress_callback` (Callable, optional): Function(status, current, total, estimated_seconds)
+- `exclude_seed_artist` (bool, default=False): drop candidates by the seed's own artist (incl. collabs) before the result is cut; a seed's supporters mostly own that artist's other releases
+- `max_per_artist` (int, optional): keep at most this many releases per artist, best-ranked first, after `candidate_filter` and before the cut. A collab counts for each of its artists; "Various Artists" is never capped
 
 **Returns:** `List[Dict[str, Any]]`
 
@@ -168,6 +170,8 @@ with SupporterRecommender() as r:
         intensity_duration=60.0,
         bpm_duration=60.0,
         progress_callback=None,
+        exclude_seed_artist=False,        # True: no candidates by the seed's own artist
+        max_per_artist=None,              # e.g. 2: the pool spans more artists
     )
 
     for rec in similar:
