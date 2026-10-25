@@ -16,10 +16,8 @@ session (or a recommendation run that revisits items) only pays once.
 
 import asyncio
 import io
-import json
 import logging
 import os
-import re
 import sys
 import threading
 import time
@@ -28,8 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
-from bs4 import BeautifulSoup
-
+from bandcamp_recommender.items import parse_item_html, select_preview_track  # noqa: F401 (re-export)
 from bandcamp_recommender.recommendations.scraper import fetch_page_html
 
 # Suppress librosa/soundfile warnings about MP3 Xing headers
@@ -105,100 +102,15 @@ async def detect_bpm_from_audio_url_async(audio_url: str, timeout: int = 300) ->
     return await loop.run_in_executor(None, detect_bpm_from_audio_url, audio_url, timeout)
 
 
-def _find_audio_path(file_dict: Dict[str, str]) -> Optional[str]:
-    """Find bcbits.com audio URL from file dictionary.
-    
-    Args:
-        file_dict: Dictionary of file format keys to URLs
-        
-    Returns:
-        Audio URL string if found, None otherwise
-    """
-    for url in file_dict.values():
-        if isinstance(url, str) and re.search(r"https://\w+\.bcbits\.com", url):
-            return url
-    return None
-
-
-def _process_trackinfo(trackinfo: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Process trackinfo list and extract track data.
-    
-    Args:
-        trackinfo: List of track dictionaries from Bandcamp data
-        
-    Returns:
-        List of processed track dictionaries
-    """
-    tracks = []
-    for track in trackinfo:
-        # Only include playable tracks (have file and title_link)
-        if track.get("title_link") and track.get("file"):
-            audio_path = _find_audio_path(track.get("file", {}))
-            if audio_path:
-                tracks.append({
-                    "url": track.get("title_link", ""),
-                    "audio_path": audio_path,
-                    "track_num": track.get("track_num", 0),
-                    "title": track.get("title", ""),
-                    "track_id": track.get("track_id") or track.get("id"),
-                })
-    return tracks
-
-
-def _parse_tracks(html: str) -> Tuple[List[Dict[str, Any]], Optional[Any]]:
-    """``(playable tracks, featured_track_id)`` from an item page."""
-    soup = BeautifulSoup(html, features="html.parser")
-    tralbum_elem = soup.find(attrs={"data-tralbum": True})
-    if tralbum_elem:
-        tralbum_json = tralbum_elem.get("data-tralbum")
-        if tralbum_json:
-            try:
-                tralbum = json.loads(tralbum_json)
-                tracks = _process_trackinfo(tralbum.get("trackinfo", []))
-                if tracks:
-                    return tracks, tralbum.get("featured_track_id")
-            except (json.JSONDecodeError, KeyError, AttributeError):
-                pass
-
-    # Fallback to pagedata (for other page types)
-    pagedata_elem = soup.find(id="pagedata")
-    if pagedata_elem:
-        data_blob = pagedata_elem.get("data-blob")
-        if data_blob:
-            try:
-                tralbum_data = json.loads(data_blob).get("tralbum_data", {})
-                return (
-                    _process_trackinfo(tralbum_data.get("trackinfo", [])),
-                    tralbum_data.get("featured_track_id"),
-                )
-            except (json.JSONDecodeError, KeyError, AttributeError):
-                pass
-    return [], None
-
-
 def extract_track_info(item_url: str) -> List[Dict[str, Any]]:
-    """Extract track information including audio URLs from a Bandcamp page.
-
-    Returns playable tracks in page order, each a dict with ``url``,
-    ``audio_path`` (bcbits preview), ``track_num``, ``title``, ``track_id``.
-    """
+    """Playable tracks of a Bandcamp page in page order, as track dicts from
+    :func:`bandcamp_recommender.items.parse_item_html` (``url``,
+    ``audio_path`` (bcbits preview), ``track_num``, ``title``, ``track_id``,
+    ...)."""
     html = fetch_page_html(item_url)
     if not html:
         return []
-    return _parse_tracks(html)[0]
-
-
-def select_preview_track(tracks: List[Dict[str, Any]], featured_track_id: Any) -> Optional[Dict[str, Any]]:
-    """The release's featured track if it is playable, else the first
-    playable one. This is the track a listener hears when they open the page,
-    so it is the one worth describing (and, downstream, airing)."""
-    if not tracks:
-        return None
-    if featured_track_id is not None:
-        for track in tracks:
-            if str(track.get("track_id")) == str(featured_track_id):
-                return track
-    return tracks[0]
+    return [t for t in parse_item_html(html, item_url)["tracks"] if t["playable"]]
 
 
 def get_preview_for_item(item_url: str) -> Optional[Dict[str, Any]]:
@@ -207,7 +119,7 @@ def get_preview_for_item(item_url: str) -> Optional[Dict[str, Any]]:
     html = fetch_page_html(item_url)
     if not html:
         return None
-    return select_preview_track(*_parse_tracks(html))
+    return parse_item_html(html, item_url)["preview"]
 
 
 def get_bpm_for_url(
