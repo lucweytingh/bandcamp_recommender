@@ -262,6 +262,8 @@ class SupporterRecommender:
                 ranked candidates BEFORE the result is cut to
                 ``max_recommendations``, so the caller's exclusions (e.g.
                 recently played) don't waste result slots or downstream work.
+                It sees every candidate ``exclude_seed_artist`` keeps,
+                including ones ``max_per_artist`` then skips.
             exclude_seed_artist: If True, drop candidates by the seed's own
                 artist (credits whose :func:`~bandcamp_recommender.artists.artist_tokens`
                 intersect the seed page's artist, so collabs count) before
@@ -475,7 +477,8 @@ class SupporterRecommender:
             return (self.item_cache.get(iid) or {}).get("band_name") or ""
 
         # Before candidate_filter, so the caller's filter (which may keep
-        # state) only sees candidates the library keeps.
+        # state) never sees the seed's own artist. It does see candidates
+        # max_per_artist skips after it.
         if exclude_seed_artist:
             seed_tokens = artist_tokens(seed_artist)
             before = len(sorted_items)
@@ -1794,11 +1797,11 @@ class SupporterRecommender:
         return results
 
     def close(self):
-        """Release the shared fallback browser if nobody is using it (it is
-        process-wide now; see bandcamp_recommender.browser)."""
-        from bandcamp_recommender import browser
-
-        browser.close_if_idle()
+        """Nothing to release: the fallback browser is process-wide and quits
+        itself once unused for ``BANDCAMP_BROWSER_IDLE_S`` (see
+        bandcamp_recommender.browser; ``browser.close()`` quits it now).
+        Quitting it here made the caller's next page read, often moments
+        later, pay a fresh Chrome start."""
 
     def __enter__(self):
         """Context manager entry."""

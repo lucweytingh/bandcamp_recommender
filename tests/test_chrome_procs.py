@@ -361,19 +361,31 @@ def test_at_exit_nothing_this_process_started_survives(proc):
     assert all((proc.root / str(pid)).exists() for pid in other)
 
 
+def _counted_scans(monkeypatch):
+    scans = MagicMock(return_value={ME: chrome_procs._Proc(ME, 1, "S", "python3", b"")})
+    monkeypatch.setattr(chrome_procs, "_processes", scans)
+    monkeypatch.setattr(chrome_procs, "_swept", False)
+    return scans
+
+
 def test_every_driver_start_reaps_first(monkeypatch):
     """So whatever an earlier reap or release had to leave is retried, and
     the first Bandcamp request doesn't scan again."""
-    monkeypatch.setattr(chrome_procs, "_swept", False)
-    reap = MagicMock(return_value=0)
-    monkeypatch.setattr(chrome_procs, "reap_orphans", reap)
-
+    scans = _counted_scans(monkeypatch)
     first = chrome_procs.new_profile()
     chrome_procs.new_profile()
     chrome_procs.sweep_once()
-    assert reap.call_count == 2
+    assert scans.call_count == 2
     assert os.path.basename(first).startswith(f"bcr-chrome-{ME}-")
     assert stat.S_IMODE(os.stat(first).st_mode) == 0o700
+
+
+def test_a_startup_reap_is_the_once_per_process_sweep(monkeypatch):
+    """A consumer's own startup reap means the first request scans no more."""
+    scans = _counted_scans(monkeypatch)
+    chrome_procs.reap_orphans(legacy=True)
+    chrome_procs.sweep_once()
+    assert scans.call_count == 1
 
 
 def test_first_bandcamp_request_reaps_once_per_process(monkeypatch):
@@ -413,18 +425,21 @@ def test_profiles_root(tmp_path, monkeypatch):
 
 
 def test_ps_fallback_without_proc(tmp_path, monkeypatch):
-    """macOS: no /proc; comm is a full path with spaces."""
+    """macOS: no /proc; ps's ucomm is cut to 16 characters and may hold
+    spaces, and names a zombie (whose comm is "<defunct>")."""
     helper = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper (Renderer)"
     profile = _profile(DEAD)
     outputs = {
-        "pid=,ppid=,stat=,comm=": (
-            f"    1     0 Ss   /sbin/launchd\n"
-            f"{ME:>5}     1 S    /usr/local/bin/python3\n"
-            f"  501     1 S    /Users/me/.wdm/chromedriver\n"
-            f"  502   501 S    /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n"
-            f"  503   502 S    {helper}\n"
-            f"  600     1 S    /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n"
-            f"  700     1 S    /bin/zsh\n"
+        "pid=,ppid=,stat=,ucomm=": (
+            f"    1     0 Ss   launchd\n"
+            f"{ME:>5}     1 S    python3.12\n"
+            f"  501     1 S    chromedriver\n"
+            f"  502   501 S    Google Chrome\n"
+            f"  503   502 S    Google Chrome He\n"
+            f"  600     1 S    Google Chrome\n"
+            f"  700     1 S    zsh\n"
+            f"  800 {ME:>5} Z    chromedriver    \n"
+            f"  801 {ME:>5} Z    ffmpeg\n"
         ),
         "pid=,args=": (
             f"    1 /sbin/launchd\n"
@@ -434,6 +449,8 @@ def test_ps_fallback_without_proc(tmp_path, monkeypatch):
             f"  503 {helper} --type=renderer --user-data-dir={profile}\n"
             f"  600 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n"
             f"  700 -zsh {profile}\n"
+            f"  800 <defunct>\n"
+            f"  801 <defunct>\n"
         ),
     }
 
@@ -444,15 +461,18 @@ def test_ps_fallback_without_proc(tmp_path, monkeypatch):
     monkeypatch.setattr(chrome_procs.shutil, "which", lambda name: "/bin/ps")
     monkeypatch.setattr(chrome_procs.subprocess, "run", run)
     table = chrome_procs._processes()
-    assert table[503].comm == "google chrome helper (renderer)"
+    assert table[503].comm == "google chrome he"
+    assert table[800].comm == "chromedriver" and table[800].state == "Z"
     assert table[502].state == "S" and table[502].ppid == 501
     assert table[700].cmdline == b""  # not Chrome: never inspected
 
-    killed = []
+    killed, waited = [], []
     monkeypatch.setattr(chrome_procs.os, "kill", lambda pid, sig: killed.append(pid) if sig else None)
+    monkeypatch.setattr(chrome_procs.os, "waitpid", lambda pid, flags: waited.append(pid) or (pid, 0))
     monkeypatch.setattr(chrome_procs, "_wait_gone", lambda pids: None)
-    assert chrome_procs.reap_orphans() == 3
+    assert chrome_procs.reap_orphans() == 4
     assert sorted(killed) == [501, 502, 503]  # not the user's Chrome (600), not the shell
+    assert waited == [800]  # our dead chromedriver, never our ffmpeg
 
     # Without command lines every profile would look unused: no table at all.
     monkeypatch.setattr(
@@ -519,7 +539,6 @@ def test_driver_that_dies_while_configured_is_cleaned_up(proc):
 def test_driver_manager_reap_orphans_delegates(proc):
     _driver_tree(proc, 5000, DEAD, SYSTEMD_USER)
     assert driver_manager.DriverManager.reap_orphans() == 3
-    assert browser.reap_orphans is chrome_procs.reap_orphans
 
 
 # ---- the shared browser closes itself when idle ------------------------------
@@ -551,6 +570,22 @@ def test_idle_browser_is_closed_and_cleaned_up(shared_browser, monkeypatch):
     assert _wait_for(lambda: browser._driver is None)
     fake.quit.assert_called_once()
     assert not os.path.exists(profile)
+
+
+def test_closing_a_recommender_leaves_the_shared_browser_to_its_idle_timer(shared_browser, monkeypatch):
+    """The page reads that follow a recommendation call reuse the browser."""
+    from bandcamp_recommender import SupporterRecommender
+
+    monkeypatch.setenv("BANDCAMP_BROWSER_IDLE_S", "0.2")
+    fake = _fake_chrome()
+    with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
+        with browser.session():
+            pass
+        with SupporterRecommender():
+            pass
+        assert browser._driver is fake
+        fake.quit.assert_not_called()
+    assert _wait_for(lambda: browser._driver is None)
 
 
 def test_browser_in_use_is_not_closed(shared_browser, monkeypatch):

@@ -20,10 +20,13 @@ of "who spawned this?":
   long-lived service should also call it at startup, since a restart may be
   followed by a long stretch without either.
 
-Owner liveness is a pid lookup, so processes in different pid namespaces
-(containers) must not share a profiles root. A dead owner whose pid was
-reused (more likely on macOS, whose pids wrap at 99999) looks alive: its
-Chrome is spared until the new holder of that pid exits.
+Owner liveness is a lookup in the local pid table, so processes on
+different hosts (a shared NFS home) or in different pid namespaces
+(containers) must not share a profiles root: a sweep would take another
+host's live profile for a dead owner's and delete it. Give each one its own
+``BANDCAMP_BROWSER_PROFILE_DIR``. A dead owner whose pid was reused (more
+likely on macOS, whose pids wrap at 99999) looks alive: its Chrome is
+spared until the new holder of that pid exits.
 
 Why explicit profiles: without one, chromedriver makes a temp profile
 (``.org.chromium.Chromium.scoped_dir.*``) that only a clean quit deletes.
@@ -111,7 +114,8 @@ def profiles_root() -> Path:
 
 def sweep_once() -> None:
     """Reap what dead library processes left behind, once per process (on the
-    first Bandcamp request, unless a driver start already did)."""
+    first Bandcamp request, unless a driver start or a :func:`reap_orphans`
+    call already did)."""
     global _swept
     if _swept:
         return
@@ -135,8 +139,6 @@ def new_profile() -> str:
     Reaps first, every time: one process scan against a Chrome start of a
     few seconds, and it retries whatever an earlier reap or release had to
     leave (a failed listing, a process that outlived its kill)."""
-    global _swept
-    _swept = True
     _reap_quietly()
     name = f"{PROFILE_PREFIX}{os.getpid()}-{secrets.token_hex(4)}"
     path = profiles_root() / name
@@ -220,7 +222,12 @@ def reap_orphans(legacy: bool = False) -> int:
     anymore: a chromedriver whose spawner died (reparented to init or a
     subreaper), or a Chrome on a chromedriver temp profile whose chromedriver
     died, each with its descendants. That is what library versions before
-    profile markers leave behind, but it may be anyone's, so it is opt-in."""
+    profile markers (0.8) leave behind, but it may be anyone's, so it is
+    opt-in: a migration aid, not needed once no such version runs here.
+
+    Any call counts as the once-per-process sweep (:func:`sweep_once`)."""
+    global _swept
+    _swept = True
     if os.name == "nt":
         return 0
     me = os.getpid()
@@ -474,8 +481,11 @@ def _run_ps(ps: str, fields: str) -> Optional[str]:
 
 
 def _ps_table() -> Dict[int, _Proc]:
+    # ucomm, not comm: macOS shows a zombie's comm as "<defunct>", while its
+    # ucomm keeps the name, so our dead chromedriver children get waited.
+    # ucomm is cut to 16 characters ("Google Chrome He"): still "chrom".
     ps = shutil.which("ps")
-    procs = _run_ps(ps, "pid=,ppid=,stat=,comm=") if ps else None
+    procs = _run_ps(ps, "pid=,ppid=,stat=,ucomm=") if ps else None
     cmdlines = _run_ps(ps, "pid=,args=") if procs is not None else None
     if cmdlines is None:  # without command lines every profile looks unused
         return {}
@@ -486,11 +496,11 @@ def _ps_table() -> Dict[int, _Proc]:
             args[int(parts[0])] = parts[1]
     table: Dict[int, _Proc] = {}
     for line in procs.splitlines():
-        parts = line.split(None, 3)  # comm (a full path on macOS) may hold spaces
+        parts = line.split(None, 3)  # ucomm may hold spaces
         if len(parts) < 4 or not parts[0].isdigit() or not parts[1].isdigit():
             continue
         pid = int(parts[0])
-        comm = os.path.basename(parts[3]).lower()
+        comm = parts[3].strip().lower()
         cmdline = args.get(pid, "").encode() if "chrom" in comm else b""
         table[pid] = _Proc(pid, int(parts[1]), parts[2][:1], comm, cmdline)
     return table

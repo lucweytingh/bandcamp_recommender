@@ -68,11 +68,11 @@ class DriverManager:
         chromedriver Service (a Service shared across drivers only stops the
         last chromedriver it started: the rest leaked). See chrome_procs."""
         chromedriver = self._chromedriver_path()
-        profile = chrome_procs.new_profile()
         options = self.get_driver_options()
-        options.add_argument(f"--user-data-dir={profile}")
-        service = Service(chromedriver, service_args=chrome_procs.chromedriver_args(profile))
+        profile = chrome_procs.new_profile()
         try:
+            options.add_argument(f"--user-data-dir={profile}")
+            service = Service(chromedriver, service_args=chrome_procs.chromedriver_args(profile))
             driver = webdriver.Chrome(service=service, options=options)
         except Exception:
             chrome_procs.release_profile(profile)
@@ -229,11 +229,12 @@ class DriverManager:
         browser of every live library process. Opt-in: callers run this on
         cold start.
 
-        Unlike :func:`bandcamp_recommender.browser.reap_orphans` this keeps
-        reaching what versions without profile markers leave behind: an
-        unmarked chromedriver whose spawner died, or a Chrome on a
-        chromedriver temp profile whose chromedriver died (reparented to init
-        or a subreaper), with their descendants. Caveat: that also kills a
+        This is :func:`bandcamp_recommender.chrome_procs.reap_orphans` with
+        ``legacy=True``: unlike the default, it keeps reaching what versions
+        without profile markers (before 0.8) leave behind: an unmarked
+        chromedriver whose spawner died, or a Chrome on a chromedriver temp
+        profile whose chromedriver died (reparented to init or a
+        subreaper), with their descendants. Caveat: that also kills a
         chromedriver run as a service straight under init, systemd or
         launchd (e.g. a Selenium Grid node). It no longer kills any other
         Chrome with PPID 1 (on macOS that included the user's own Chrome

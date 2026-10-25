@@ -11,11 +11,12 @@ process-wide driver:
   timeout, so a wedged page can't stall every thread forever);
 * recreated if it died;
 * quit once nobody used it for ``BANDCAMP_BROWSER_IDLE_S`` (default 120 s,
-  0 = never), by :func:`close` / :func:`close_if_idle`, or at exit;
+  0 = never), by :func:`close` / :func:`close_if_idle`, or at exit (not
+  when a ``SupporterRecommender`` closes: the next caller may need it);
 * cleaned up after: each driver runs on its own library-owned profile, and
   quitting it kills whatever still runs on that profile and deletes it.
-  :func:`reap_orphans` does the same for drivers of library processes that
-  died. See :mod:`bandcamp_recommender.chrome_procs`.
+  :func:`bandcamp_recommender.chrome_procs.reap_orphans` does the same for
+  drivers of library processes that died.
 
 Lock order: the driver lock is always taken BEFORE a pacer slot, never while
 holding one.
@@ -46,12 +47,6 @@ _driver = None
 _last_used = 0.0
 _idle_wake = threading.Event()
 _idle_thread: Optional[threading.Thread] = None
-
-# Kill Chrome left behind by library processes that died; spares live ones.
-# Runs by itself before every driver start and on the first Bandcamp request;
-# a long-lived service should also call it once at startup.
-reap_orphans = chrome_procs.reap_orphans
-
 
 class BrowserUnavailable(http.FetchError):
     """The fallback browser could not be started or acquired in time."""
