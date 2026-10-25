@@ -125,21 +125,27 @@ def test_own_browser_is_spared_while_its_driver_lives(proc):
     assert sorted(proc.killed) == tree
 
 
-def test_unmarked_chromedriver_whose_spawner_died_only_on_request(proc):
+def test_unmarked_selenium_leftovers_only_on_request(proc):
     """What versions before profile markers leave behind. Not ours to judge by
-    default (could be anyone's orphaned chromedriver); DriverManager.reap_orphans,
-    the old opt-in cold-start reaper, keeps reaching it."""
+    default (could be anyone's); DriverManager.reap_orphans, the old opt-in
+    cold-start reaper, keeps reaching it."""
     proc.add(8001, "chromedriver", SYSTEMD_USER, "chromedriver", "--port=2")
     proc.add(8002, "chrome", 8001, "chrome", "--user-data-dir=/tmp/.org.chromium.Chromium.scoped_dir.x")
     proc.add(8003, "chrome", 8002, "chrome", "--type=renderer")
     proc.add(8101, "chromedriver", 1, "chromedriver", "--port=3")
-    proc.add(8201, "chromedriver", OTHER, "chromedriver", "--port=4")  # its process is alive
+    # Its chromedriver died (OOM): the browser was reparented.
+    proc.add(8401, "chrome", SYSTEMD_USER, "chrome", "--user-data-dir=/tmp/.org.chromium.Chromium.scoped_dir.z")
+    proc.add(8402, "chrome", 8401, "chrome", "--type=renderer")
+    # Alive: driven by a live process.
+    proc.add(8201, "chromedriver", OTHER, "chromedriver", "--port=4")
     proc.add(8202, "chrome", 8201, "chrome", "--user-data-dir=/tmp/.org.chromium.Chromium.scoped_dir.y")
-    proc.add(8301, "chrome", 1, "/opt/google/chrome/chrome")  # PPID 1 but nobody's driver
+    # PPID 1 but nobody's driver: the user's own browser.
+    proc.add(8301, "chrome", 1, "/opt/google/chrome/chrome")
+    proc.add(8302, "chrome_crashpad", 1, "chrome_crashpad_handler", "--monitor-self")
 
     assert chrome_procs.reap_orphans() == 0
-    assert driver_manager.DriverManager.reap_orphans() == 4
-    assert sorted(proc.killed) == [8001, 8002, 8003, 8101]
+    assert driver_manager.DriverManager.reap_orphans() == 6
+    assert sorted(proc.killed) == [8001, 8002, 8003, 8101, 8401, 8402]
 
 
 def test_in_a_container_pid_1_may_be_a_live_library_process(proc):
@@ -147,7 +153,7 @@ def test_in_a_container_pid_1_may_be_a_live_library_process(proc):
     proc.add(1, "python3", 0, "python3", "app.py")
     proc.add(8001, "chromedriver", 1, "chromedriver", "--port=2")
 
-    chrome_procs.reap_orphans(unmarked_chromedrivers=True)
+    chrome_procs.reap_orphans(legacy=True)
     assert proc.killed == []
 
 
@@ -205,6 +211,17 @@ def test_sweeps_stale_profiles_only(proc):
     assert left == {mine, names["starting"], names["in_use"], names["unrelated"]}
 
 
+def test_release_profile_keeps_a_dir_still_in_use(proc):
+    profile = chrome_procs.new_profile()
+    name = os.path.basename(profile)
+    tree = _driver_tree(proc, 5000, ME, ME, token=name.rsplit("-", 1)[1])
+    proc.unkillable.add(tree[1])
+
+    chrome_procs.release_profile(profile)
+    assert os.path.isdir(profile)
+    assert name not in chrome_procs._live  # so the next sweep takes it once it's gone
+
+
 def test_release_profile_kills_leftovers_and_deletes_the_dir(proc):
     profile = chrome_procs.new_profile()
     name = os.path.basename(profile)
@@ -229,7 +246,7 @@ def test_quit_driver_cleans_up_even_when_quit_fails(proc):
     assert not os.path.exists(profile)
 
 
-def test_a_forked_child_leaves_its_parents_profile_alone(proc, tmp_path):
+def test_a_forked_child_leaves_its_parents_browser_alone(proc, tmp_path):
     parents = tmp_path / f"bcr-chrome-{OTHER}-bbbbbbbb"
     parents.mkdir()
     tree = _driver_tree(proc, 6000, OTHER, OTHER, token="bbbbbbbb")
@@ -237,6 +254,7 @@ def test_a_forked_child_leaves_its_parents_profile_alone(proc, tmp_path):
     setattr(driver, chrome_procs.PROFILE_ATTR, str(parents))
 
     chrome_procs.quit_driver(driver)
+    driver.quit.assert_not_called()  # quitting would end the parent's session
     assert parents.is_dir()
     assert proc.killed == []
     assert all((proc.root / str(pid)).exists() for pid in tree)
@@ -455,6 +473,21 @@ def test_browser_in_use_is_not_closed(shared_browser, monkeypatch):
             time.sleep(0.4)  # well past the idle timeout, but in use
             assert browser._driver is fake
             fake.quit.assert_not_called()
+    assert _wait_for(lambda: browser._driver is None)
+
+
+def test_a_huge_idle_timeout_does_not_kill_the_watcher(shared_browser, monkeypatch):
+    monkeypatch.setenv("BANDCAMP_BROWSER_IDLE_S", "inf")
+    fake = _fake_chrome()
+    with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
+        with browser.session():
+            pass
+    time.sleep(0.2)
+    assert browser._idle_thread.is_alive()
+    monkeypatch.setenv("BANDCAMP_BROWSER_IDLE_S", "0.1")
+    with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
+        with browser.session():
+            pass
     assert _wait_for(lambda: browser._driver is None)
 
 

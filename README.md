@@ -199,8 +199,9 @@ their own.
   profiles; it never touches a live process's browser or a Chrome the
   library didn't start, and runs by itself once per process on the first
   Bandcamp request. `DriverManager.reap_orphans()` (the opt-in cold-start
-  reaper) does the same and also kills unmarked chromedrivers whose spawner
-  died, as earlier versions leave behind.
+  reaper) does the same and also kills what earlier versions leave behind:
+  an unmarked chromedriver whose spawner died, or a Chrome on a chromedriver
+  temp profile whose chromedriver died.
 - `collection_page_size` (default 10000 = everything) limits how many of each
   supporter's newest items are read; `candidate_filter` drops items before
   the candidate pool is cut. Audio features describe each item's featured

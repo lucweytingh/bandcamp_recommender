@@ -58,6 +58,9 @@ PROFILE_ATTR = "_bandcamp_profile"
 
 _NAME_RE = re.compile(r"bcr-chrome-(\d+)-[0-9a-f]{8}")
 _MARK_RE = re.compile(_NAME_RE.pattern.encode())
+# The temp profile chromedriver makes when given none
+# (.org.chromium.Chromium.scoped_dir.*): what versions before markers ran on.
+_TEMP_PROFILE_RE = re.compile(rb"--user-data-dir=[^\s\0]*scoped_dir")
 # A live owner's dir that no process uses may be a driver starting right now.
 # Older than this it is a leftover (e.g. the owner pid was reused after a reboot).
 _LAUNCH_GRACE_S = 300.0
@@ -109,12 +112,13 @@ def sweep_once() -> None:
     if _swept:
         return
     with _live_lock:
-        first, _swept = not _swept, True
-    if first:
-        try:
-            reap_orphans()
-        except Exception:
-            logger.warning("chrome orphan sweep failed", exc_info=_debug())
+        if _swept:
+            return
+        _swept = True
+    try:
+        reap_orphans()
+    except Exception:
+        logger.warning("chrome orphan sweep failed", exc_info=_debug())
 
 
 def new_profile() -> str:
@@ -144,41 +148,52 @@ def release_profile(profile: str) -> None:
     """Kill whatever still runs on ``profile`` (a driver whose quit failed, a
     browser whose chromedriver died) and delete the dir."""
     name = os.path.basename(profile)
+    survivors = []
     if os.name != "nt":
         try:
             table = _processes()
-            _kill([p.pid for p in _running_chrome(table) if _marker(p) == name])
+            on_it = [p.pid for p in _running_chrome(table) if _marker(p) == name]
+            _kill(on_it)
+            survivors = [pid for pid in on_it if _is_running(pid)]
             _reap_zombies(table, os.getpid())
         except Exception:
             logger.warning("cleanup of browser profile %s failed", name, exc_info=_debug())
-    shutil.rmtree(profile, ignore_errors=True)
+    if survivors:
+        # Not under a live process; once it is gone a later sweep takes it.
+        logger.warning("browser profile %s still in use by pid(s) %s; kept", name, survivors)
+    else:
+        shutil.rmtree(profile, ignore_errors=True)
     with _live_lock:
         _live.pop(name, None)
 
 
 def quit_driver(driver) -> None:
     """Quit ``driver`` and clean up after it, even if the quit fails."""
+    profile = getattr(driver, PROFILE_ATTR, None)
+    if not isinstance(profile, str):
+        profile = None
+    elif _owner(os.path.basename(profile)) != os.getpid():
+        return  # inherited by a forked child: the parent's to quit, not ours
     try:
         driver.quit()
     except Exception:
         logger.warning("browser quit failed", exc_info=_debug())
-    profile = getattr(driver, PROFILE_ATTR, None)
-    # A forked child that inherited the driver must not clean up its parent's.
-    if isinstance(profile, str) and _owner(os.path.basename(profile)) == os.getpid():
+    if profile is not None:
         release_profile(profile)
 
 
-def reap_orphans(unmarked_chromedrivers: bool = False) -> int:
+def reap_orphans(legacy: bool = False) -> int:
     """Kill Chrome and chromedriver whose owning library process is dead (or,
     for this process, whose driver is gone), wait our own defunct
     chromedriver children, and delete stale profile dirs. Returns the number
     of processes killed or waited. Never touches a live process's browser.
     No-op on Windows.
 
-    ``unmarked_chromedrivers`` also kills chromedrivers without the marker
-    whose spawner died (reparented to init or a subreaper), with their
-    Chrome: what library versions before profile markers leave behind, but
-    also anyone else's orphaned chromedriver, so it is opt-in."""
+    ``legacy`` also reaps unmarked Selenium processes nothing can drive
+    anymore: a chromedriver whose spawner died (reparented to init or a
+    subreaper), or a Chrome on a chromedriver temp profile whose chromedriver
+    died, each with its descendants. That is what library versions before
+    profile markers leave behind, but it may be anyone's, so it is opt-in."""
     if os.name == "nt":
         return 0
     me = os.getpid()
@@ -191,7 +206,7 @@ def reap_orphans(unmarked_chromedrivers: bool = False) -> int:
         logger.warning("chrome reaper: could not list processes, skipping")
         return 0
     zombies = _reap_zombies(table, me)
-    doomed = _orphans(table, me, unmarked_chromedrivers)
+    doomed = _orphans(table, me, legacy)
     killed = _kill(doomed)
     gone = {pid for pid in doomed if not _is_running(pid)}
     in_use = {_marker(p) for p in _running_chrome(table) if p.pid not in gone}
@@ -238,7 +253,7 @@ def _running_chrome(table: Dict[int, _Proc]) -> List[_Proc]:
     return [p for p in table.values() if "chrom" in p.comm and p.state not in ("Z", "X")]
 
 
-def _orphans(table: Dict[int, _Proc], me: int, unmarked_chromedrivers: bool) -> List[int]:
+def _orphans(table: Dict[int, _Proc], me: int, legacy: bool) -> List[int]:
     doomed: Dict[int, None] = {}
     for p in _running_chrome(table):
         name = _marker(p)
@@ -251,7 +266,9 @@ def _orphans(table: Dict[int, _Proc], me: int, unmarked_chromedrivers: bool) -> 
                 dead = not _alive(table, owner)
             if dead:
                 doomed[p.pid] = None
-        elif unmarked_chromedrivers and p.comm == "chromedriver" and _spawner_gone(table, p):
+        elif legacy and _spawner_gone(table, p) and (
+            p.comm == "chromedriver" or _TEMP_PROFILE_RE.search(p.cmdline)
+        ):
             doomed[p.pid] = None
             for d in _descendants(table, p.pid):
                 if "chrom" in table[d].comm:
@@ -260,8 +277,9 @@ def _orphans(table: Dict[int, _Proc], me: int, unmarked_chromedrivers: bool) -> 
 
 
 def _spawner_gone(table: Dict[int, _Proc], p: _Proc) -> bool:
-    """A chromedriver is a child of the process driving it; once that process
-    dies it is reparented to init or a subreaper."""
+    """A chromedriver is a child of the process driving it, a Chrome of its
+    chromedriver; once the parent dies it is reparented to init or a
+    subreaper."""
     parent = table.get(p.ppid)
     return parent is not None and parent.comm in _REAPER_COMMS
 

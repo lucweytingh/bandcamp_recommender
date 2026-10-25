@@ -101,7 +101,7 @@ def _idle_watch() -> None:
             continue
         left = _last_used + idle_s - time.monotonic()
         if left > 0:
-            timeout = left
+            timeout = min(left, 86400.0)  # Event.wait overflows on huge values
             continue
         timeout = None  # quit now, or in use: the end of that session wakes us
         if not _lock.acquire(blocking=False):

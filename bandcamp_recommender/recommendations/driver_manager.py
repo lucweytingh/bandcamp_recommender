@@ -229,12 +229,13 @@ class DriverManager:
         browser of every live process. Opt-in: callers run this on cold start.
 
         Unlike :func:`bandcamp_recommender.browser.reap_orphans` this keeps
-        its old reach for chromedrivers from versions without profile
-        markers: an unmarked chromedriver whose spawner died (reparented to
-        init or a subreaper) goes too, with its Chrome. It no longer kills
-        other Chrome with PPID 1 (on macOS that included the user's own
-        Chrome launched from the Dock).
+        reaching what versions without profile markers leave behind: an
+        unmarked chromedriver whose spawner died, or a Chrome on a
+        chromedriver temp profile whose chromedriver died (reparented to init
+        or a subreaper), with their descendants. It no longer kills any other
+        Chrome with PPID 1 (on macOS that included the user's own Chrome
+        launched from the Dock).
 
         Returns the number of processes reaped. Safe no-op on Windows.
         """
-        return chrome_procs.reap_orphans(unmarked_chromedrivers=True)
+        return chrome_procs.reap_orphans(legacy=True)
