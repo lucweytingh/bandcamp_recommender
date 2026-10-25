@@ -391,7 +391,8 @@ class OrphanReaperTests(unittest.TestCase):
         from bandcamp_recommender.recommendations import driver_manager
 
         dm = driver_manager.DriverManager()
-        # Should not raise and should return an int.
+        # Should not raise and should return an int. Runs against conftest's
+        # /proc holding only this process: never reaps a real one.
         count = dm.reap_orphans()
         self.assertIsInstance(count, int)
         self.assertGreaterEqual(count, 0)
