@@ -185,8 +185,21 @@ their own.
   90 d. A repeated seed costs a couple of requests.
 - **Selenium is a fallback only**: one shared driver per process
   (`bandcamp_recommender.browser`), used when plain HTTP is challenged, at
-  most `BANDCAMP_SELENIUM_FALLBACK_BUDGET` (8) supporters per call. Call
-  `browser.close()` / `close_if_idle()` in long-running processes.
+  most `BANDCAMP_SELENIUM_FALLBACK_BUDGET` (8) supporters per call. It quits
+  itself after `BANDCAMP_BROWSER_IDLE_S` (120) seconds unused (0 = never);
+  `browser.close()` / `close_if_idle()` still quit it on demand.
+- **The library cleans up after its own Chrome**: every driver runs on its
+  own profile dir, named after the owning process, under
+  `BANDCAMP_BROWSER_PROFILE_DIR` (default
+  `~/snap/chromium/common/bandcamp_recommender/chrome-profiles` when snap
+  Chromium is installed, since it can't write hidden dirs in `$HOME`, else
+  `~/.cache/bandcamp_recommender/chrome-profiles`). Quitting a driver kills
+  whatever still runs on its profile and deletes it. `browser.reap_orphans()`
+  (also `DriverManager.reap_orphans()`) kills Chrome left by library
+  processes that died and deletes their profiles, and never touches a live
+  process's browser or a Chrome the library didn't start. It runs once per
+  process on the first driver start; long-running callers can also call it
+  at startup.
 - `collection_page_size` (default 10000 = everything) limits how many of each
   supporter's newest items are read; `candidate_filter` drops items before
   the candidate pool is cut. Audio features describe each item's featured
