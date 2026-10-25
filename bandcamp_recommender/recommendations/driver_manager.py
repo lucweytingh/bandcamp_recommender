@@ -3,9 +3,6 @@
 import logging
 import os
 import shutil
-import signal
-import subprocess
-import sys
 import time
 from queue import Queue
 from threading import Lock
@@ -16,6 +13,8 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium import webdriver
 from webdriver_manager.chrome import ChromeDriverManager
+
+from bandcamp_recommender import chrome_procs
 
 
 logger = logging.getLogger(__name__)
@@ -51,22 +50,40 @@ class DriverManager:
         self.driver: Optional[webdriver.Chrome] = None
         self._driver_pool: Optional[Queue] = None
         self._driver_pool_lock = Lock()
-        self._chrome_service: Optional[Service] = None
+        self._chromedriver: Optional[str] = None
 
-    def _get_chromedriver_service(self) -> Service:
-        """Get a ChromeDriver Service, preferring env var or system binary over webdriver_manager."""
-        # 1. Check CHROMEDRIVER env var
-        chromedriver_env = os.environ.get("CHROMEDRIVER", "")
-        if chromedriver_env and os.path.exists(chromedriver_env):
-            return Service(chromedriver_env)
+    def _chromedriver_path(self) -> str:
+        """Resolve chromedriver once per manager, preferring env var or system binary over webdriver_manager."""
+        if self._chromedriver is None:
+            # 1. CHROMEDRIVER env var, 2. chromedriver on PATH, 3. webdriver_manager auto-download
+            chromedriver_env = os.environ.get("CHROMEDRIVER", "")
+            if chromedriver_env and os.path.exists(chromedriver_env):
+                self._chromedriver = chromedriver_env
+            else:
+                self._chromedriver = shutil.which("chromedriver") or ChromeDriverManager().install()
+        return self._chromedriver
 
-        # 2. Check system chromedriver on PATH
-        system_chromedriver = shutil.which("chromedriver")
-        if system_chromedriver:
-            return Service(system_chromedriver)
-
-        # 3. Fall back to webdriver_manager auto-download
-        return Service(ChromeDriverManager().install())
+    def _launch(self) -> webdriver.Chrome:
+        """Start one Chrome on its own library-owned profile, with its own
+        chromedriver Service (a Service shared across drivers only stops the
+        last chromedriver it started: the rest leaked). See chrome_procs."""
+        chromedriver = self._chromedriver_path()
+        options = self.get_driver_options()
+        profile = chrome_procs.new_profile()
+        try:
+            options.add_argument(f"--user-data-dir={profile}")
+            service = Service(chromedriver, service_args=chrome_procs.chromedriver_args(profile))
+            driver = webdriver.Chrome(service=service, options=options)
+        except Exception:
+            chrome_procs.release_profile(profile)
+            raise
+        setattr(driver, chrome_procs.PROFILE_ATTR, profile)
+        try:
+            self._configure_driver(driver)
+        except Exception:
+            chrome_procs.quit_driver(driver)
+            raise
+        return driver
 
     def get_driver_options(self) -> Options:
         """Get optimized driver options (reusable).
@@ -126,10 +143,7 @@ class DriverManager:
 
         Only initialized when needed (for collection pages that require cookies).
         """
-        options = self.get_driver_options()
-        service = self._get_chromedriver_service()
-        self.driver = webdriver.Chrome(service=service, options=options)
-        self._configure_driver(self.driver)
+        self.driver = self._launch()
 
     def ensure_driver(self):
         """Ensure driver is initialized (lazy initialization)."""
@@ -150,21 +164,12 @@ class DriverManager:
             if self._driver_pool is None:
                 self._driver_pool = Queue(maxsize=pool_size)
 
-                # Pre-create ChromeDriver service (expensive operation, do once)
-                if self._chrome_service is None:
-                    self._chrome_service = self._get_chromedriver_service()
-
                 # Pre-create drivers (this can take a while, but we do it once)
-                options = self.get_driver_options()
                 for i in range(pool_size):
                     try:
                         if i > 0:
                             time.sleep(0.1)
-                        driver = webdriver.Chrome(
-                            service=self._chrome_service,
-                            options=options
-                        )
-                        self._configure_driver(driver)
+                        driver = self._launch()
                         self._driver_pool.put(driver)
                         if progress_callback:
                             progress_callback(f"Initialized driver {i+1}/{pool_size}...")
@@ -183,26 +188,12 @@ class DriverManager:
         Returns:
             New Chrome WebDriver instance
         """
-        options = self.get_driver_options()
-        if self._chrome_service is None:
-            self._chrome_service = self._get_chromedriver_service()
-        driver = webdriver.Chrome(
-            service=self._chrome_service,
-            options=options
-        )
-        self._configure_driver(driver)
-        return driver
+        return self._launch()
 
     def close(self):
         """Close the webdriver and cleanup driver pool."""
         if self.driver:
-            try:
-                self.driver.quit()
-            except WebDriverException:
-                logger.warning(
-                    "driver.quit() failed in close()",
-                    exc_info=os.environ.get("BANDCAMP_DEBUG") == "1",
-                )
+            chrome_procs.quit_driver(self.driver)
             self.driver = None
 
         # Clean up driver pool
@@ -210,9 +201,9 @@ class DriverManager:
             while not self._driver_pool.empty():
                 try:
                     driver = self._driver_pool.get_nowait()
-                    driver.quit()
                 except Exception:
-                    pass
+                    break
+                chrome_procs.quit_driver(driver)
             self._driver_pool = None
 
     @staticmethod
@@ -233,55 +224,22 @@ class DriverManager:
 
     @staticmethod
     def reap_orphans() -> int:
-        """SIGKILL local chromedriver / chrome / chromium processes whose
-        parent is init (PID 1) — i.e. orphans from a previous crashed run.
+        """SIGKILL chromedriver / Chrome left behind by library processes that
+        died (a previous crashed run), and delete their profiles. Spares the
+        browser of every live library process. Opt-in: callers run this on
+        cold start.
 
-        Returns the number of processes reaped. Safe no-op on Windows and
-        when ``ps`` is unavailable. Opt-in: callers run this on cold start.
+        This is :func:`bandcamp_recommender.chrome_procs.reap_orphans` with
+        ``legacy=True``: unlike the default, it keeps reaching what versions
+        without profile markers (before 0.8) leave behind: an unmarked
+        chromedriver whose spawner died, or a Chrome on a chromedriver temp
+        profile whose chromedriver died (reparented to init or a
+        subreaper), with their descendants. Caveat: that also kills a
+        chromedriver run as a service straight under init, systemd or
+        launchd (e.g. a Selenium Grid node). It no longer kills any other
+        Chrome with PPID 1 (on macOS that included the user's own Chrome
+        launched from the Dock).
+
+        Returns the number of processes reaped. Safe no-op on Windows.
         """
-        if sys.platform.startswith("win"):
-            return 0
-        ps = shutil.which("ps")
-        if not ps:
-            return 0
-        try:
-            result = subprocess.run(
-                [ps, "-axo", "pid=,ppid=,comm="],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            logger.warning("reap_orphans: ps invocation failed")
-            return 0
-        if result.returncode != 0:
-            return 0
-
-        targets = ("chromedriver", "chrome", "chromium", "Google Chrome")
-        reaped = 0
-        for line in result.stdout.splitlines():
-            parts = line.strip().split(None, 2)
-            if len(parts) < 3:
-                continue
-            try:
-                pid = int(parts[0])
-                ppid = int(parts[1])
-            except ValueError:
-                continue
-            comm = parts[2]
-            if ppid != 1:
-                continue
-            base = os.path.basename(comm).lower()
-            if not any(t.lower() in base for t in targets):
-                continue
-            try:
-                os.kill(pid, signal.SIGKILL)
-                reaped += 1
-            except ProcessLookupError:
-                continue
-            except PermissionError:
-                logger.warning("reap_orphans: no permission to kill pid %d", pid)
-                continue
-        if reaped:
-            logger.warning("reap_orphans: killed %d orphan chromium process(es)", reaped)
-        return reaped
+        return chrome_procs.reap_orphans(legacy=True)

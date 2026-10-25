@@ -10,8 +10,13 @@ process-wide driver:
 * created lazily on first use, serialized by a lock (acquire with a
   timeout, so a wedged page can't stall every thread forever);
 * recreated if it died;
-* quit by :func:`close` / :func:`close_if_idle` (long-running callers should
-  call one of them between units of work; :mod:`atexit` covers the rest).
+* quit once nobody used it for ``BANDCAMP_BROWSER_IDLE_S`` (default 120 s,
+  0 = never), by :func:`close` / :func:`close_if_idle`, or at exit (not
+  when a ``SupporterRecommender`` closes: the next caller may need it);
+* cleaned up after: each driver runs on its own library-owned profile, and
+  quitting it kills whatever still runs on that profile and deletes it.
+  :func:`bandcamp_recommender.chrome_procs.reap_orphans` does the same for
+  drivers of library processes that died.
 
 Lock order: the driver lock is always taken BEFORE a pacer slot, never while
 holding one.
@@ -28,16 +33,20 @@ import threading
 import time
 from typing import Any, Dict, Iterator, Optional
 
-from bandcamp_recommender import http
+from bandcamp_recommender import chrome_procs, http
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ACQUIRE_TIMEOUT_S = 180.0
+_DEFAULT_IDLE_S = 120.0
 _EXPECT_POLL_S = 0.25
 _EXPECT_WAIT_S = 6.0
 
 _lock = threading.Lock()
 _driver = None
+_last_used = 0.0
+_idle_wake = threading.Event()
+_idle_thread: Optional[threading.Thread] = None
 
 
 class BrowserUnavailable(http.FetchError):
@@ -51,37 +60,95 @@ def _acquire_timeout() -> float:
         return _DEFAULT_ACQUIRE_TIMEOUT_S
 
 
-def _quit(driver) -> None:
+def _idle_timeout() -> float:
     try:
-        driver.quit()
-    except Exception:
-        logger.warning("fallback browser quit failed", exc_info=os.environ.get("BANDCAMP_DEBUG") == "1")
+        return float(os.environ.get("BANDCAMP_BROWSER_IDLE_S", _DEFAULT_IDLE_S))
+    except ValueError:
+        return _DEFAULT_IDLE_S
+
+
+def _drop() -> None:
+    """Quit the shared driver and forget it. Caller holds ``_lock``."""
+    global _driver
+    chrome_procs.quit_driver(_driver)
+    _driver = None
+
+
+def _start_idle_watch() -> None:
+    """Caller holds ``_lock``. One watcher thread per process, started with
+    the first driver; it sleeps until a session ends when there's nothing
+    to watch. Restarted if it is gone (e.g. in a forked child, which
+    inherits the Thread object but not the thread)."""
+    global _idle_thread
+    if _idle_thread is None or not _idle_thread.is_alive():
+        _idle_thread = threading.Thread(target=_idle_watch, name="bandcamp-browser-idle", daemon=True)
+        _idle_thread.start()
+
+
+def _idle_watch() -> None:
+    """Quit the shared driver once nobody has used it for the idle timeout."""
+    timeout: Optional[float] = None
+    while True:
+        _idle_wake.wait(timeout)
+        # Cleared before reading the state, so a session ending from here on
+        # sets it again: no lost wake-up.
+        _idle_wake.clear()
+        try:
+            timeout = _idle_check()
+        except Exception:  # never let the watcher die silently
+            logger.warning(
+                "idle check of the fallback browser failed",
+                exc_info=os.environ.get("BANDCAMP_DEBUG") == "1",
+            )
+            timeout = None
+
+
+def _idle_check() -> Optional[float]:
+    """Quit the driver if it is idle; return how long to wait before the
+    next check (None: until a session ends)."""
+    idle_s = _idle_timeout()
+    if idle_s <= 0 or _driver is None:
+        return None
+    left = _last_used + idle_s - time.monotonic()
+    if left > 0:
+        return min(left, 86400.0)  # Event.wait overflows on huge values
+    # Quit now, or in use: the end of that session wakes us.
+    if not _lock.acquire(blocking=False):
+        return None
+    try:
+        if _driver is not None and time.monotonic() - _last_used >= idle_s:
+            _drop()
+            logger.info("closed the fallback browser after %.0f s idle", idle_s)
+    finally:
+        _lock.release()
+    return None
 
 
 @contextlib.contextmanager
 def session() -> Iterator[Any]:
     """Exclusive use of the shared driver for a sequence of steps that must
     stay on one page (e.g. load a fan page, then call the API from it)."""
-    global _driver
+    global _driver, _last_used
     if not _lock.acquire(timeout=_acquire_timeout()):
         raise BrowserUnavailable("fallback browser busy")
     try:
         from bandcamp_recommender.recommendations.driver_manager import DriverManager
 
         if _driver is not None and not DriverManager.is_driver_alive(_driver):
-            _quit(_driver)
-            _driver = None
+            _drop()
         if _driver is None:
             try:
                 _driver = DriverManager().create_driver()
             except Exception as e:
                 raise BrowserUnavailable(f"could not start the fallback browser: {e}") from e
+            _start_idle_watch()
         try:
             yield _driver
         finally:
             if not DriverManager.is_driver_alive(_driver):
-                _quit(_driver)
-                _driver = None
+                _drop()
+            _last_used = time.monotonic()
+            _idle_wake.set()
     finally:
         _lock.release()
 
@@ -154,24 +221,20 @@ def fetch_html(url: str, expect: Optional[str]) -> str:
 
 def close() -> None:
     """Quit the shared driver now (waits for an in-flight user)."""
-    global _driver
     with _lock:
         if _driver is not None:
-            _quit(_driver)
-            _driver = None
+            _drop()
 
 
 def close_if_idle() -> bool:
     """Quit the driver unless someone is using it right now. Never blocks;
     True if a driver was quit."""
-    global _driver
     if not _lock.acquire(blocking=False):
         return False
     try:
         if _driver is None:
             return False
-        _quit(_driver)
-        _driver = None
+        _drop()
         return True
     finally:
         _lock.release()

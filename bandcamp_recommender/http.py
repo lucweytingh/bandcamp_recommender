@@ -35,14 +35,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import ssl
 import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
+import certifi
 import requests
 import urllib3
+
+from bandcamp_recommender import chrome_procs
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +201,66 @@ _pacer: Optional[Pacer] = None
 _init_lock = threading.Lock()
 
 
+class _StdlibTLSAdapter(requests.adapters.HTTPAdapter):
+    """HTTPAdapter whose TLS handshake is Python's standard one.
+
+    urllib3 builds its own SSL context (create_urllib3_context), and its
+    ClientHello is distinctive enough that Bandcamp's CDN answers it with the
+    JS bot challenge from residential IPs (measured 2026-10-25 from a home
+    connection: urllib3's context challenged with and without ALPN, the
+    stdlib's ssl.create_default_context passed; datacenter IPs passed both).
+    Certificate and hostname verification are unchanged: the stdlib context
+    requires both, loaded with certifi's CA bundle like requests' default.
+
+    The context is chosen per request in build_connection_pool_key_attributes,
+    the hook requests (>= 2.32.3, the declared floor) documents for a custom
+    SSLContext; per-request pool kwargs win over a pool-manager default, so
+    the context is set there, not only on the manager. urllib3 mutates the
+    context it is handed
+    (verify_mode, CA locations, client cert), so one context is shared only
+    by requests with the same trust settings: ``verify=True`` uses certifi,
+    ``verify="<bundle>"`` (or REQUESTS_CA_BUNDLE) gets its own context
+    trusting exactly that bundle, and ``verify=False`` or a client ``cert``
+    fall back to urllib3's fresh per-connection context with requests' usual
+    semantics (and urllib3's handshake)."""
+
+    def _stdlib_context(self, verify=True):
+        """The shared stdlib context for ``verify`` (True or a CA path)."""
+        contexts = self.__dict__.setdefault("_tls_contexts", {})
+        key = None if verify is True else verify
+        ctx = contexts.get(key)
+        if ctx is None:
+            if key is None:
+                ctx = ssl.create_default_context(cafile=certifi.where())
+            elif os.path.isdir(key):
+                ctx = ssl.create_default_context(capath=key)
+            else:
+                ctx = ssl.create_default_context(cafile=key)
+            ctx = contexts.setdefault(key, ctx)
+        return ctx
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs.setdefault("ssl_context", self._stdlib_context())
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs.setdefault("ssl_context", self._stdlib_context())
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        host_params, pool_kwargs = super().build_connection_pool_key_attributes(
+            request, verify, cert
+        )
+        if cert is None and (verify is True or isinstance(verify, str)):
+            pool_kwargs["ssl_context"] = self._stdlib_context(verify)
+        else:
+            # None drops the pool-manager default (urllib3 _merge_pool_kwargs):
+            # sharing a CERT_REQUIRED context with a CERT_NONE request raises,
+            # and a client cert would stay loaded for every later request.
+            pool_kwargs["ssl_context"] = None
+        return host_params, pool_kwargs
+
+
 def _state():
     global _session, _pacer
     with _init_lock:
@@ -208,7 +272,7 @@ def _state():
             # (303 -> 301 -> ...); the default of 30 turned each into a
             # 30-request burst against a ~1 req/s limit.
             session.max_redirects = 5
-            adapter = requests.adapters.HTTPAdapter(
+            adapter = _StdlibTLSAdapter(
                 pool_connections=16, pool_maxsize=max(8, concurrency * 2)
             )
             session.mount("https://", adapter)
@@ -222,7 +286,11 @@ def _state():
                 concurrency,
             )
             _session = session
-        return _session, _pacer
+        state = _session, _pacer
+    # The library's first Bandcamp request in this process cleans up the
+    # Chrome a dead predecessor left behind (a no-op flag check afterwards).
+    chrome_procs.sweep_once()
+    return state
 
 
 def pacer() -> Pacer:
@@ -533,10 +601,11 @@ def get_page(url: str, expect: Optional[str] = None, timeout: float = 20,
         try:
             body = get_html(url, expect=expect, timeout=timeout)
             curl_breaker.record_outcome(success=True)
-        except Challenged as e:
+        except Challenged:
             curl_breaker.record_outcome(success=False)
             if not fallback:
-                _remember_failure(url, e)
+                # Not remembered: the page itself may be fine through the
+                # browser, which a caller with fallback=True would get.
                 raise
             logger.warning("bot challenge on %s; using the fallback browser", url)
         except FetchError as e:

@@ -1,6 +1,5 @@
 """Main recommendation engine for Bandcamp based on supporter purchases."""
 
-import json
 import logging
 import os
 import random
@@ -8,7 +7,7 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from threading import Lock
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 logger = logging.getLogger(__name__)
@@ -58,9 +57,6 @@ _DEFAULT_BPM_RERANK_ALPHA = 0.05
 # whale bias pass a smaller page (the feed is newest-first).
 _DEFAULT_COLLECTION_PAGE_SIZE = 10000
 _DEFAULT_SELENIUM_FALLBACK_BUDGET = 8
-# Full collections take Bandcamp ~3 s per 1000 items to serve (measured:
-# 2789 items = 8.7 s, 7 MB); the 10000-item maximum is ~30 s, more under load.
-_COLLECTION_API_TIMEOUT_S = 120
 # Items on a fan page's first page (what ``first_page_only`` reads).
 _FIRST_PAGE_SIZE = 20
 
@@ -119,9 +115,11 @@ def _bpm_rerank_score(
     return supporters_count - penalty
 
 
-from bs4 import BeautifulSoup
-
+from bandcamp_recommender import fans
+from bandcamp_recommender.artists import artist_tokens
+from bandcamp_recommender.items import normalize_item_url
 from bandcamp_recommender.recommendations.scraper import (
+    extract_artist,
     extract_item_id,
     extract_supporters,
     extract_tags,
@@ -132,13 +130,32 @@ from bandcamp_recommender.recommendations.mood_tags import tag_mood_score
 from bandcamp_recommender.recommendations.tags import calculate_tag_similarity, normalize_tag
 
 
-def _normalize_item_url(url: str) -> str:
-    """Lowercase + strip query/fragment/trailing slash so two spellings of the
-    same Bandcamp item URL compare equal.
-    """
-    if not url:
-        return ""
-    return url.split("?", 1)[0].split("#", 1)[0].rstrip("/").lower()
+def _cap_per_artist(
+    ranked: List[tuple],
+    tokens_of: Callable[[str], set],
+    max_per_artist: int,
+    limit: int,
+) -> Tuple[List[tuple], int]:
+    """The first ``limit`` of ``ranked`` (``(item_id, count)``, best first)
+    keeping at most ``max_per_artist`` releases per artist token, and how many
+    releases the cap skipped on the way. A release credited to several
+    artists counts for each of them and is skipped once any of them is at the
+    cap. A placeholder credit ("Various Artists", "Unknown Artist", "") counts
+    as its release page (see artist_tokens), so one label's placeholder
+    releases share a cap; a release with no tokens at all is never capped."""
+    kept: List[tuple] = []
+    skipped = 0
+    per_artist: Counter = Counter()
+    for iid, cnt in ranked:
+        if len(kept) >= limit:
+            break
+        tokens = tokens_of(iid)
+        if any(per_artist[t] >= max_per_artist for t in tokens):
+            skipped += 1
+            continue
+        per_artist.update(tokens)
+        kept.append((iid, cnt))
+    return kept, skipped
 
 
 class SupporterRecommender:
@@ -158,6 +175,9 @@ class SupporterRecommender:
         self._selenium_budget = _resolve_selenium_fallback_budget()
         # username -> fan_id from the seed page (one-call collection reads).
         self._fan_ids: Dict[str, int] = {}
+        # What the last get_recommendations pool steps did (seed artist, drop
+        # counts); get_similar_recommendations reports it in last_call_stats.
+        self._pool_stats: Dict[str, Any] = {}
 
     def get_recommendations(
         self,
@@ -178,6 +198,8 @@ class SupporterRecommender:
         event_callback: Optional[Callable[[dict], None]] = None,
         collection_page_size: int = _DEFAULT_COLLECTION_PAGE_SIZE,
         candidate_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        exclude_seed_artist: bool = False,
+        max_per_artist: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Get recommendations based on supporter purchases.
 
@@ -242,10 +264,32 @@ class SupporterRecommender:
                 ranked candidates BEFORE the result is cut to
                 ``max_recommendations``, so the caller's exclusions (e.g.
                 recently played) don't waste result slots or downstream work.
+                It sees every candidate ``exclude_seed_artist`` keeps,
+                including ones ``max_per_artist`` then skips.
+            exclude_seed_artist: If True, drop candidates by the seed's own
+                artist (credits whose :func:`~bandcamp_recommender.artists.artist_tokens`
+                intersect the seed page's artist, so collabs count) before
+                ``candidate_filter`` and the cut. A seed's supporters mostly
+                own its artist's other releases, which can otherwise fill the
+                result. A placeholder seed credit ("Various Artists",
+                "Unknown Artist") or a seed page without a readable artist
+                (logged as a warning) is identified by the seed's page host,
+                so only placeholder or blank credits from that same page are
+                dropped (one label's comps are one act); other pages' comps
+                stay. Default False (unchanged behaviour).
+            max_per_artist: If set (>= 1), keep at most this many releases
+                per artist token, best-ranked first, after ``candidate_filter``
+                and before the cut, so a few artists' back catalogues can't
+                fill the result. A collab counts for each of its artists;
+                placeholder credits are capped per release page (one label's
+                comps together, different labels' apart). Default None (no
+                cap).
 
         Returns:
             List of recommendation dictionaries with item_title, band_name, item_url, supporters_count
         """
+        if max_per_artist is not None and max_per_artist < 1:
+            raise ValueError(f"max_per_artist must be >= 1 or None, got {max_per_artist!r}")
         self._begin_call(collection_page_size)
         # Get supporters of the wishlist item
         if progress_callback:
@@ -273,11 +317,20 @@ class SupporterRecommender:
         if progress_callback:
             progress_callback("Extracting item ID...", 0, 0, 0)
         original_item_id = extract_item_id(wishlist_item_url)
+        # Read now, moments after extract_supporters fetched the seed page, so
+        # it's a page-cache hit (after a long supporter phase it may not be).
+        if exclude_seed_artist:
+            seed_artist = extract_artist(wishlist_item_url)
+            if not seed_artist:
+                logger.warning("exclude_seed_artist: no artist on the seed page %s, "
+                               "excluding only placeholder or blank credits from "
+                               "that page", wishlist_item_url)
+            self._pool_stats["seed_artist"] = seed_artist
         # URL-normalized seed key, computed once. Used to drop the seed from
         # the per-supporter supporter_done emit (the animation's cloud), the
         # same way it's dropped from the ranked results below. Cosmetic only —
         # ranking/counting still happen on the full purchase set.
-        seed_key = _normalize_item_url(wishlist_item_url)
+        seed_key = normalize_item_url(wishlist_item_url)
 
         # Get purchases from all supporters (with metadata) - parallel processing
         all_purchases = []
@@ -362,7 +415,7 @@ class SupporterRecommender:
                                 # searched track never appears as a live graph
                                 # node. The ranked results already drop it.
                                 if iid == original_item_id or (
-                                    _normalize_item_url(info.get("item_url", "")) == seed_key
+                                    normalize_item_url(info.get("item_url", "")) == seed_key
                                 ):
                                     continue
                                 items_meta.append({
@@ -425,20 +478,43 @@ class SupporterRecommender:
         # Done before the slice so the result count stays at max_recommendations.
         sorted_items = [
             (iid, cnt) for (iid, cnt) in sorted_items
-            if _normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
+            if normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
         ]
 
+        def tokens_of(iid: str) -> set:
+            info = self.item_cache.get(iid) or {}
+            return artist_tokens(info.get("band_name") or "", info.get("item_url"))
+
+        # Before candidate_filter, so the caller's filter (which may keep
+        # state) never sees the seed's own artist. It does see candidates
+        # max_per_artist skips after it.
+        if exclude_seed_artist:
+            seed_tokens = artist_tokens(seed_artist, wishlist_item_url)
+            before = len(sorted_items)
+            if seed_tokens:
+                sorted_items = [
+                    (iid, cnt) for (iid, cnt) in sorted_items
+                    if not tokens_of(iid) & seed_tokens
+                ]
+            self._pool_stats["seed_artist_dropped"] = before - len(sorted_items)
+
         if candidate_filter is not None:
+            before = len(sorted_items)
             sorted_items = [
                 (iid, cnt) for (iid, cnt) in sorted_items
                 if candidate_filter(self.item_cache.get(iid) or {})
             ]
+            self._pool_stats["filtered"] = before - len(sorted_items)
 
-        if bpm_match:
-            expanded_pool_size = max(50, max_recommendations * 3)
-            top_items = sorted_items[:expanded_pool_size]
+        pool_size = max(50, max_recommendations * 3) if bpm_match else max_recommendations
+        if max_per_artist is None:
+            top_items = sorted_items[:pool_size]
         else:
-            top_items = sorted_items[:max_recommendations]
+            # After the caller's filter, so a release it rejects doesn't use
+            # up its artist's slots.
+            top_items, self._pool_stats["artist_capped"] = _cap_per_artist(
+                sorted_items, tokens_of, max_per_artist, pool_size
+            )
 
         if event_callback:
             top_meta = []
@@ -616,6 +692,8 @@ class SupporterRecommender:
         progress_callback: Optional[Callable] = None,
         collection_page_size: int = _DEFAULT_COLLECTION_PAGE_SIZE,
         candidate_filter: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        exclude_seed_artist: bool = False,
+        max_per_artist: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Get recommendations ordered by feature-vector similarity to a source.
 
@@ -662,9 +740,13 @@ class SupporterRecommender:
         back to the ``BANDCAMP_DIVERSIFY`` env var. See
         :mod:`bandcamp_recommender.recommendations.diversity`.
 
-        ``collection_page_size`` and ``candidate_filter`` are passed to
-        :meth:`get_recommendations` (the filter runs before the pool is cut,
-        so every hydrated + decoded candidate is one the caller can use).
+        ``collection_page_size``, ``candidate_filter``, ``exclude_seed_artist``
+        and ``max_per_artist`` are passed to :meth:`get_recommendations`; all
+        apply before the ``candidate_pool_size`` cut, so every hydrated +
+        decoded candidate is one the caller can use. ``last_call_stats["pool"]``
+        reports what they did: ``seed_artist`` (None if unreadable) and
+        ``seed_artist_dropped``, ``filtered``, ``artist_capped`` (releases
+        skipped while filling the pool), each only when its option is set.
 
         Audio features describe each item's featured preview track (the one
         ``audio_url`` points at) and are cached on disk per (item, track).
@@ -692,6 +774,8 @@ class SupporterRecommender:
             progress_callback=progress_callback,
             collection_page_size=collection_page_size,
             candidate_filter=candidate_filter,
+            exclude_seed_artist=exclude_seed_artist,
+            max_per_artist=max_per_artist,
         )
         t_pool = time.monotonic() - t0
 
@@ -699,10 +783,10 @@ class SupporterRecommender:
         # extract_item_id can't read the source's tralbum_id (curl 403,
         # page structure shift) the seed slips through and ranks #1 with
         # near-zero feature distance to itself.
-        source_key = _normalize_item_url(source_url)
+        source_key = normalize_item_url(source_url)
         candidates = [
             c for c in candidates
-            if _normalize_item_url(c.get("item_url", "")) != source_key
+            if normalize_item_url(c.get("item_url", "")) != source_key
         ]
 
         if not candidates:
@@ -790,6 +874,7 @@ class SupporterRecommender:
             "candidates": len(candidates),
             "with_audio": with_audio,
             "http": http.diff(counters_before),
+            "pool": dict(self._pool_stats),
         }
         if progress_callback:
             progress_callback(
@@ -870,18 +955,14 @@ class SupporterRecommender:
     # disk (bandcamp_recommender.cache), so recurring seeds and overlapping
     # scenes stop re-downloading the same collections.
 
-    _API_URLS = {
-        "collection_data": "https://bandcamp.com/api/fancollection/1/collection_items",
-        "wishlist_data": "https://bandcamp.com/api/fancollection/1/wishlist_items",
-    }
-    # Hidden/removed items make the API return slightly fewer ids than the
-    # advertised count; a read much shorter than expected is partial.
-    _COMPLETE_FRACTION = 0.9
+    _LIST_NAMES = {"collection_data": "collection", "wishlist_data": "wishlist"}
+    _COMPLETE_FRACTION = fans.COMPLETE_FRACTION
 
     def _begin_call(self, collection_page_size: int = _DEFAULT_COLLECTION_PAGE_SIZE) -> None:
         """Per-call knobs + fallback budget (entry points call this first)."""
         self._collection_page_size = max(1, int(collection_page_size))
         self._fan_ids = {}
+        self._pool_stats = {}
         with self._budget_lock:
             self._selenium_budget = _resolve_selenium_fallback_budget()
 
@@ -971,16 +1052,9 @@ class SupporterRecommender:
         ``(ids, True)``, or None when the API answers without an item list
         (the page path then decides private vs. broken). Raises
         ``http.FetchError`` subclasses like the page path."""
-        from bandcamp_recommender import http
-
         count = _FIRST_PAGE_SIZE if first_page_only else self._collection_page_size
-        payload = {
-            "fan_id": self._fan_ids[username],
-            "older_than_token": f"{int(time.time()) + 86400}::a::",
-            "count": count,
-        }
-        data = http.post_json(
-            self._API_URLS[data_key], payload, timeout=_COLLECTION_API_TIMEOUT_S,
+        data = fans.read_list_page(
+            self._LIST_NAMES[data_key], self._fan_ids[username], fans.newest_first_token(), count,
             referer=f"https://bandcamp.com/{username}",
         )
         items = (data or {}).get("items") if isinstance(data, dict) else None
@@ -1007,7 +1081,7 @@ class SupporterRecommender:
         private, deleted or empty fan page."""
         from bandcamp_recommender import browser, http
 
-        url = f"https://bandcamp.com/{username}/wishlist"
+        url = fans.fan_page_url(username)
         try:
             if driver is None:
                 html = http.get_html(url, timeout=20)
@@ -1017,13 +1091,8 @@ class SupporterRecommender:
             if e.status in (404, 410):
                 raise _NoFanData(username) from e
             raise
-        soup = BeautifulSoup(html, features="html.parser")
-        pagedata_elem = soup.find(id="pagedata")
-        if not pagedata_elem:
-            raise _NoFanData(username)
-        try:
-            pagedata = json.loads(pagedata_elem.get("data-blob", "{}"))
-        except ValueError:
+        pagedata = fans.parse_pagedata(html)
+        if pagedata is None:
             raise _NoFanData(username)
         parsed = self._parse_collection_pagedata(pagedata, data_key)
         if parsed is None:
@@ -1036,17 +1105,11 @@ class SupporterRecommender:
             return ids, True
         page_size = self._collection_page_size
         if parsed["last_token"] and parsed["fan_id"] and first_len < item_count:
-            payload = {
-                "fan_id": parsed["fan_id"],
-                "older_than_token": parsed["last_token"],
-                "count": page_size,
-            }
-            api_url = self._API_URLS[data_key]
             try:
-                if driver is None:
-                    data = http.post_json(api_url, payload, timeout=_COLLECTION_API_TIMEOUT_S, referer=url)
-                else:
-                    data = browser.post_json(driver, api_url, payload, timeout=_COLLECTION_API_TIMEOUT_S)
+                data = fans.read_list_page(
+                    self._LIST_NAMES[data_key], parsed["fan_id"], parsed["last_token"], page_size,
+                    referer=url, driver=driver,
+                )
             except http.Challenged:
                 raise
             except http.FetchError as e:
@@ -1446,7 +1509,7 @@ class SupporterRecommender:
         # id-based pop / url backstop on the counts still happens below
         # (after the loop); this is purely cosmetic for the emit.
         seed_id = extract_item_id(item_url)
-        seed_key = _normalize_item_url(item_url)
+        seed_key = normalize_item_url(item_url)
 
         # Get items from selected supporters
         all_items = []
@@ -1530,7 +1593,7 @@ class SupporterRecommender:
                                     # Drop the seed from the emitted cloud
                                     # nodes too — by id and by normalized url.
                                     if iid == seed_id or (
-                                        _normalize_item_url(info.get("item_url", "")) == seed_key
+                                        normalize_item_url(info.get("item_url", "")) == seed_key
                                     ):
                                         continue
                                     items_meta.append({
@@ -1602,7 +1665,7 @@ class SupporterRecommender:
         # (seed_key computed once before the fetch loop).
         item_counts = Counter({
             iid: cnt for iid, cnt in item_counts.items()
-            if _normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
+            if normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
         })
 
         # Filter by min_overlap if specified, with fallback if enabled
@@ -1743,11 +1806,11 @@ class SupporterRecommender:
         return results
 
     def close(self):
-        """Release the shared fallback browser if nobody is using it (it is
-        process-wide now; see bandcamp_recommender.browser)."""
-        from bandcamp_recommender import browser
-
-        browser.close_if_idle()
+        """Nothing to release: the fallback browser is process-wide and quits
+        itself once unused for ``BANDCAMP_BROWSER_IDLE_S`` (see
+        bandcamp_recommender.browser; ``browser.close()`` quits it now).
+        Quitting it here made the caller's next page read, often moments
+        later, pay a fresh Chrome start."""
 
     def __enter__(self):
         """Context manager entry."""

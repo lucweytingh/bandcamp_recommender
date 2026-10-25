@@ -242,5 +242,86 @@ class PacerTests(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - t0, 0.45)
 
 
+
+
+class StdlibTLSTests(unittest.TestCase):
+    """urllib3's own SSL context is challenged by Bandcamp's CDN from
+    residential IPs; the session must use the stdlib handshake while keeping
+    full certificate + hostname verification."""
+
+    def setUp(self):
+        bchttp.reset()
+        self.addCleanup(bchttp.reset)
+
+    def test_https_adapter_uses_a_verifying_stdlib_context(self):
+        import ssl
+
+        session, _ = bchttp._state()
+        adapter = session.get_adapter("https://bandcamp.com/")
+        self.assertIsInstance(adapter, bchttp._StdlibTLSAdapter)
+        ctx = adapter.poolmanager.connection_pool_kw.get("ssl_context")
+        self.assertIsInstance(ctx, ssl.SSLContext)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+        # The urllib3 context disables session tickets; the stdlib one doesn't.
+        self.assertFalse(ctx.options & ssl.OP_NO_TICKET)
+
+    def _conn(self, verify=True, cert=None, url="https://bandcamp.com/"):
+        import requests
+
+        session, _ = bchttp._state()
+        adapter = session.get_adapter(url)
+        prepared = requests.Request("GET", url).prepare()
+        pool = adapter.get_connection_with_tls_context(prepared, verify, cert=cert)
+        return adapter, pool
+
+    def test_each_request_uses_the_stdlib_context(self):
+        # What requests actually connects with, not just the manager default.
+        adapter, pool = self._conn()
+        self.assertIs(pool.conn_kw.get("ssl_context"), adapter._stdlib_context())
+
+    def test_a_per_request_context_from_requests_does_not_win(self):
+        # Per-request pool kwargs override the manager default: whatever the
+        # base adapter puts there, ours must be what the connection uses.
+        import ssl
+        from unittest import mock
+
+        import requests
+
+        foreign = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        base = requests.adapters.HTTPAdapter.build_connection_pool_key_attributes
+
+        def injecting(self, request, verify, cert=None):
+            host, kw = base(self, request, verify, cert)
+            kw["ssl_context"] = foreign
+            return host, kw
+
+        with mock.patch.object(
+            requests.adapters.HTTPAdapter, "build_connection_pool_key_attributes", injecting
+        ):
+            adapter, pool = self._conn()
+        self.assertIs(pool.conn_kw.get("ssl_context"), adapter._stdlib_context())
+
+    def test_verify_false_and_client_certs_do_not_share_the_context(self):
+        # urllib3 sets verify_mode / loads the cert chain on the context it is
+        # handed: on the shared one that raises (CERT_NONE with
+        # check_hostname) or leaks into every later request.
+        adapter, pool = self._conn(verify=False)
+        self.assertIsNone(pool.conn_kw.get("ssl_context"))
+        adapter, pool = self._conn(cert="/nonexistent/client.pem")
+        self.assertIsNone(pool.conn_kw.get("ssl_context"))
+        self.assertEqual(adapter._stdlib_context().verify_mode, __import__("ssl").CERT_REQUIRED)
+
+    def test_a_custom_ca_bundle_gets_its_own_context(self):
+        import certifi
+
+        adapter, pool = self._conn(verify=certifi.where())
+        ctx = pool.conn_kw.get("ssl_context")
+        self.assertIsNotNone(ctx)
+        self.assertIsNot(ctx, adapter._stdlib_context())
+        self.assertIs(ctx, adapter._stdlib_context(certifi.where()))
+
+
+
 if __name__ == "__main__":
     unittest.main()

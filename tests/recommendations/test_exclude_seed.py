@@ -15,11 +15,9 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+from bandcamp_recommender.items import normalize_item_url
 from bandcamp_recommender.recommendations import supporter_recommender as sr
-from bandcamp_recommender.recommendations.supporter_recommender import (
-    SupporterRecommender,
-    _normalize_item_url,
-)
+from bandcamp_recommender.recommendations.supporter_recommender import SupporterRecommender
 
 
 SEED = "https://artist.bandcamp.com/album/Seed-Album"
@@ -66,7 +64,7 @@ class ExcludeSeedTests(unittest.TestCase):
 
     def test_seed_excluded_when_extract_item_id_is_none(self):
         rec = SupporterRecommender()
-        seed_key = _normalize_item_url(SEED)
+        seed_key = normalize_item_url(SEED)
         with patch.object(sr, "extract_supporters", return_value=["alice", "bob"]), \
              patch.object(sr, "extract_item_id", return_value=None), \
              patch.object(
@@ -86,13 +84,13 @@ class ExcludeSeedTests(unittest.TestCase):
         self.assertTrue(recs, "expected some non-seed recommendations")
         for r in recs:
             self.assertNotEqual(
-                _normalize_item_url(r.get("item_url", "")),
+                normalize_item_url(r.get("item_url", "")),
                 seed_key,
                 f"seed leaked into recommendations: {r.get('item_url')!r}",
             )
         # The two genuine items survive.
         self.assertEqual(
-            {_normalize_item_url(r["item_url"]) for r in recs},
+            {normalize_item_url(r["item_url"]) for r in recs},
             {
                 "https://artist.bandcamp.com/album/other-one",
                 "https://artist.bandcamp.com/album/other-two",
@@ -189,7 +187,7 @@ class ExcludeSeedTests(unittest.TestCase):
 
     def test_random_items_excludes_seed_when_extract_item_id_is_none(self):
         rec = SupporterRecommender()
-        seed_key = _normalize_item_url(SEED)
+        seed_key = normalize_item_url(SEED)
         with patch.object(sr, "extract_supporters", return_value=["alice", "bob"]), \
              patch.object(sr, "extract_item_id", return_value=None), \
              patch.object(
@@ -204,7 +202,7 @@ class ExcludeSeedTests(unittest.TestCase):
         self.assertTrue(results, "expected some non-seed random items")
         for r in results:
             self.assertNotEqual(
-                _normalize_item_url(r.get("item_url", "")),
+                normalize_item_url(r.get("item_url", "")),
                 seed_key,
                 f"seed leaked into random items: {r.get('item_url')!r}",
             )

@@ -25,6 +25,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+from bandcamp_recommender.artists import artist_tokens
 from bandcamp_recommender.features import distance as _feature_distance
 from bandcamp_recommender.recommendations.intensity import (
     score_intensity_from_features,
@@ -54,6 +55,7 @@ class Track:
     genre: str = ""
     distance_to_seed: Optional[float] = None
     id: str = ""
+    url: str = ""
 
 
 @dataclass
@@ -221,8 +223,12 @@ def select_stratified(pool: Sequence[Track], seed: Track, k: int) -> List[Track]
 
     Groups the pool by primary bucket (genre), ranks buckets by their most
     relevant member, then takes one track per bucket (most relevant first),
-    never repeating an artist. Falls back to filling from leftovers if there are
-    fewer buckets than k.
+    never repeating an artist. Artists are compared by
+    :func:`~bandcamp_recommender.artists.artist_tokens`, so "Siu Mata & Amor
+    Satyr" blocks a later "SIU MATA". Placeholder credits ("Various
+    Artists", "Unknown Artist") are told apart by release page: one label's
+    comps block each other, different labels' comps do not. Falls back to
+    filling from leftovers if there are fewer buckets than k.
     """
     if not pool:
         return []
@@ -248,11 +254,11 @@ def select_stratified(pool: Sequence[Track], seed: Track, k: int) -> List[Track]
             while i < len(b):
                 t = b[i]
                 i += 1
-                if t.artist and t.artist in used_artists:
+                tokens = artist_tokens(t.artist, t.url or None)
+                if tokens & used_artists:
                     continue
                 selected.append(t)
-                if t.artist:
-                    used_artists.add(t.artist)
+                used_artists |= tokens
                 progressed = True
                 break
             bucket_cursors[id(b)] = i
@@ -464,6 +470,7 @@ def diversify_items(
         Track(
             features=it.get("features") or {},
             artist=it.get("band_name", ""),
+            url=it.get("item_url", ""),
             distance_to_seed=it.get("distance"),
             id=str(i),
         )

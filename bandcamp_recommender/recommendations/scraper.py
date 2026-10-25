@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 from bs4 import BeautifulSoup
 
 from .. import http
+from ..items import ITEM_PAGE_MARKER, feature_tags, parse_item_html
 
 
 logger = logging.getLogger(__name__)
@@ -23,11 +24,6 @@ def _debug_exc_info() -> bool:
 # Default curl timeout, raised 15→20 to accommodate slow Bandcamp custom
 # domains (e.g. craigieknowes.com routinely takes 15–20s).
 _DEFAULT_CURL_TIMEOUT = 20
-
-
-# Every Bandcamp item page carries this attribute; a 200 without it is not
-# the page (bot challenge, error shell, parked domain).
-ITEM_PAGE_MARKER = "data-tralbum"
 
 
 def clear_page_cache() -> None:
@@ -283,31 +279,30 @@ def extract_item_id(item_url: str) -> Optional[str]:
     return None
 
 
+def extract_artist(item_url: str) -> Optional[str]:
+    """The release's artist credit, in the form the fan-collection API
+    reports as ``band_name``: the ``artist`` of
+    :func:`bandcamp_recommender.items.parse_item_html` (``data-tralbum``'s
+    ``artist`` first). ``data-band``'s ``name`` is the page's account, which
+    on a label's page is the label (measured:
+    dbh-music.bandcamp.com/track/mothafucka is by "Paul Johnson", account
+    "dbh-music"), so it is only the last fallback. None when the page can't
+    be read."""
+    html = fetch_page_html(item_url, timeout=_DEFAULT_CURL_TIMEOUT)
+    if not html:
+        return None
+    return parse_item_html(html, item_url)["artist"]
+
+
 def extract_tags(item_url: str) -> List[str]:
-    """Extract tags from a Bandcamp item page.
-    
-    Tags are extracted from DOM elements with class 'tag'.
-    
-    Args:
-        item_url: URL of the Bandcamp item
-        
-    Returns:
-        List of tag strings, or empty list if not found
+    """Every tag on a Bandcamp item page, in page order, the artist's
+    location tag (last) included: the input the tag features expect (see
+    :func:`bandcamp_recommender.items.feature_tags`). ``items.item_info``
+    reports the genre tags and the location separately.
+
+    Returns an empty list when the page can't be read or has no tags.
     """
     html = fetch_page_html(item_url, timeout=_DEFAULT_CURL_TIMEOUT)
     if not html:
         return []
-    
-    try:
-        soup = BeautifulSoup(html, features="html.parser")
-        
-        # Extract tags from DOM elements with class 'tag'
-        tag_links = soup.find_all("a", class_=re.compile("tag"))
-        tags = [tag.get_text(strip=True) for tag in tag_links if tag.get_text(strip=True)]
-        
-        return tags
-    except Exception:
-        logger.warning("error extracting tags from %s", item_url, exc_info=_debug_exc_info())
-        return []
-
-
+    return feature_tags(parse_item_html(html, item_url))

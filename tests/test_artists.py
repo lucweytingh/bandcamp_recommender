@@ -1,0 +1,131 @@
+"""Artist identity (bandcamp_recommender.artists.artist_tokens).
+
+Ported from boemketel_radio's tests/test_utils.py, where this function lived
+before it moved into the library."""
+
+from bandcamp_recommender.artists import artist_tokens
+
+
+class TestArtistTokens:
+    def test_single_artist(self):
+        assert artist_tokens("Siu Mata") == {"siu mata"}
+        assert artist_tokens("modest by default | Mabisyo") == {"modest by default", "mabisyo"}
+
+    def test_empty(self):
+        assert artist_tokens("") == set()
+        assert artist_tokens(None) == set()
+        assert artist_tokens("   ") == set()
+
+    def test_collaboration_variants_share_token(self):
+        # The whole point: these forms must all yield "siu mata" so artist
+        # dedup recognizes them as the same act.
+        for s in ("Siu Mata & Amor Satyr", "Amor Satyr & Siu Mata",
+                  "Siu Mata, Amor Satyr", "Siu Mata feat. Amor Satyr",
+                  "Siu Mata x Amor Satyr", "Siu Mata / Amor Satyr",
+                  "Siu Mata + Amor Satyr", "Siu Mata vs. Amor Satyr",
+                  "Siu Mata ft Amor Satyr", "Siu Mata | Amor Satyr",
+                  "Siu Mata × Amor Satyr", "Siu Mata×Amor Satyr",
+                  "Siu Mata featuring Amor Satyr", "Siu Mata (feat. Amor Satyr)",
+                  "Siu Mata (Ft. Amor Satyr)"):
+            assert artist_tokens(s) == {"siu mata", "amor satyr"}, s
+
+    def test_case_insensitive(self):
+        assert artist_tokens("SIU MATA") == artist_tokens("Siu Mata")
+        assert artist_tokens("Siu Mata FEAT. Amor Satyr") == {"siu mata", "amor satyr"}
+
+    def test_drops_compilation_labels(self):
+        for s in ("Various Artists", "VARIOUS ARTISTS", "Various", "V/A", "v/a",
+                  "VA", "V.A.", "Various Artist", "Unknown Artist", " various artists "):
+            assert artist_tokens(s) == set(), s
+
+    def test_compilation_label_inside_a_credit_is_dropped(self):
+        assert artist_tokens("Various Artists & Siu Mata") == {"siu mata"}
+        assert artist_tokens("V.A. / Ancient Methods") == {"ancient methods"}
+
+    def test_parenthesised_feature_credit_with_several_artists(self):
+        assert artist_tokens("Cimm & Youngsta (feat. Riko Dan)") == {"cimm", "youngsta", "riko dan"}
+        assert artist_tokens("Ourman (ft. Gnischrew, Off White & SBK)") == {
+            "ourman", "gnischrew", "off white", "sbk"}
+
+    def test_other_parentheses_stay_part_of_the_name(self):
+        # "(UK)" disambiguates same-named acts: it must not become an artist
+        # that merges every "(UK)" act.
+        assert artist_tokens("Phase (UK)") == {"phase (uk)"}
+
+    def test_does_not_split_on_and_or_with(self):
+        # "and"/"with" are common in band names: must stay intact.
+        assert artist_tokens("Florence and the Machine") == {"florence and the machine"}
+        assert artist_tokens("Dancing with Ghosts") == {"dancing with ghosts"}
+
+    def test_x_only_splits_as_standalone_word(self):
+        # "x" inside a word (Aphex) is not a separator.
+        assert artist_tokens("Aphex Twin") == {"aphex twin"}
+        assert artist_tokens("Xenia Rubinos") == {"xenia rubinos"}
+
+    def test_word_connectors_only_split_between_spaces(self):
+        # A name that starts or ends with "X" keeps it (the radio's copy gave
+        # "madam", merging Madam X with any "Madam").
+        assert artist_tokens("Madam X") == {"madam x"}
+        assert artist_tokens("X-Coast & La Goony Chonga") == {"x-coast", "la goony chonga"}
+        assert artist_tokens("Nu Brand Flexxx x Rebound X") == {"nu brand flexxx", "rebound x"}
+
+    def test_separators_inside_a_band_name_split_it(self):
+        # Accepted trade-off (see the module docstring): leaning to splitting
+        # catches collabs at the cost of rare false merges.
+        assert artist_tokens("Earth, Wind & Fire") == {"earth", "wind", "fire"}
+        assert artist_tokens("AC/DC") == {"ac", "dc"}
+
+
+
+def test_placeholder_credit_falls_back_to_the_release_page():
+    url = "https://KCIK.bandcamp.com/track/kcik-18?from=x"
+    assert artist_tokens("Unknown Artist", url) == {"@kcik.bandcamp.com"}
+    assert artist_tokens("Various Artists", url) == {"@kcik.bandcamp.com"}
+    assert artist_tokens("", url) == {"@kcik.bandcamp.com"}
+
+
+def test_real_credits_ignore_the_page():
+    assert artist_tokens("Siu Mata & Amor Satyr", "https://label.bandcamp.com/album/a") == {"siu mata", "amor satyr"}
+
+
+def test_placeholder_spellings_are_placeholders():
+    # Each of these used to be one literal token shared across labels, so two
+    # labels' "V.A" comps were capped and excluded as one act.
+    url = "https://label.bandcamp.com/album/a"
+    for s in ("V.A", "VA.", "Various Artists.", "Unknown Artists", "Anonymous",
+              "-", "?", "...", "N/A", "VV.AA.", "Various Artists / V/A", " v / a "):
+        assert artist_tokens(s) == set(), s
+        assert artist_tokens(s, url) == {"@label.bandcamp.com"}, s
+
+
+def test_v_a_abbreviation_inside_a_credit_is_dropped():
+    assert artist_tokens("Siu Mata / V/A") == {"siu mata"}
+    assert artist_tokens("V/Aqua") == {"v", "aqua"}  # not the abbreviation
+
+
+def test_symbol_only_band_names_stay_real():
+    assert artist_tokens("!!!", "https://label.bandcamp.com/a") == {"!!!"}
+
+
+def test_page_identity_ignores_www_and_survives_a_malformed_url():
+    assert artist_tokens("", "https://www.label.com/album/a") == {"@label.com"}
+    assert artist_tokens("Unknown Artist", "https://[bad/x") == set()
+    # The URL the library synthesizes for an item without one is no page.
+    assert artist_tokens("Unknown Artist", "https://bandcamp.com/album/123") == set()
+
+
+def test_without_a_url_placeholders_stay_empty():
+    assert artist_tokens("Unknown Artist") == set()
+    assert artist_tokens("Various Artists", None) == set()
+    assert artist_tokens("Unknown Artist", "not a url") == set()
+
+
+
+def test_va_abbreviation_only_as_a_whole_segment():
+    # Inside a name, "V.A." is part of the name, not a compilation credit.
+    assert artist_tokens("V.A. Smith") == {"v.a. smith"}
+    assert artist_tokens("Kurt V. A. Smith") == {"kurt v. a. smith"}
+    assert artist_tokens("Siu Mata & V.A. Smith") == {"siu mata", "v.a. smith"}
+    # As its own segment it is still the placeholder.
+    assert artist_tokens("V.A. / Ancient Methods") == {"ancient methods"}
+    assert artist_tokens("Ancient Methods, V/A") == {"ancient methods"}

@@ -89,6 +89,8 @@ with SupporterRecommender() as recommender:
 - `max_recommendations` (int, default=10): Maximum number of recommendations
 - `min_supporters` (int, default=2): Minimum number of supporters who must have purchased an item
 - `progress_callback` (Callable, optional): Function(status, current, total, estimated_seconds)
+- `exclude_seed_artist` (bool, default=False): drop candidates by the seed's own artist (incl. collabs) before the result is cut; a seed's supporters mostly own that artist's other releases
+- `max_per_artist` (int, optional): keep at most this many releases per artist, best-ranked first, after `candidate_filter` and before the cut. A collab counts for each of its artists; placeholder credits ("Various Artists", "Unknown Artist") are capped per release page host, so one label's comps share a cap and other labels' don't
 
 **Returns:** `List[Dict[str, Any]]`
 
@@ -168,6 +170,8 @@ with SupporterRecommender() as r:
         intensity_duration=60.0,
         bpm_duration=60.0,
         progress_callback=None,
+        exclude_seed_artist=False,        # True: no candidates by the seed's own artist
+        max_per_artist=None,              # e.g. 2: the pool spans more artists
     )
 
     for rec in similar:
@@ -332,6 +336,66 @@ clear_bpm_cache()
 clear_seed_bpm_cache()
 ```
 
+### 5. Item pages (`bandcamp_recommender.items`)
+
+Everything on an album / track page as a plain dict, from one parse
+(`parse_item_html(html, item_url)`, pure and never raising) or from the
+live page (`item_info(item_url)`, one read through `http.get_page`).
+`item_info` raises `http.FetchError` subclasses when the page can't be read.
+The `parse_item_html` docstring lists every key.
+
+```python
+from bandcamp_recommender import items
+
+info = items.item_info("https://label.bandcamp.com/album/x")
+info["artist"]            # the release's artist ("by ..."), also on a label's page
+info["preview"]           # the track that plays (featured if playable), or None
+info["tags"], info["location"]  # genre tags; the location tag ("Berlin") apart
+items.art_url(info["art_id"], size=10)  # 10 = 1200 px, 2 = 700 px
+items.feature_tags(info)  # tags + location, the tag-feature input
+
+# A track page's own description is usually None; this reads its album's
+# (one more paced read):
+items.item_info("https://artist.bandcamp.com/track/y", follow_album_description=True)
+```
+
+The location tag stays in the tag-feature input (`feature_tags`,
+`scraper.extract_tags`, cached item metadata) because the everynoise
+lexicon pairs it with genre tags ("detroit" + "techno" -> "detroit
+techno").
+
+---
+
+### 6. A fan's own lists (`bandcamp_recommender.fans`)
+
+```python
+from bandcamp_recommender import fans, http
+
+try:
+    lib = fans.fan_library("someuser", lists=("wishlist", "collection"))
+except fans.FanNotFound:
+    ...  # no such fan page (a plain-HTTP 404/410; via the browser: http.Unexpected)
+except http.FetchError:
+    ...  # Bandcamp couldn't be read now (typed: Challenged, RateLimited, ...)
+
+lib["fan_id"]          # int
+lib["username"]        # the page's spelling
+lib["hidden"]          # requested lists the fan keeps private (returned as [])
+lib["wishlist"]        # full list in the API's order (newest first), each item:
+# {"tralbum_id", "item_url", "item_title", "band_name", "item_type", "added_ts"}
+```
+
+`added_ts` is epoch seconds when the item entered that list (the feed's sort
+key: purchase time for the collection, wishlist time for the wishlist), or
+None. `fans.parse_added_ts(raw_api_item)` exposes the same parse. One fan page
+read plus one API call per non-empty visible list; plain HTTP first, the shared
+browser only when Bandcamp challenges. Results are not cached (a failed fan
+page read is replayed for 60 s, like every `http.get_page` failure). A list is
+never silently empty: an error reply, or no items while the page shows some,
+raises `http.Unexpected`; a read below 90% of the page's count is returned with
+a logged warning. The browser can't see HTTP statuses, so when the page goes
+through it an unknown username raises `http.Unexpected`, not `FanNotFound`.
+
 ---
 
 ## Progress Callback
@@ -443,31 +507,44 @@ detectors, so enabling both costs roughly the same as enabling either.
 
 ## Updating to a New Version (for agents in consumer repos)
 
-**Current version: `0.2.0`** (was `0.1.1`). The public API is unchanged — `SupporterRecommender`, `get_recommendations`, `get_random_items`, and `get_tag_similar_recommendations` all keep the same signatures and return shapes. Internally, supporter fetches now go through `curl` first and only fall back to Selenium if blocked, which is ~40% faster on `get_random.py` and avoids spawning Chrome on healthy runs.
+**Current version: `0.8.0`** (was `0.7.0`). Public signatures are unchanged.
+The new APIs and the few deliberate default changes (fallback Chrome idle
+close, which `SupporterRecommender.close()` leaves to the timer now,
+owner-aware Chrome reaping, track dict `url`s) are listed under
+"Upgrading to 0.8.0" in `README.md`.
 
 ### Pick the right command based on how the package was installed
 
 Check the consumer's `pyproject.toml` for a `bandcamp-recommender` entry to determine the install style.
 
-**1. Editable install (`uv add --editable /path/...` or `bandcamp-recommender @ file:///...` with `[tool.uv.sources] bandcamp-recommender = { path = "...", editable = true }`):**
+**1. Git URL pin (`bandcamp-recommender[bpm] @ git+https://github.com/lucweytingh/bandcamp_recommender.git@<ref>`), as the radio and the crate app use:**
+
+Point the ref at the release tag, then relock:
+```bash
+# pyproject.toml: ...bandcamp_recommender.git@v0.8.0
+uv lock --upgrade-package bandcamp-recommender
+uv sync
+```
+
+**2. Editable install (`uv add --editable /path/...` or `bandcamp-recommender @ file:///...` with `[tool.uv.sources] bandcamp-recommender = { path = "...", editable = true }`):**
 
 The consumer points at the source tree directly. Just pull the source:
 ```bash
 cd /path/to/bandcamp_recommender   # the path the consumer points at
 git pull --ff-only origin master
 ```
-No `uv sync` needed — next Python process picks up the new code.
+No `uv sync` needed: the next Python process picks up the new code.
 
-**2. Non-editable file-URL install (`bandcamp-recommender @ file:///path/to/bandcamp_recommender` with no editable flag):**
+**3. Non-editable file-URL install (`bandcamp-recommender @ file:///path/to/bandcamp_recommender` with no editable flag):**
 
-`uv` caches the built wheel against the version string, so a behavior change without a version bump would silently use the old code. Since this update bumps `0.1.1 → 0.2.0`, force a refresh in the consumer repo:
+`uv` caches the built wheel against the version string, so a behavior change without a version bump would silently use the old code. Since this update bumps `0.7.0 -> 0.8.0`, force a refresh in the consumer repo:
 ```bash
 cd /path/to/consumer/project
 uv lock --upgrade-package bandcamp-recommender
 uv sync
 ```
 
-**3. PYTHONPATH / sys.path insert (Option 2 in this doc):**
+**4. PYTHONPATH / sys.path insert (Option 2 in this doc):**
 
 Just pull. No package metadata involved.
 ```bash
@@ -481,31 +558,28 @@ From the consumer repo, after updating:
 ```bash
 uv run python -c "import bandcamp_recommender, importlib.metadata as m; print(m.version('bandcamp-recommender'))"
 ```
-Expected output: `0.2.0`.
+Expected output: `0.8.0`.
 
-Also confirm the new curl-first path is wired in (only present in 0.2.0+):
+Also confirm the 0.8.0 modules are there:
 ```bash
-uv run python -c "from bandcamp_recommender import SupporterRecommender; assert hasattr(SupporterRecommender, '_get_supporter_items_curl_first'); print('OK')"
+uv run python -c "from bandcamp_recommender import artists, chrome_procs, fans, items; assert hasattr(items, 'item_info'); print('OK')"
 ```
 
 ### What the consumer code needs to change
 
-Nothing — this is a drop-in replacement. The two new env-var knobs are optional:
+Nothing for existing calls. New optional env knobs:
 
-- `BANDCAMP_DRIVER_POOL=N` — cap the Selenium fallback pool size (default 5; lower if RAM is tight).
-- `BANDCAMP_DISABLE_JS=1` — disable JavaScript in Chrome for extra speed in the fallback path. Off by default because it disables the in-browser `fetch()` used by the collection API; only safe if curl works for the collection API on your network.
+- `BANDCAMP_BROWSER_IDLE_S=N`: quit the fallback Chrome after N seconds unused (default 120). 0 = never: the browser then lives until `browser.close()` or exit (0.7.0 also quit it when a `SupporterRecommender` closed; 0.8 does not).
+- `BANDCAMP_BROWSER_PROFILE_DIR=/path`: where the library's own Chrome profiles live (default: under `~/snap/chromium/common/` with snap Chromium, else `~/.cache/bandcamp_recommender/`).
+
+Older knobs still apply: `BANDCAMP_DRIVER_POOL=N` caps a `DriverManager` pool (default 5), and `BANDCAMP_DISABLE_JS=1` disables JavaScript in Chrome (off by default because it disables the in-browser `fetch()` the collection API fallback uses).
 
 ### If the upgrade misbehaves
 
-Pin back to `0.1.1` in the consumer's `pyproject.toml`:
+Pin back to `v0.7.0` in the consumer's `pyproject.toml`:
 ```toml
 dependencies = [
-    "bandcamp-recommender @ file:///path/to/bandcamp_recommender",
+    "bandcamp-recommender[bpm] @ git+https://github.com/lucweytingh/bandcamp_recommender.git@v0.7.0",
 ]
 ```
-And in `bandcamp_recommender`, check out the prior commit:
-```bash
-cd /path/to/bandcamp_recommender
-git checkout <commit-before-curl-first>
-```
-Then `uv sync --reinstall-package bandcamp-recommender` in the consumer.
+Then `uv lock --upgrade-package bandcamp-recommender && uv sync` in the consumer.
