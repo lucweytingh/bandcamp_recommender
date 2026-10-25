@@ -334,6 +334,35 @@ clear_seed_bpm_cache()
 
 ---
 
+### 5. A fan's own lists (`bandcamp_recommender.fans`)
+
+```python
+from bandcamp_recommender import fans, http
+
+try:
+    lib = fans.fan_library("someuser", lists=("wishlist", "collection"))
+except fans.FanNotFound:
+    ...  # no such fan page
+except http.FetchError:
+    ...  # Bandcamp couldn't be read now (typed: Challenged, RateLimited, ...)
+
+lib["fan_id"]          # int
+lib["username"]        # the page's spelling
+lib["hidden"]          # requested lists the fan keeps private (returned as [])
+lib["wishlist"]        # full list in the API's order (newest first), each item:
+# {"tralbum_id", "item_url", "item_title", "band_name", "item_type", "added_ts"}
+```
+
+`added_ts` is epoch seconds when the item entered that list (the feed's sort
+key: purchase time for the collection, wishlist time for the wishlist), or
+None. `fans.parse_added_ts(raw_api_item)` exposes the same parse. One fan page
+read plus one API call per visible list; plain HTTP first, the shared browser
+only when Bandcamp challenges; nothing is cached. A list is never silently
+empty: an error reply, or no items while the page shows some, raises
+`http.Unexpected`.
+
+---
+
 ## Progress Callback
 
 All methods support an optional `progress_callback` function for real-time progress updates:
