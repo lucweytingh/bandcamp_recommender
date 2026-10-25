@@ -210,15 +210,54 @@ class _StdlibTLSAdapter(requests.adapters.HTTPAdapter):
     connection: urllib3's context challenged with and without ALPN, the
     stdlib's ssl.create_default_context passed; datacenter IPs passed both).
     Certificate and hostname verification are unchanged: the stdlib context
-    requires both, loaded with certifi's CA bundle like requests' default."""
+    requires both, loaded with certifi's CA bundle like requests' default.
+
+    The context is chosen per request in build_connection_pool_key_attributes,
+    the hook requests documents for a custom SSLContext: setting it only as a
+    pool-manager default loses to the per-request ``ssl_context`` that requests
+    2.32.0-2.32.2 inject. urllib3 mutates the context it is handed
+    (verify_mode, CA locations, client cert), so one context is shared only
+    by requests with the same trust settings: ``verify=True`` uses certifi,
+    ``verify="<bundle>"`` (or REQUESTS_CA_BUNDLE) gets its own context
+    trusting exactly that bundle, and ``verify=False`` or a client ``cert``
+    fall back to urllib3's fresh per-connection context with requests' usual
+    semantics (and urllib3's handshake)."""
+
+    def _stdlib_context(self, verify=True):
+        """The shared stdlib context for ``verify`` (True or a CA path)."""
+        contexts = self.__dict__.setdefault("_tls_contexts", {})
+        key = None if verify is True else verify
+        ctx = contexts.get(key)
+        if ctx is None:
+            if key is None:
+                ctx = ssl.create_default_context(cafile=certifi.where())
+            elif os.path.isdir(key):
+                ctx = ssl.create_default_context(capath=key)
+            else:
+                ctx = ssl.create_default_context(cafile=key)
+            ctx = contexts.setdefault(key, ctx)
+        return ctx
 
     def init_poolmanager(self, *args, **kwargs):
-        kwargs.setdefault("ssl_context", ssl.create_default_context(cafile=certifi.where()))
+        kwargs.setdefault("ssl_context", self._stdlib_context())
         return super().init_poolmanager(*args, **kwargs)
 
     def proxy_manager_for(self, proxy, **proxy_kwargs):
-        proxy_kwargs.setdefault("ssl_context", ssl.create_default_context(cafile=certifi.where()))
+        proxy_kwargs.setdefault("ssl_context", self._stdlib_context())
         return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        host_params, pool_kwargs = super().build_connection_pool_key_attributes(
+            request, verify, cert
+        )
+        if cert is None and (verify is True or isinstance(verify, str)):
+            pool_kwargs["ssl_context"] = self._stdlib_context(verify)
+        else:
+            # None drops the pool-manager default (urllib3 _merge_pool_kwargs):
+            # sharing a CERT_REQUIRED context with a CERT_NONE request raises,
+            # and a client cert would stay loaded for every later request.
+            pool_kwargs["ssl_context"] = None
+        return host_params, pool_kwargs
 
 
 def _state():

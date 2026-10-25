@@ -92,6 +92,7 @@ source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "blinker" },
+    { name = "certifi" },
     { name = "requests" },
     { name = "selenium" },
     { name = "webdriver-manager" },
@@ -113,9 +114,10 @@ dev = [
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.14.3" },
     { name = "blinker", specifier = "<1.8" },
+    { name = "certifi", specifier = ">=2023.7.22" },
     { name = "librosa", marker = "extra == 'bpm'", specifier = ">=0.10" },
     { name = "numpy", marker = "extra == 'bpm'", specifier = ">=1.24" },
-    { name = "requests", specifier = ">=2.31" },
+    { name = "requests", specifier = ">=2.32.3" },
     { name = "selenium", specifier = ">=4.39.0" },
     { name = "webdriver-manager", specifier = ">=4.0.2" },
 ]
