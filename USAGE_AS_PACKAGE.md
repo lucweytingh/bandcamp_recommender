@@ -569,7 +569,7 @@ uv run python -c "from bandcamp_recommender import artists, chrome_procs, fans, 
 
 Nothing for existing calls. New optional env knobs:
 
-- `BANDCAMP_BROWSER_IDLE_S=N`: quit the fallback Chrome after N seconds unused (default 120; 0 = never, the 0.7.0 behaviour).
+- `BANDCAMP_BROWSER_IDLE_S=N`: quit the fallback Chrome after N seconds unused (default 120). 0 = never: the browser then lives until `browser.close()` or exit (0.7.0 also quit it when a `SupporterRecommender` closed; 0.8 does not).
 - `BANDCAMP_BROWSER_PROFILE_DIR=/path`: where the library's own Chrome profiles live (default: under `~/snap/chromium/common/` with snap Chromium, else `~/.cache/bandcamp_recommender/`).
 
 Older knobs still apply: `BANDCAMP_DRIVER_POOL=N` caps a `DriverManager` pool (default 5), and `BANDCAMP_DISABLE_JS=1` disables JavaScript in Chrome (off by default because it disables the in-browser `fetch()` the collection API fallback uses).

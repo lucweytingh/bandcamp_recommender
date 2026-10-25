@@ -48,6 +48,7 @@ _last_used = 0.0
 _idle_wake = threading.Event()
 _idle_thread: Optional[threading.Thread] = None
 
+
 class BrowserUnavailable(http.FetchError):
     """The fallback browser could not be started or acquired in time."""
 

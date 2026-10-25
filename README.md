@@ -312,7 +312,8 @@ signature is unchanged, and so is every default result, except these
 deliberate changes:
 
 - The fallback Chrome quits itself after `BANDCAMP_BROWSER_IDLE_S` (120) s
-  unused; it used to live until `close()` or exit. `0` restores that.
+  unused; it used to live until `browser.close()`, a recommender's
+  `close()`, or exit. With `0` it lives until `browser.close()` or exit.
 - `SupporterRecommender.close()` (and leaving its `with` block) no longer
   quits the shared browser (0.7.0 quit it if idle; 0.5 quit the
   recommender's own drivers): the idle timer does, so the page reads that
