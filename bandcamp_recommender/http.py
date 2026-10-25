@@ -44,6 +44,8 @@ from urllib.parse import urlparse
 import requests
 import urllib3
 
+from bandcamp_recommender import chrome_procs
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_USER_AGENT = "bandcamp-recommender (+https://github.com/lucweytingh/bandcamp_recommender)"
@@ -222,7 +224,11 @@ def _state():
                 concurrency,
             )
             _session = session
-        return _session, _pacer
+        state = _session, _pacer
+    # The library's first Bandcamp request in this process cleans up the
+    # Chrome a dead predecessor left behind (a no-op flag check afterwards).
+    chrome_procs.sweep_once()
+    return state
 
 
 def pacer() -> Pacer:

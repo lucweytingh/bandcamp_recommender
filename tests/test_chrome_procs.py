@@ -35,6 +35,7 @@ class FakeProc:
         self.killed: list = []
         self.wait_calls: list = []
         self.waited: list = []
+        self.unkillable: set = set()
         root.mkdir()
 
     def add(self, pid, comm, ppid, *argv, state="S"):
@@ -48,6 +49,8 @@ class FakeProc:
         d = self.root / str(pid)
         if not d.exists():
             raise ProcessLookupError(pid)
+        if pid in self.unkillable:
+            raise PermissionError(pid)
         if sig == signal.SIGKILL:
             self.killed.append(pid)
             shutil.rmtree(d)
@@ -122,15 +125,20 @@ def test_own_browser_is_spared_while_its_driver_lives(proc):
     assert sorted(proc.killed) == tree
 
 
-def test_unmarked_chromedriver_whose_spawner_died_goes_with_its_browser(proc):
+def test_unmarked_chromedriver_whose_spawner_died_only_on_request(proc):
+    """What versions before profile markers leave behind. Not ours to judge by
+    default (could be anyone's orphaned chromedriver); DriverManager.reap_orphans,
+    the old opt-in cold-start reaper, keeps reaching it."""
     proc.add(8001, "chromedriver", SYSTEMD_USER, "chromedriver", "--port=2")
     proc.add(8002, "chrome", 8001, "chrome", "--user-data-dir=/tmp/.org.chromium.Chromium.scoped_dir.x")
     proc.add(8003, "chrome", 8002, "chrome", "--type=renderer")
     proc.add(8101, "chromedriver", 1, "chromedriver", "--port=3")
     proc.add(8201, "chromedriver", OTHER, "chromedriver", "--port=4")  # its process is alive
     proc.add(8202, "chrome", 8201, "chrome", "--user-data-dir=/tmp/.org.chromium.Chromium.scoped_dir.y")
+    proc.add(8301, "chrome", 1, "/opt/google/chrome/chrome")  # PPID 1 but nobody's driver
 
-    chrome_procs.reap_orphans()
+    assert chrome_procs.reap_orphans() == 0
+    assert driver_manager.DriverManager.reap_orphans() == 4
     assert sorted(proc.killed) == [8001, 8002, 8003, 8101]
 
 
@@ -139,8 +147,28 @@ def test_in_a_container_pid_1_may_be_a_live_library_process(proc):
     proc.add(1, "python3", 0, "python3", "app.py")
     proc.add(8001, "chromedriver", 1, "chromedriver", "--port=2")
 
-    chrome_procs.reap_orphans()
+    chrome_procs.reap_orphans(unmarked_chromedrivers=True)
     assert proc.killed == []
+
+
+def test_an_unusable_process_list_reaps_nothing(proc, monkeypatch):
+    root = chrome_procs.profiles_root()
+    (root / f"bcr-chrome-{DEAD}-aaaaaaaa").mkdir(parents=True)
+    (root / f"bcr-chrome-{OTHER}-bbbbbbbb").mkdir()
+    monkeypatch.setattr(chrome_procs, "_processes", lambda: {})  # e.g. ps timed out
+
+    assert chrome_procs.reap_orphans() == 0
+    assert len(list(root.iterdir())) == 2
+
+
+def test_profile_of_an_unkillable_process_is_kept(proc):
+    root = chrome_procs.profiles_root()
+    (root / f"bcr-chrome-{DEAD}-aaaaaaaa").mkdir(parents=True)
+    tree = _driver_tree(proc, 5000, DEAD, SYSTEMD_USER)
+    proc.unkillable.add(tree[1])
+
+    chrome_procs.reap_orphans()
+    assert (root / f"bcr-chrome-{DEAD}-aaaaaaaa").is_dir()
 
 
 def test_waits_only_our_own_chromium_zombies(proc):
@@ -201,6 +229,19 @@ def test_quit_driver_cleans_up_even_when_quit_fails(proc):
     assert not os.path.exists(profile)
 
 
+def test_a_forked_child_leaves_its_parents_profile_alone(proc, tmp_path):
+    parents = tmp_path / f"bcr-chrome-{OTHER}-bbbbbbbb"
+    parents.mkdir()
+    tree = _driver_tree(proc, 6000, OTHER, OTHER, token="bbbbbbbb")
+    driver = MagicMock()
+    setattr(driver, chrome_procs.PROFILE_ATTR, str(parents))
+
+    chrome_procs.quit_driver(driver)
+    assert parents.is_dir()
+    assert proc.killed == []
+    assert all((proc.root / str(pid)).exists() for pid in tree)
+
+
 def test_at_exit_nothing_this_process_started_survives(proc):
     profile = chrome_procs.new_profile()
     tree = _driver_tree(proc, 5000, ME, ME, token=os.path.basename(profile).rsplit("-", 1)[1])
@@ -225,6 +266,24 @@ def test_first_profile_reaps_once_per_process(monkeypatch):
     assert reap.call_count == 1
     assert os.path.basename(first).startswith(f"bcr-chrome-{ME}-")
     assert stat.S_IMODE(os.stat(first).st_mode) == 0o700
+
+
+def test_first_bandcamp_request_reaps_once_per_process(monkeypatch):
+    """Chrome a SIGKILLed predecessor left behind is freed at startup, not on
+    the (rare) first fallback."""
+    from bandcamp_recommender import http as bchttp
+
+    monkeypatch.setattr(chrome_procs, "_swept", False)
+    reap = MagicMock(return_value=0)
+    monkeypatch.setattr(chrome_procs, "reap_orphans", reap)
+    bchttp.reset()
+    try:
+        bchttp._state()
+        bchttp._state()
+        bchttp.pacer()
+    finally:
+        bchttp.reset()
+    assert reap.call_count == 1
 
 
 def test_profiles_root(tmp_path, monkeypatch):
@@ -252,6 +311,7 @@ def test_ps_fallback_without_proc(tmp_path, monkeypatch):
     outputs = {
         "pid=,ppid=,stat=,comm=": (
             f"    1     0 Ss   /sbin/launchd\n"
+            f"{ME:>5}     1 S    /usr/local/bin/python3\n"
             f"  501     1 S    /Users/me/.wdm/chromedriver\n"
             f"  502   501 S    /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n"
             f"  503   502 S    {helper}\n"
@@ -260,6 +320,7 @@ def test_ps_fallback_without_proc(tmp_path, monkeypatch):
         ),
         "pid=,args=": (
             f"    1 /sbin/launchd\n"
+            f"{ME:>5} python3 -m pytest\n"
             f"  501 /Users/me/.wdm/chromedriver --port=5 {chrome_procs.CHROMEDRIVER_SWITCH}={profile}\n"
             f"  502 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir={profile}\n"
             f"  503 {helper} --type=renderer --user-data-dir={profile}\n"
@@ -284,6 +345,14 @@ def test_ps_fallback_without_proc(tmp_path, monkeypatch):
     monkeypatch.setattr(chrome_procs, "_wait_gone", lambda pids: None)
     assert chrome_procs.reap_orphans() == 3
     assert sorted(killed) == [501, 502, 503]  # not the user's Chrome (600), not the shell
+
+    # Without command lines every profile would look unused: no table at all.
+    monkeypatch.setattr(
+        chrome_procs.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1 if cmd[-1] == "pid=,args=" else 0,
+                                                      stdout=outputs[cmd[-1]], stderr=""),
+    )
+    assert chrome_procs._processes() == {}
 
 
 # ---- every driver gets its own profile ---------------------------------------
@@ -327,6 +396,16 @@ def test_failed_launch_releases_its_profile(proc):
             driver_manager.DriverManager().create_driver()
     assert chrome_procs._live == {}
     assert list(chrome_procs.profiles_root().iterdir()) == []
+
+
+def test_driver_that_dies_while_configured_is_cleaned_up(proc):
+    fake = _fake_chrome()
+    fake.set_page_load_timeout.side_effect = ConnectionError("chromedriver died")
+    with patch.object(driver_manager.webdriver, "Chrome", return_value=fake):
+        with pytest.raises(ConnectionError):
+            driver_manager.DriverManager().create_driver()
+    fake.quit.assert_called_once()
+    assert chrome_procs._live == {}
 
 
 def test_driver_manager_reap_orphans_delegates(proc):

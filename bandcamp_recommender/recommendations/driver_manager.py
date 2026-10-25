@@ -78,7 +78,11 @@ class DriverManager:
             chrome_procs.release_profile(profile)
             raise
         setattr(driver, chrome_procs.PROFILE_ATTR, profile)
-        self._configure_driver(driver)
+        try:
+            self._configure_driver(driver)
+        except Exception:
+            chrome_procs.quit_driver(driver)
+            raise
         return driver
 
     def get_driver_options(self) -> Options:
@@ -222,9 +226,15 @@ class DriverManager:
     def reap_orphans() -> int:
         """SIGKILL chromedriver / Chrome left behind by library processes that
         died (a previous crashed run), and delete their profiles. Spares the
-        browser of every live process, and anything this library didn't start
-        (see :func:`bandcamp_recommender.chrome_procs.reap_orphans`).
+        browser of every live process. Opt-in: callers run this on cold start.
+
+        Unlike :func:`bandcamp_recommender.browser.reap_orphans` this keeps
+        its old reach for chromedrivers from versions without profile
+        markers: an unmarked chromedriver whose spawner died (reparented to
+        init or a subreaper) goes too, with its Chrome. It no longer kills
+        other Chrome with PPID 1 (on macOS that included the user's own
+        Chrome launched from the Dock).
 
         Returns the number of processes reaped. Safe no-op on Windows.
         """
-        return chrome_procs.reap_orphans()
+        return chrome_procs.reap_orphans(unmarked_chromedrivers=True)

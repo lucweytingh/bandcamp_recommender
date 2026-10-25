@@ -195,11 +195,12 @@ their own.
   Chromium is installed, since it can't write hidden dirs in `$HOME`, else
   `~/.cache/bandcamp_recommender/chrome-profiles`). Quitting a driver kills
   whatever still runs on its profile and deletes it. `browser.reap_orphans()`
-  (also `DriverManager.reap_orphans()`) kills Chrome left by library
-  processes that died and deletes their profiles, and never touches a live
-  process's browser or a Chrome the library didn't start. It runs once per
-  process on the first driver start; long-running callers can also call it
-  at startup.
+  kills Chrome left by library processes that died and deletes their
+  profiles; it never touches a live process's browser or a Chrome the
+  library didn't start, and runs by itself once per process on the first
+  Bandcamp request. `DriverManager.reap_orphans()` (the opt-in cold-start
+  reaper) does the same and also kills unmarked chromedrivers whose spawner
+  died, as earlier versions leave behind.
 - `collection_page_size` (default 10000 = everything) limits how many of each
   supporter's newest items are read; `candidate_filter` drops items before
   the candidate pool is cut. Audio features describe each item's featured

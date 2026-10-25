@@ -15,11 +15,11 @@ of "who spawned this?":
   into a snap scope), waits our own dead chromedriver children, and deletes
   stale profile dirs. It spares the Chrome of every live process (two
   processes using the library no longer kill each other's browsers) and
-  anything without the marker (your own Chrome, Playwright, ...), except an
-  unmarked chromedriver whose spawner is gone (reparented to init or the
-  systemd user manager): left by an older library version, nothing can
-  drive it anymore. Runs once per process on the first driver start;
-  long-running callers can also call it at startup.
+  anything without the marker (your own Chrome, Playwright, ...). It runs
+  once per process, on the first Bandcamp request or driver start.
+
+Owner liveness is a pid lookup, so processes in different pid namespaces
+(containers) must not share a profiles root.
 
 Why explicit profiles: without one, chromedriver makes a temp profile
 (``.org.chromium.Chromium.scoped_dir.*``) that only a clean quit deletes.
@@ -102,10 +102,12 @@ def profiles_root() -> Path:
     return Path(cache_home) / "bandcamp_recommender" / "chrome-profiles"
 
 
-def new_profile() -> str:
-    """Create a fresh profile dir owned by this process; return its path.
-    The first call per process reaps what dead processes left behind."""
+def sweep_once() -> None:
+    """Reap what dead library processes left behind, once per process (on the
+    first Bandcamp request or driver start, whichever comes first)."""
     global _swept
+    if _swept:
+        return
     with _live_lock:
         first, _swept = not _swept, True
     if first:
@@ -113,6 +115,11 @@ def new_profile() -> str:
             reap_orphans()
         except Exception:
             logger.warning("chrome orphan sweep failed", exc_info=_debug())
+
+
+def new_profile() -> str:
+    """Create a fresh profile dir owned by this process; return its path."""
+    sweep_once()
     name = f"{PROFILE_PREFIX}{os.getpid()}-{secrets.token_hex(4)}"
     path = profiles_root() / name
     # Registered before it exists, so a concurrent sweep never takes it.
@@ -156,28 +163,37 @@ def quit_driver(driver) -> None:
     except Exception:
         logger.warning("browser quit failed", exc_info=_debug())
     profile = getattr(driver, PROFILE_ATTR, None)
-    if isinstance(profile, str):
+    # A forked child that inherited the driver must not clean up its parent's.
+    if isinstance(profile, str) and _owner(os.path.basename(profile)) == os.getpid():
         release_profile(profile)
 
 
-def reap_orphans() -> int:
+def reap_orphans(unmarked_chromedrivers: bool = False) -> int:
     """Kill Chrome and chromedriver whose owning library process is dead (or,
     for this process, whose driver is gone), wait our own defunct
     chromedriver children, and delete stale profile dirs. Returns the number
     of processes killed or waited. Never touches a live process's browser.
-    No-op on Windows."""
+    No-op on Windows.
+
+    ``unmarked_chromedrivers`` also kills chromedrivers without the marker
+    whose spawner died (reparented to init or a subreaper), with their
+    Chrome: what library versions before profile markers leave behind, but
+    also anyone else's orphaned chromedriver, so it is opt-in."""
     if os.name == "nt":
         return 0
+    me = os.getpid()
     try:
         table = _processes()
     except Exception:
-        logger.warning("chrome reaper: could not list processes", exc_info=_debug())
+        table = {}
+    if me not in table:
+        # A failed or partial listing makes every owner look dead.
+        logger.warning("chrome reaper: could not list processes, skipping")
         return 0
-    me = os.getpid()
     zombies = _reap_zombies(table, me)
-    doomed = _orphans(table, me)
+    doomed = _orphans(table, me, unmarked_chromedrivers)
     killed = _kill(doomed)
-    gone = set(doomed)
+    gone = {pid for pid in doomed if not _is_running(pid)}
     in_use = {_marker(p) for p in _running_chrome(table) if p.pid not in gone}
     swept = _sweep(table, me, in_use)
     if killed or zombies or swept:
@@ -222,7 +238,7 @@ def _running_chrome(table: Dict[int, _Proc]) -> List[_Proc]:
     return [p for p in table.values() if "chrom" in p.comm and p.state not in ("Z", "X")]
 
 
-def _orphans(table: Dict[int, _Proc], me: int) -> List[int]:
+def _orphans(table: Dict[int, _Proc], me: int, unmarked_chromedrivers: bool) -> List[int]:
     doomed: Dict[int, None] = {}
     for p in _running_chrome(table):
         name = _marker(p)
@@ -235,7 +251,7 @@ def _orphans(table: Dict[int, _Proc], me: int) -> List[int]:
                 dead = not _alive(table, owner)
             if dead:
                 doomed[p.pid] = None
-        elif p.comm == "chromedriver" and _spawner_gone(table, p):
+        elif unmarked_chromedrivers and p.comm == "chromedriver" and _spawner_gone(table, p):
             doomed[p.pid] = None
             for d in _descendants(table, p.pid):
                 if "chrom" in table[d].comm:
@@ -412,10 +428,11 @@ def _run_ps(ps: str, fields: str) -> Optional[str]:
 def _ps_table() -> Dict[int, _Proc]:
     ps = shutil.which("ps")
     procs = _run_ps(ps, "pid=,ppid=,stat=,comm=") if ps else None
-    if procs is None:
+    cmdlines = _run_ps(ps, "pid=,args=") if procs is not None else None
+    if cmdlines is None:  # without command lines every profile looks unused
         return {}
     args: Dict[int, str] = {}
-    for line in (_run_ps(ps, "pid=,args=") or "").splitlines():
+    for line in cmdlines.splitlines():
         parts = line.split(None, 1)
         if len(parts) == 2 and parts[0].isdigit():
             args[int(parts[0])] = parts[1]

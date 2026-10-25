@@ -48,6 +48,7 @@ _idle_wake = threading.Event()
 _idle_thread: Optional[threading.Thread] = None
 
 # Kill Chrome left behind by library processes that died; spares live ones.
+# Runs by itself once per process (first Bandcamp request or driver start).
 reap_orphans = chrome_procs.reap_orphans
 
 
@@ -69,6 +70,13 @@ def _idle_timeout() -> float:
         return _DEFAULT_IDLE_S
 
 
+def _drop() -> None:
+    """Quit the shared driver and forget it. Caller holds ``_lock``."""
+    global _driver
+    chrome_procs.quit_driver(_driver)
+    _driver = None
+
+
 def _start_idle_watch() -> None:
     """Caller holds ``_lock``. One watcher thread per process, started with
     the first driver; it sleeps until a session ends when there's nothing
@@ -81,7 +89,6 @@ def _start_idle_watch() -> None:
 
 def _idle_watch() -> None:
     """Quit the shared driver once nobody has used it for the idle timeout."""
-    global _driver
     timeout: Optional[float] = None
     while True:
         _idle_wake.wait(timeout)
@@ -101,8 +108,7 @@ def _idle_watch() -> None:
             continue
         try:
             if _driver is not None and time.monotonic() - _last_used >= idle_s:
-                chrome_procs.quit_driver(_driver)
-                _driver = None
+                _drop()
                 logger.info("closed the fallback browser after %.0f s idle", idle_s)
         finally:
             _lock.release()
@@ -119,8 +125,7 @@ def session() -> Iterator[Any]:
         from bandcamp_recommender.recommendations.driver_manager import DriverManager
 
         if _driver is not None and not DriverManager.is_driver_alive(_driver):
-            chrome_procs.quit_driver(_driver)
-            _driver = None
+            _drop()
         if _driver is None:
             try:
                 _driver = DriverManager().create_driver()
@@ -131,8 +136,7 @@ def session() -> Iterator[Any]:
             yield _driver
         finally:
             if not DriverManager.is_driver_alive(_driver):
-                chrome_procs.quit_driver(_driver)
-                _driver = None
+                _drop()
             _last_used = time.monotonic()
             _idle_wake.set()
     finally:
@@ -207,24 +211,20 @@ def fetch_html(url: str, expect: Optional[str]) -> str:
 
 def close() -> None:
     """Quit the shared driver now (waits for an in-flight user)."""
-    global _driver
     with _lock:
         if _driver is not None:
-            chrome_procs.quit_driver(_driver)
-            _driver = None
+            _drop()
 
 
 def close_if_idle() -> bool:
     """Quit the driver unless someone is using it right now. Never blocks;
     True if a driver was quit."""
-    global _driver
     if not _lock.acquire(blocking=False):
         return False
     try:
         if _driver is None:
             return False
-        chrome_procs.quit_driver(_driver)
-        _driver = None
+        _drop()
         return True
     finally:
         _lock.release()
