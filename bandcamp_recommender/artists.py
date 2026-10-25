@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 from typing import Optional, Set
+from urllib.parse import urlparse
 
 # Collaboration separators: "Siu Mata & Amor Satyr", "A, B", "A / B", "A + B",
 # "A | B", "A × B", "A x B", "A vs B", "A feat. B", "A featuring B", "A ft B"
@@ -39,15 +40,31 @@ _ARTIST_STOPWORDS = {
 }
 
 
-def artist_tokens(artist: Optional[str]) -> Set[str]:
+def artist_tokens(artist: Optional[str], item_url: Optional[str] = None) -> Set[str]:
     """The individual artists in a credit, lowercased.
 
     ``"Siu Mata"``, ``"Siu Mata & Amor Satyr"`` and ``"Amor Satyr & Siu
     Mata"`` all contain ``"siu mata"``, so artist-level dedup catches the same
-    act across releases. Generic compilation credits yield an empty set (no
-    artist to compare), as does an empty credit. See the module docstring for
-    the accepted over-splitting.
+    act across releases. See the module docstring for the accepted
+    over-splitting.
+
+    Placeholder credits ("Various Artists", "Unknown Artist", "") name no
+    artist. Without ``item_url`` they yield an empty set (nothing to compare).
+    With it they yield the release's Bandcamp page instead, e.g.
+    ``{"@kcik.bandcamp.com"}``: one label or page releasing everything as
+    "Unknown Artist" is one act for dedup (measured: three such releases aired
+    back to back), while compilations from different labels stay distinct.
+    The ``@`` prefix cannot collide with a real credit.
     """
+    tokens = _credit_tokens(artist)
+    if not tokens and item_url:
+        host = (urlparse(item_url).hostname or "").lower()
+        if host:
+            return {"@" + host}
+    return tokens
+
+
+def _credit_tokens(artist: Optional[str]) -> Set[str]:
     if not artist:
         return set()
     # Whole-string stopword check first, before splitting: otherwise "V/A"

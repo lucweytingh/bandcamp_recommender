@@ -74,3 +74,21 @@ class TestArtistTokens:
         # catches collabs at the cost of rare false merges.
         assert artist_tokens("Earth, Wind & Fire") == {"earth", "wind", "fire"}
         assert artist_tokens("AC/DC") == {"ac", "dc"}
+
+
+
+def test_placeholder_credit_falls_back_to_the_release_page():
+    url = "https://KCIK.bandcamp.com/track/kcik-18?from=x"
+    assert artist_tokens("Unknown Artist", url) == {"@kcik.bandcamp.com"}
+    assert artist_tokens("Various Artists", url) == {"@kcik.bandcamp.com"}
+    assert artist_tokens("", url) == {"@kcik.bandcamp.com"}
+
+
+def test_real_credits_ignore_the_page():
+    assert artist_tokens("Siu Mata & Amor Satyr", "https://label.bandcamp.com/album/a") == {"siu mata", "amor satyr"}
+
+
+def test_without_a_url_placeholders_stay_empty():
+    assert artist_tokens("Unknown Artist") == set()
+    assert artist_tokens("Various Artists", None) == set()
+    assert artist_tokens("Unknown Artist", "not a url") == set()

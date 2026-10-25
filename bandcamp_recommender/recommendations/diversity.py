@@ -55,6 +55,7 @@ class Track:
     genre: str = ""
     distance_to_seed: Optional[float] = None
     id: str = ""
+    url: str = ""
 
 
 @dataclass
@@ -252,7 +253,7 @@ def select_stratified(pool: Sequence[Track], seed: Track, k: int) -> List[Track]
             while i < len(b):
                 t = b[i]
                 i += 1
-                tokens = artist_tokens(t.artist)
+                tokens = artist_tokens(t.artist, t.url or None)
                 if tokens & used_artists:
                     continue
                 selected.append(t)
@@ -468,6 +469,7 @@ def diversify_items(
         Track(
             features=it.get("features") or {},
             artist=it.get("band_name", ""),
+            url=it.get("item_url", ""),
             distance_to_seed=it.get("distance"),
             id=str(i),
         )

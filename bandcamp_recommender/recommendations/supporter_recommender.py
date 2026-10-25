@@ -132,7 +132,7 @@ from bandcamp_recommender.recommendations.tags import calculate_tag_similarity, 
 
 def _cap_per_artist(
     ranked: List[tuple],
-    band_of: Callable[[str], str],
+    tokens_of: Callable[[str], set],
     max_per_artist: int,
     limit: int,
 ) -> Tuple[List[tuple], int]:
@@ -147,7 +147,7 @@ def _cap_per_artist(
     for iid, cnt in ranked:
         if len(kept) >= limit:
             break
-        tokens = artist_tokens(band_of(iid))
+        tokens = tokens_of(iid)
         if any(per_artist[t] >= max_per_artist for t in tokens):
             skipped += 1
             continue
@@ -473,19 +473,20 @@ class SupporterRecommender:
             if normalize_item_url((self.item_cache.get(iid) or {}).get("item_url", "")) != seed_key
         ]
 
-        def band_of(iid: str) -> str:
-            return (self.item_cache.get(iid) or {}).get("band_name") or ""
+        def tokens_of(iid: str) -> set:
+            info = self.item_cache.get(iid) or {}
+            return artist_tokens(info.get("band_name") or "", info.get("item_url"))
 
         # Before candidate_filter, so the caller's filter (which may keep
         # state) never sees the seed's own artist. It does see candidates
         # max_per_artist skips after it.
         if exclude_seed_artist:
-            seed_tokens = artist_tokens(seed_artist)
+            seed_tokens = artist_tokens(seed_artist, wishlist_item_url)
             before = len(sorted_items)
             if seed_tokens:
                 sorted_items = [
                     (iid, cnt) for (iid, cnt) in sorted_items
-                    if not artist_tokens(band_of(iid)) & seed_tokens
+                    if not tokens_of(iid) & seed_tokens
                 ]
             self._pool_stats["seed_artist_dropped"] = before - len(sorted_items)
 
@@ -504,7 +505,7 @@ class SupporterRecommender:
             # After the caller's filter, so a release it rejects doesn't use
             # up its artist's slots.
             top_items, self._pool_stats["artist_capped"] = _cap_per_artist(
-                sorted_items, band_of, max_per_artist, pool_size
+                sorted_items, tokens_of, max_per_artist, pool_size
             )
 
         if event_callback:

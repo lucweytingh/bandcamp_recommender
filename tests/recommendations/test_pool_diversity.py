@@ -31,16 +31,18 @@ def _recommend(ranked: List[Tuple[str, str]], seed_artist="Siu Mata", calls=None
     rec = SupporterRecommender()
     n = len(ranked)
     supporters = [f"s{i}" for i in range(n)]
-    owns = {s: [iid for r, (iid, _) in enumerate(ranked) if i < n - r]
+    owns = {s: [t[0] for r, t in enumerate(ranked) if i < n - r]
             for i, s in enumerate(supporters)}
-    bands = dict(ranked)
+    bands = {t[0]: t[1] for t in ranked}
+    # Optional third element: the release's page URL (default: one page).
+    urls = {t[0]: (t[2] if len(t) > 2 else f"https://x.bandcamp.com/album/{t[0]}") for t in ranked}
     calls = [] if calls is None else calls
 
     def fetch(username, data_key, first_page_only=False):
         calls.append("supporter")
         for iid in owns[username]:
             rec._store_item_metadata(iid, {"item_title": iid, "band_name": bands[iid],
-                                           "item_url": f"https://x.bandcamp.com/album/{iid}"}, True)
+                                           "item_url": urls[iid]}, True)
         return owns[username]
 
     def artist(url):
@@ -170,13 +172,35 @@ class MaxPerArtistTests(unittest.TestCase):
             ["solo_a", "solo_b", "solo_c"],
         )
 
-    def test_compilations_are_never_capped(self):
-        ranked = [("v1", "Various Artists"), ("v2", "Various Artists"), ("v3", "V/A"),
-                  ("e1", ""), ("e2", "")]
+    def test_compilations_from_different_pages_are_not_capped(self):
+        ranked = [("v1", "Various Artists", "https://label-one.bandcamp.com/album/v1"),
+                  ("v2", "Various Artists", "https://label-two.bandcamp.com/album/v2"),
+                  ("v3", "V/A", "https://label-three.bandcamp.com/album/v3"),
+                  ("e1", "", "https://four.bandcamp.com/album/e1"),
+                  ("e2", "", "https://five.bandcamp.com/album/e2")]
         self.assertEqual(
             _run(ranked, seed_artist="Seed", max_recommendations=5, max_per_artist=1),
             ["v1", "v2", "v3", "e1", "e2"],
         )
+
+    def test_placeholder_credits_from_one_page_are_one_act(self):
+        # Measured: a label crediting every release to "Unknown Artist" aired
+        # three of them back to back; the page is their identity.
+        ranked = [("k18", "Unknown Artist", "https://kcik.bandcamp.com/track/kcik-18"),
+                  ("k32", "Unknown Artist", "https://kcik.bandcamp.com/track/kcik-32"),
+                  ("k26", "Unknown Artist", "https://kcik.bandcamp.com/track/kcik-26"),
+                  ("b1", "Artist B", "https://b.bandcamp.com/album/b1")]
+        self.assertEqual(
+            _run(ranked, seed_artist="Seed", max_recommendations=4, max_per_artist=1),
+            ["k18", "b1"],
+        )
+
+    def test_placeholder_seed_drops_its_own_pages_releases(self):
+        ranked = [("k32", "Unknown Artist", "https://siumata.bandcamp.com/track/k32"),
+                  ("x", "Artist X", "https://x.bandcamp.com/album/x")]
+        ids, _ = _recommend(ranked, seed_artist="Unknown Artist", max_recommendations=2,
+                            exclude_seed_artist=True)
+        self.assertEqual(ids, ["x"])
 
     def test_bpm_match_caps_the_expanded_pool(self):
         # bpm_match cuts the pool at max(50, 3 * n) instead of n; the cap
