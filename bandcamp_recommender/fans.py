@@ -10,7 +10,8 @@ fallback browser loads the fan page (same-origin cookies) and calls the API
 from inside it. Failures are typed (:mod:`bandcamp_recommender.http`
 errors) and a list is never silently empty: a private list is named in
 ``hidden`` (measured: a private wishlist shows ``hidden: true`` on the page
-and the API answers ``{"error": true}``), any other error reply raises.
+and the API answers ``{"error": true}``), a list the page counts as empty
+costs no API call, any other error reply raises.
 
 The supporter reads in ``SupporterRecommender`` use the same page parse and
 API call (:func:`parse_pagedata`, :func:`read_list_page`).
@@ -43,6 +44,11 @@ PAGE_SIZE = 10000
 LIST_TIMEOUT_S = 120
 # 20 x 10000 items: a bound on a misbehaving token, not a real fan.
 _MAX_PAGES = 20
+# Hidden/removed items make the API return slightly fewer ids than the
+# advertised count; a read much shorter than expected is partial.
+COMPLETE_FRACTION = 0.9
+# Bandcamp started in 2008: a token head below this is not an epoch.
+_MIN_EPOCH = 10**9
 
 
 class FanNotFound(http.FetchError):
@@ -111,7 +117,7 @@ def parse_added_ts(item: Dict[str, Any]) -> Optional[float]:
     token = item.get("token")
     if isinstance(token, str):
         head = token.split(":", 1)[0]
-        if head.isdigit() and int(head) > 0:
+        if head.isascii() and head.isdigit() and int(head) > _MIN_EPOCH:
             return float(head)
     for key in ("purchased", "added"):
         ts = _parse_date(item.get(key))
@@ -139,7 +145,8 @@ def _unexpected(message: str) -> http.Unexpected:
 def _parse_fan(html: str, username: str, url: str) -> Dict[str, Any]:
     """fan_id, canonical username and per-list state from a fan page."""
     pagedata = parse_pagedata(html) or {}
-    fan_data = pagedata.get("fan_data") or {}
+    fan_data = pagedata.get("fan_data")
+    fan_data = fan_data if isinstance(fan_data, dict) else {}
     fan_id = fan_data.get("fan_id")
     if isinstance(fan_id, bool) or not isinstance(fan_id, int) or fan_id <= 0:
         raise _unexpected(f"no fan_id in the pagedata of {url}")
@@ -148,18 +155,25 @@ def _parse_fan(html: str, username: str, url: str) -> Dict[str, Any]:
         section = pagedata.get(f"{name}_data")
         section = section if isinstance(section, dict) else {}
         count = section.get("item_count")
-        count = count if isinstance(count, int) else None
+        count = count if isinstance(count, int) and not isinstance(count, bool) else None
+        expected = count
         if count is not None and isinstance(section.get("hidden_items_count"), int):
-            # Only used to tell an empty list from a failed read: count
-            # conservatively, items the fan hid are not served.
-            count -= section["hidden_items_count"]
-        lists[name] = {"hidden": section.get("hidden") is True, "item_count": count}
+            # Only used to judge the read: count conservatively, items the
+            # fan hid are not served.
+            expected = max(0, count - section["hidden_items_count"])
+        lists[name] = {"hidden": section.get("hidden") is True, "item_count": count,
+                       "expected": expected}
     return {"fan_id": fan_id, "username": fan_data.get("username") or username, "lists": lists}
+
+
+def _describe(data: Any) -> str:
+    return str(sorted(data)[:8]) if isinstance(data, dict) else type(data).__name__
 
 
 def _read_list(fan: Dict[str, Any], name: str, referer: str, driver) -> List[Dict[str, Any]]:
     """Every item of one list, newest first. Raises on an error reply, or on
-    an empty reply for a list the fan page says has items."""
+    an empty reply for a list the fan page says has items; warns on a read
+    much shorter than the page's count."""
     token = newest_first_token()
     items: List[Dict[str, Any]] = []
     seen = set()
@@ -167,7 +181,7 @@ def _read_list(fan: Dict[str, Any], name: str, referer: str, driver) -> List[Dic
         data = read_list_page(name, fan["fan_id"], token, PAGE_SIZE, referer=referer, driver=driver)
         batch = data.get("items") if isinstance(data, dict) else None
         if not isinstance(batch, list):
-            raise _unexpected(f"no items in the {name} reply for {fan['username']}: {str(data)[:80]}")
+            raise _unexpected(f"no items in the {name} reply for {fan['username']}: {_describe(data)}")
         for raw in batch:
             if not isinstance(raw, dict) or not raw.get("tralbum_id"):
                 continue
@@ -183,16 +197,25 @@ def _read_list(fan: Dict[str, Any], name: str, referer: str, driver) -> List[Dic
     else:
         logger.warning("%s's %s still has more after %d pages; returning %d items",
                        fan["username"], name, _MAX_PAGES, len(items))
-    advertised = fan["lists"][name]["item_count"]
-    if not items and advertised:
-        raise _unexpected(f"{fan['username']}'s {name}: the page shows {advertised} items, the API none")
+    expected = fan["lists"][name]["expected"]
+    if expected:
+        if not items:
+            raise _unexpected(f"{fan['username']}'s {name}: the page shows {expected} items, the API none")
+        if len(items) < COMPLETE_FRACTION * expected:
+            logger.warning("%s's %s: read %d of the %d items the page shows",
+                           fan["username"], name, len(items), expected)
     return items
 
 
 def _read_lists(fan, names, out, referer, driver) -> None:
     for name in names:
-        if name not in out:
-            out[name] = [] if fan["lists"][name]["hidden"] else _read_list(fan, name, referer, driver)
+        if name in out:
+            continue
+        state = fan["lists"][name]
+        # Hidden: the API answers {"error": true}. Counted empty: nothing to
+        # read (and whether the API errors on an empty list is unmeasured).
+        empty = state["hidden"] or state["item_count"] == 0
+        out[name] = [] if empty else _read_list(fan, name, referer, driver)
 
 
 def _result(fan, names, out) -> Dict[str, Any]:
@@ -213,14 +236,19 @@ def fan_library(username: str, *, lists: Sequence[str] = LISTS) -> Dict[str, Any
     epoch seconds or None, see :func:`parse_added_ts`; near-monotonic, the
     feed itself has the odd item out of place). ``hidden`` names the
     requested lists the fan keeps private; those are ``[]`` and cost no API
-    call. ``username`` is the page's spelling.
+    call, like a list the page counts as empty. ``username`` is the page's
+    spelling.
 
-    Costs one page read plus one API call per visible list (more past 10000
-    items). All or nothing: raises :class:`FanNotFound` for an unknown
-    username, :class:`http.Unexpected` for a page or reply without the
-    expected data, other :class:`http.FetchError` subclasses when Bandcamp
-    can't be read (``http.Challenged`` only if the fallback browser is
-    challenged too)."""
+    Costs one page read plus one API call per non-empty visible list (more
+    past 10000 items). All or nothing: raises :class:`FanNotFound` for an
+    unknown username (a plain-HTTP 404/410; when the page goes through the
+    fallback browser, which can't see the status, an unknown username raises
+    :class:`http.Unexpected`), :class:`http.Unexpected` for a page or reply
+    without the expected data, other :class:`http.FetchError` subclasses
+    when Bandcamp can't be read (``http.Challenged`` only if the fallback
+    browser is challenged too). A list read short of
+    :data:`COMPLETE_FRACTION` of the page's count is returned with a logged
+    warning."""
     names = tuple(dict.fromkeys(lists))
     if not names or any(name not in API_URLS for name in names):
         raise ValueError(f"lists must be drawn from {LISTS}, got {lists!r}")

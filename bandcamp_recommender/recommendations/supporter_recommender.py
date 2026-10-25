@@ -866,9 +866,7 @@ class SupporterRecommender:
     # scenes stop re-downloading the same collections.
 
     _LIST_NAMES = {"collection_data": "collection", "wishlist_data": "wishlist"}
-    # Hidden/removed items make the API return slightly fewer ids than the
-    # advertised count; a read much shorter than expected is partial.
-    _COMPLETE_FRACTION = 0.9
+    _COMPLETE_FRACTION = fans.COMPLETE_FRACTION
 
     def _begin_call(self, collection_page_size: int = _DEFAULT_COLLECTION_PAGE_SIZE) -> None:
         """Per-call knobs + fallback budget (entry points call this first)."""

@@ -136,10 +136,12 @@ for item in lib["collection"]:                # full list, newest first
     item["added_ts"]                          # epoch s it entered the list, or None
 ```
 
-One fan page read plus one API call per visible list, not cached. `added_ts`
-is the list entry time (bought, for the collection; wishlisted, for the
-wishlist). Failures raise (`fans.FanNotFound`, or the `http` errors); a list is
-never silently empty.
+One fan page read plus one API call per non-empty visible list; the lists are
+read fresh on every call. `added_ts` is the list entry time (bought, for the
+collection; wishlisted, for the wishlist). Failures raise (the `http` errors,
+or `fans.FanNotFound` for an unknown username when the page answers 404 over
+plain HTTP; through the fallback browser, which can't see the status, an
+unknown username raises `http.Unexpected`). A list is never silently empty.
 
 ### Feature vectors (similarity matching, mood projection)
 

@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from bandcamp_recommender import browser, fans, http
+from bandcamp_recommender.recommendations import curl_breaker
 
 _WISHLIST_URL = fans.API_URLS["wishlist"]
 _COLLECTION_URL = fans.API_URLS["collection"]
@@ -34,6 +35,10 @@ def _fan_page(fan_id=5068627, username="tabletop13", wishlist_count=2, collectio
         "wishlist_data": wishlist_data,
         "item_cache": {"collection": {}, "wishlist": {}},
     }
+    return _page(blob)
+
+
+def _page(blob):
     return f'<html><div id="pagedata" data-blob="{htmllib.escape(json.dumps(blob))}"></div></html>'
 
 
@@ -161,13 +166,17 @@ class FanLibraryTests(unittest.TestCase):
         self.assertEqual(len(lib["collection"]), 3)
         self.assertEqual([url for url, _ in calls], [_COLLECTION_URL])
 
-    def test_empty_list_is_empty(self):
-        lib, _, _ = self._read(
+    def test_empty_list_is_empty_and_costs_no_api_call(self):
+        # Whatever the API would answer for an empty list (unmeasured), it
+        # is not asked.
+        lib, _, calls = self._read(
             page=_fan_page(wishlist_count=0),
-            replies={_WISHLIST_URL: _reply([]), _COLLECTION_URL: _reply(_COLLECTION)},
+            replies={_WISHLIST_URL: AssertionError("wishlist API called"),
+                     _COLLECTION_URL: _reply(_COLLECTION)},
         )
         self.assertEqual(lib["wishlist"], [])
         self.assertEqual(lib["hidden"], [])
+        self.assertEqual([url for url, _ in calls], [_COLLECTION_URL])
 
     def test_error_reply_raises_instead_of_an_empty_list(self):
         before = http.snapshot()
@@ -185,6 +194,26 @@ class FanLibraryTests(unittest.TestCase):
             replies={_COLLECTION_URL: _reply([])},
         )
         self.assertEqual(lib["collection"], [])
+
+    def test_more_hidden_items_than_items_is_not_a_negative_count(self):
+        lib, _, _ = self._read(
+            page=_fan_page(collection_count=1, collection_hidden_items=2), lists=("collection",),
+            replies={_COLLECTION_URL: _reply([])},
+        )
+        self.assertEqual(lib["collection"], [])
+
+    def test_short_read_is_returned_with_a_warning(self):
+        with self.assertLogs("bandcamp_recommender.fans", level="WARNING") as logs:
+            lib, _, _ = self._read(page=_fan_page(collection_count=10), lists=("collection",))
+        self.assertEqual(len(lib["collection"]), 3)
+        self.assertIn("read 3 of the 10 items", logs.output[0])
+
+    def test_non_object_fan_data_raises_unexpected(self):
+        with patch.object(http, "get_html", return_value=_page({"fan_data": [5068627]})), \
+             patch.object(http, "post_json") as pj:
+            with self.assertRaises(http.Unexpected):
+                fans.fan_library("tabletop13")
+        pj.assert_not_called()
 
     def test_unknown_fan(self):
         with patch.object(http, "get_html", side_effect=http.HTTPStatus(404, "u")), \
@@ -263,6 +292,34 @@ class FanLibraryTests(unittest.TestCase):
         self.assertEqual([c[0][1] for c in bpj.call_args_list], [_COLLECTION_URL])
         self.assertEqual(len(lib["wishlist"]), 2)
         self.assertEqual(len(lib["collection"]), 3)
+        # The API challenge counts toward the plain-HTTP breaker.
+        self.assertEqual(len(curl_breaker._read_state()["recent_failures"]), 1)
+
+    def test_tripped_breaker_reads_everything_in_the_browser(self):
+        for _ in range(3):
+            curl_breaker.record_outcome(success=False)
+        self.assertTrue(curl_breaker.should_skip_curl())
+        driver = MagicMock()
+
+        @contextlib.contextmanager
+        def fake_session():
+            yield driver
+
+        def browser_post(drv, url, payload, timeout=60):
+            return _reply(_WISHLIST) if url == _WISHLIST_URL else _reply(_COLLECTION)
+
+        with patch.object(http, "get_html") as get, \
+             patch.object(http, "post_json") as pj, \
+             patch.object(browser, "session", side_effect=fake_session), \
+             patch.object(browser, "load", return_value=_fan_page()) as load, \
+             patch.object(browser, "post_json", side_effect=browser_post) as bpj:
+            lib = fans.fan_library("tabletop13")
+        get.assert_not_called()
+        pj.assert_not_called()
+        load.assert_called_once()
+        self.assertEqual(sorted(c[0][1] for c in bpj.call_args_list), sorted([_WISHLIST_URL, _COLLECTION_URL]))
+        self.assertEqual(len(lib["wishlist"]), 2)
+        self.assertEqual(len(lib["collection"]), 3)
 
     def test_challenged_browser_raises(self):
         @contextlib.contextmanager
@@ -297,6 +354,11 @@ class AddedTsTests(unittest.TestCase):
         self.assertIsNone(fans.parse_added_ts({}))
         self.assertIsNone(fans.parse_added_ts({"added": "soon", "token": "::a::"}))
         self.assertIsNone(fans.parse_added_ts({"updated": "16 Sep 2026 22:52:52 GMT"}))
+        self.assertIsNone(fans.parse_added_ts({"token": "\u00b2:1:a::"}))  # isdigit() but not int()
+
+    def test_implausible_token_epoch_falls_back_to_the_dates(self):
+        self.assertEqual(fans.parse_added_ts({"token": "5:1:a::", "added": "16 Sep 2026 22:52:52 GMT"}),
+                         1789599172.0)
 
 
 class ParsePagedataTests(unittest.TestCase):
