@@ -281,8 +281,8 @@ class StdlibTLSTests(unittest.TestCase):
         self.assertIs(pool.conn_kw.get("ssl_context"), adapter._stdlib_context())
 
     def test_a_per_request_context_from_requests_does_not_win(self):
-        # requests 2.32.0-2.32.2 put their own preloaded urllib3 context into
-        # the per-request pool kwargs, which override the manager default.
+        # Per-request pool kwargs override the manager default: whatever the
+        # base adapter puts there, ours must be what the connection uses.
         import ssl
         from unittest import mock
 

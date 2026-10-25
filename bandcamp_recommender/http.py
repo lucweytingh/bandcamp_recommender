@@ -213,9 +213,10 @@ class _StdlibTLSAdapter(requests.adapters.HTTPAdapter):
     requires both, loaded with certifi's CA bundle like requests' default.
 
     The context is chosen per request in build_connection_pool_key_attributes,
-    the hook requests documents for a custom SSLContext: setting it only as a
-    pool-manager default loses to the per-request ``ssl_context`` that requests
-    2.32.0-2.32.2 inject. urllib3 mutates the context it is handed
+    the hook requests (>= 2.32.3, the declared floor) documents for a custom
+    SSLContext; per-request pool kwargs win over a pool-manager default, so
+    the context is set there, not only on the manager. urllib3 mutates the
+    context it is handed
     (verify_mode, CA locations, client cert), so one context is shared only
     by requests with the same trust settings: ``verify=True`` uses certifi,
     ``verify="<bundle>"`` (or REQUESTS_CA_BUNDLE) gets its own context

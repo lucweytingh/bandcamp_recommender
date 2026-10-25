@@ -47,9 +47,11 @@ _PLACEHOLDERS = {
 # A credit made only of these (e.g. "-", "?", "...") is a placeholder too.
 # Other symbol-only names can be real acts ("!!!" is a band).
 _PLACEHOLDER_ONLY = re.compile(r"[\s\-\u2013\u2014_.,/\\|?*~]*")
-# "V/A" inside a longer credit ("Various Artists / V/A", "V.A. / X") is read as
-# one placeholder before the split, which would otherwise make it "v" and "a".
-_VA_ABBREV = re.compile(r"(?<!\w)v\s*[/.]\s*a\b\.?", re.IGNORECASE)
+# "V/A" as its own part of a longer credit ("Various Artists / V/A", "V.A. / X")
+# is read as one placeholder before the split, which would otherwise make it
+# "v" and "a". Only a whole segment (between collaboration separators or the
+# string edges) counts: "V.A. Smith" and "Kurt V. A. Smith" are names.
+_VA_ABBREV = re.compile(r"(?:^|(?<=[&,|+×/]))\s*v\s*[/.]\s*a\.?\s*(?=$|[&,|+×/])", re.IGNORECASE)
 
 
 def _is_placeholder(credit: str) -> bool:
@@ -105,7 +107,7 @@ def _credit_tokens(artist: Optional[str]) -> Set[str]:
     if _is_placeholder(artist):
         return set()
     tokens = set()
-    credit = _PAREN_FEAT.sub(r" \1 ", _VA_ABBREV.sub("various artists", artist))
+    credit = _PAREN_FEAT.sub(r" \1 ", _VA_ABBREV.sub(" various artists ", artist))
     for part in _ARTIST_SPLIT.split(credit):
         p = part.strip().lower()
         if p and not _is_placeholder(p):

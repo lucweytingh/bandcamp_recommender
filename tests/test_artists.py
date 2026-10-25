@@ -118,3 +118,14 @@ def test_without_a_url_placeholders_stay_empty():
     assert artist_tokens("Unknown Artist") == set()
     assert artist_tokens("Various Artists", None) == set()
     assert artist_tokens("Unknown Artist", "not a url") == set()
+
+
+
+def test_va_abbreviation_only_as_a_whole_segment():
+    # Inside a name, "V.A." is part of the name, not a compilation credit.
+    assert artist_tokens("V.A. Smith") == {"v.a. smith"}
+    assert artist_tokens("Kurt V. A. Smith") == {"kurt v. a. smith"}
+    assert artist_tokens("Siu Mata & V.A. Smith") == {"siu mata", "v.a. smith"}
+    # As its own segment it is still the placeholder.
+    assert artist_tokens("V.A. / Ancient Methods") == {"ancient methods"}
+    assert artist_tokens("Ancient Methods, V/A") == {"ancient methods"}
