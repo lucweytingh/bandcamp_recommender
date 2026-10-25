@@ -123,6 +123,28 @@ in `docs/diversity-eval-results.md`. Backward-compatible: `diversify=None` (the
 default) is the unchanged similarity ranking; the `BANDCAMP_DIVERSIFY` env var
 sets a global default when the param is unset.
 
+#### Candidate-pool diversity (opt-in)
+
+A seed's supporters mostly own its artist's other releases, and on a small
+scene the top of the overlap ranking is a few artists' back catalogues, so the
+candidate pool can hold very few artists. Two options act on the ranked
+candidates before the pool is cut (also on `get_recommendations`):
+
+```python
+recs = r.get_similar_recommendations(
+    source_url="https://artist.bandcamp.com/track/seed",
+    candidate_pool_size=30,
+    exclude_seed_artist=True,   # no candidates by the seed's own artist
+    max_per_artist=2,           # each artist's 2 best-ranked releases at most
+)
+r.last_call_stats["pool"]       # {"seed_artist", "seed_artist_dropped", "artist_capped", ...}
+```
+
+Artists are compared with `artists.artist_tokens` ("A & B", "A feat. B" count
+for both A and B; "Various Artists" is never an artist). The seed's artist is
+read from the seed page, which the call has just read anyway: no extra
+request. Defaults (`False` / `None`) give the same result as before.
+
 ### A fan's own lists (wishlist + collection)
 
 ```python
@@ -216,7 +238,7 @@ never raises (missing pieces are None / empty). `item_info` reads through
 challenge). `artist` is the release's artist; `page_name` is the Bandcamp
 page it sits on (the label's, for label releases).
 
-## Network behaviour (0.7.0)
+## Network behaviour (0.8.0)
 
 - **Plain HTTP, honest User-Agent.** Every Bandcamp page and API call goes
   through `bandcamp_recommender.http` (requests, HTTP/1.1). Bandcamp's CDN
@@ -233,6 +255,14 @@ page it sits on (the label's, for label releases).
   `BANDCAMP_CACHE_PATH`, `BANDCAMP_CACHE_DISABLED=1`): supporter
   collections 7 d, item metadata (featured track, tags) 30 d, audio features
   90 d. A repeated seed costs a couple of requests.
+- **What the 0.8.0 reads cost**: `items.item_info` is one page read (two
+  for a track page on an album, unless `follow_album_description=False`),
+  shared with the recommender through the short-lived page cache.
+  `fans.fan_library` is one fan page read plus one API call per non-empty
+  visible list, never cached; when Bandcamp challenges plain HTTP the rest
+  of the call runs in ONE browser session (one page load, the API calls
+  from inside it). `exclude_seed_artist` reads the seed page from the page
+  cache.
 - **Selenium is a fallback only**: one shared driver per process
   (`bandcamp_recommender.browser`), used when plain HTTP is challenged, at
   most `BANDCAMP_SELENIUM_FALLBACK_BUDGET` (8) supporters per call. It quits
@@ -274,19 +304,51 @@ page it sits on (the label's, for label releases).
 - A `SupporterRecommender` keeps per-call state: don't share one instance
   across threads for concurrent calls.
 
+## Upgrading to 0.8.0
+
+Pin `bandcamp-recommender[bpm] @ git+https://github.com/lucweytingh/bandcamp_recommender.git@v0.8.0`.
+New: `items.item_info` / `parse_item_html` / `art_url` / `feature_tags`,
+`fans.fan_library`, `artists.artist_tokens`, the `exclude_seed_artist` /
+`max_per_artist` options, `browser.reap_orphans`. Every public 0.7.0
+signature is unchanged, and so is every default result, except these
+deliberate changes:
+
+- The fallback Chrome quits itself after `BANDCAMP_BROWSER_IDLE_S` (120) s
+  unused; it used to live until `close()` or exit. `0` restores that.
+- The library reaps Chrome by itself (first request, every driver start) and
+  only Chrome of library processes that died. `DriverManager.reap_orphans()`
+  keeps its signature but no longer kills every Chrome whose parent is init
+  (on macOS that was the user's own Chrome, launched from the Dock).
+- Chrome runs on a library-owned profile dir (`BANDCAMP_BROWSER_PROFILE_DIR`)
+  that is deleted when the driver quits, instead of a chromedriver temp
+  profile.
+- Track dicts (`bpm.extract_track_info`, `get_preview_for_item`,
+  `items.preview_from_tralbum`) carry an absolute `url` (was the
+  page-relative link) and the new keys; a missing `track_num` is None (was 0).
+- Page tags are read from the tag block and de-duplicated ignoring case
+  (identical output on every real page tested).
+- `diversify="stratified"` compares artists with `artist_tokens` (collabs
+  and case variants are one artist; compilations no longer block each other).
+- `items.normalize_item_url` also strips surrounding whitespace; every disk
+  cache key stays valid.
+
 ## Architecture
 
 The codebase is organized into modular components:
 
 - `bandcamp_recommender/features.py` - Vector similarity API (`extract_features`, `distance`, `project_mood`)
-- `bandcamp_recommender/items.py` - Cached item metadata + `normalize_item_url`, the one canonical item URL for comparisons and cache keys
+- `bandcamp_recommender/items.py` - The one item-page parse (`parse_item_html`, `item_info`), cached item metadata, and `normalize_item_url`, the one canonical item URL for comparisons and cache keys
+- `bandcamp_recommender/fans.py` - A fan's own wishlist + collection (`fan_library`), with list entry times
 - `bandcamp_recommender/artists.py` - `artist_tokens`, artist identity: collaboration credits split into their members, case folded, "Various Artists" dropped (two credits are the same artist when their tokens intersect)
 - `bandcamp_recommender/recommendations/supporter_recommender.py` - Main recommendation engine
 - `bandcamp_recommender/recommendations/mood_tags.py` - Everynoise-derived tag-mood + tag-spikiness lexicon
 - `bandcamp_recommender/recommendations/intensity.py` - Audio energy / texture feature extraction (librosa)
 - `bandcamp_recommender/recommendations/bpm.py` - BPM detection (Joe Sullivan + librosa backends) + `_load_audio_segment` shared decode
+- `bandcamp_recommender/http.py` - The paced, validated plain-HTTP client and page policy (`get_page`), request counters
+- `bandcamp_recommender/browser.py` - The one shared fallback browser (idle close, `close`, `reap_orphans`)
+- `bandcamp_recommender/chrome_procs.py` - Owned Chrome profiles and the owner-aware reaper
+- `bandcamp_recommender/cache.py` - The sqlite disk cache
 - `bandcamp_recommender/recommendations/driver_manager.py` - Selenium WebDriver management & pooling
-- `bandcamp_recommender/items.py` - The one item-page parse (`parse_item_html`, `item_info`) + cached item metadata
 - `bandcamp_recommender/recommendations/scraper.py` - Web scraping utilities (curl, BeautifulSoup)
 - `bandcamp_recommender/recommendations/api.py` - Bandcamp API interaction utilities
 - `bandcamp_recommender/recommendations/tags.py` - Tag extraction + normalization utilities
