@@ -332,6 +332,37 @@ clear_bpm_cache()
 clear_seed_bpm_cache()
 ```
 
+### 5. Item pages (`bandcamp_recommender.items`)
+
+Everything on an album / track page as a plain dict, from one parse
+(`parse_item_html(html, item_url)`, pure and never raising) or from the
+live page (`item_info(item_url)`, through `http.get_page`). `item_info`
+raises `http.FetchError` subclasses when the page can't be read.
+
+```python
+from bandcamp_recommender import items
+
+info = items.item_info("https://label.bandcamp.com/album/x")
+# item_url, item_type ("album" | "track"), item_id, title,
+# artist      the release's artist ("by ..."), also on a label's page
+# page_name   the Bandcamp page (data-band): the artist's or the label's
+# album_url   a track page's album, else None
+# tracks      [{track_id, title, artist, track_num, duration, url, files,
+#               audio_path, playable}, ...] every track, in order
+# featured_track_id, preview (featured if playable, else first playable)
+# tags        genre tags; location: the location tag ("Berlin") or None
+# description full text (a track page takes its album's: one more read,
+#             skip with follow_album_description=False)
+# art_id      -> items.art_url(art_id, size=10)  (10 = 1200 px, 2 = 700 px)
+# release_date ISO date or None
+items.feature_tags(info)  # tags + location, the tag-feature input
+```
+
+The location tag stays in the tag-feature input (`feature_tags`,
+`scraper.extract_tags`, cached item metadata) because the everynoise
+lexicon pairs it with genre tags ("detroit" + "techno" -> "detroit
+techno").
+
 ---
 
 ## Progress Callback

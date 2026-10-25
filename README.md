@@ -166,6 +166,32 @@ The full feature universe (each in a documented normalized range):
 Audio features need the `bpm` extra installed; tag features work on
 their own.
 
+### Item pages (`bandcamp_recommender.items`)
+
+One parse of an album or track page, so consumers don't scrape them:
+
+```python
+from bandcamp_recommender import http, items
+
+try:
+    info = items.item_info("https://artist.bandcamp.com/track/x")
+except http.FetchError as e:  # Challenged / RateLimited / Timeout / HTTPStatus / Unexpected
+    ...
+info["artist"], info["title"], info["release_date"]   # "by ..." artist, ISO date
+info["preview"]["audio_path"]    # what plays: featured track if playable, else first playable
+info["tracks"]                   # every track: playable, duration, url, files, ...
+info["tags"], info["location"]   # genre tags; the location tag ("Berlin") apart
+info["description"]              # a track page gets its album's (one extra read)
+items.art_url(info["art_id"], size=10)  # 10 = 1200 px, 2 = 700 px
+items.feature_tags(info)         # tags + location: the tag-feature input
+```
+
+`items.parse_item_html(html, item_url)` is the same parse without I/O; it
+never raises (missing pieces are None / empty). `item_info` reads through
+`http.get_page` (validated, cached for a few minutes, browser fallback on a
+challenge). `artist` is the release's artist; `page_name` is the Bandcamp
+page it sits on (the label's, for label releases).
+
 ## Network behaviour (0.7.0)
 
 - **Plain HTTP, honest User-Agent.** Every Bandcamp page and API call goes
@@ -209,6 +235,7 @@ The codebase is organized into modular components:
 - `bandcamp_recommender/recommendations/intensity.py` - Audio energy / texture feature extraction (librosa)
 - `bandcamp_recommender/recommendations/bpm.py` - BPM detection (Joe Sullivan + librosa backends) + `_load_audio_segment` shared decode
 - `bandcamp_recommender/recommendations/driver_manager.py` - Selenium WebDriver management & pooling
+- `bandcamp_recommender/items.py` - The one item-page parse (`parse_item_html`, `item_info`) + cached item metadata
 - `bandcamp_recommender/recommendations/scraper.py` - Web scraping utilities (curl, BeautifulSoup)
 - `bandcamp_recommender/recommendations/api.py` - Bandcamp API interaction utilities
 - `bandcamp_recommender/recommendations/tags.py` - Tag extraction + normalization utilities

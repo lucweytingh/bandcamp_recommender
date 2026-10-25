@@ -197,7 +197,7 @@ def parse_item_html(html: str, item_url: Optional[str] = None) -> Dict[str, Any]
     """Everything the library knows how to read from an album or track page,
     as a plain dict. Pure (no I/O) and total: a missing or malformed piece is
     None / empty, never an exception, so a challenge page or an error shell
-    parses to an all-empty dict.
+    parses to a dict with no page data (only what ``item_url`` implies).
 
     Keys:
         ``item_url``          ``item_url`` as given, else the page's own URL
