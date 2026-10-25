@@ -216,27 +216,22 @@ One parse of an album or track page, so consumers don't scrape them:
 from bandcamp_recommender import http, items
 
 try:
-    info = items.item_info("https://artist.bandcamp.com/track/x")
+    info = items.item_info("https://artist.bandcamp.com/album/x")
 except http.FetchError as e:  # e.g. Challenged / RateLimited / Timeout / HTTPStatus
     ...
-info["artist"], info["title"], info["release_date"]   # "by ..." artist, ISO date
-(info["preview"] or {}).get("audio_path")  # featured track if playable, else first playable; None on preorders
-info["tracks"]                   # every track: playable, duration, url, files, ...
-info["tags"], info["location"]   # genre tags; the location tag ("Berlin") apart
-info["description"]              # a track page gets its album's (one extra read)
+info["artist"], info["title"], info["tags"], info["location"]
+(info["preview"] or {}).get("audio_path")  # the track that plays; None on preorders
 items.art_url(info["art_id"], size=10) or info["og_image_url"]  # 10 = 1200 px, 2 = 700 px
-items.feature_tags(info)         # tags + location: the tag-feature input
+items.feature_tags(info)                   # tags + location: the tag-feature input
 ```
 
-A track page on an album costs two paced reads (its own + the album's, for the
-description); consumers that don't show the description should pass
-`follow_album_description=False` (one read per page).
-
-`items.parse_item_html(html, item_url)` is the same parse without I/O; it
-never raises (missing pieces are None / empty). `item_info` reads through
-`http.get_page` (validated, cached for a few minutes, browser fallback on a
-challenge). `artist` is the release's artist; `page_name` is the Bandcamp
-page it sits on (the label's, for label releases).
+The `items.parse_item_html` docstring lists every key; it is the same parse
+without I/O and never raises (missing pieces are None / empty). `item_info`
+is one page read through `http.get_page` (validated, cached for a few
+minutes, browser fallback on a challenge). A track page's own description is
+usually None, since Bandcamp describes the album:
+`follow_album_description=True` reads the album page for it (one more paced
+read).
 
 ## Network behaviour (0.8.0)
 
@@ -256,7 +251,7 @@ page it sits on (the label's, for label releases).
   collections 7 d, item metadata (featured track, tags) 30 d, audio features
   90 d. A repeated seed costs a couple of requests.
 - **What the 0.8.0 reads cost**: `items.item_info` is one page read (two
-  for a track page on an album, unless `follow_album_description=False`),
+  for a track page on an album with `follow_album_description=True`),
   shared with the recommender through the short-lived page cache.
   `fans.fan_library` is one fan page read plus one API call per non-empty
   visible list, never cached; when Bandcamp challenges plain HTTP the rest
@@ -267,20 +262,23 @@ page it sits on (the label's, for label releases).
   (`bandcamp_recommender.browser`), used when plain HTTP is challenged, at
   most `BANDCAMP_SELENIUM_FALLBACK_BUDGET` (8) supporters per call. It quits
   itself after `BANDCAMP_BROWSER_IDLE_S` (120) seconds unused (0 = never);
-  `browser.close()` / `close_if_idle()` still quit it on demand.
+  `browser.close()` / `close_if_idle()` still quit it on demand. Closing a
+  `SupporterRecommender` leaves it running for the next caller.
 - **The library cleans up after its own Chrome**: every driver runs on its
   own profile dir, named after the owning process, under
   `BANDCAMP_BROWSER_PROFILE_DIR` (default
   `~/snap/chromium/common/bandcamp_recommender/chrome-profiles` when snap
   Chromium is installed, since it can't write hidden dirs in `$HOME`, else
   `~/.cache/bandcamp_recommender/chrome-profiles`). Quitting a driver kills
-  whatever still runs on its profile and deletes it. `browser.reap_orphans()`
+  whatever still runs on its profile and deletes it. `chrome_procs.reap_orphans()`
   kills Chrome left by library processes that died and deletes their
   profiles; it never touches a live process's browser or a Chrome the
   library didn't start. It runs by itself before every driver start and on
   the first Bandcamp request of a process (a cache hit doesn't count),
   so a long-lived service should also call it once at startup: after a
-  restart it may make no request for a long time.
+  restart it may make no request for a long time. (Any call counts as the
+  first-request sweep.) Processes on different hosts or in different pid
+  namespaces must not share a profiles dir.
   `DriverManager.reap_orphans()` (the opt-in cold-start reaper) does the
   same and also kills what earlier versions leave behind: an unmarked
   chromedriver whose spawner died, or a Chrome on a chromedriver temp
@@ -309,12 +307,16 @@ page it sits on (the label's, for label releases).
 Pin `bandcamp-recommender[bpm] @ git+https://github.com/lucweytingh/bandcamp_recommender.git@v0.8.0`.
 New: `items.item_info` / `parse_item_html` / `art_url` / `feature_tags`,
 `fans.fan_library`, `artists.artist_tokens`, the `exclude_seed_artist` /
-`max_per_artist` options, `browser.reap_orphans`. Every public 0.7.0
+`max_per_artist` options, `chrome_procs.reap_orphans`. Every public 0.7.0
 signature is unchanged, and so is every default result, except these
 deliberate changes:
 
 - The fallback Chrome quits itself after `BANDCAMP_BROWSER_IDLE_S` (120) s
   unused; it used to live until `close()` or exit. `0` restores that.
+- `SupporterRecommender.close()` (and leaving its `with` block) no longer
+  quits the shared browser (0.7.0 quit it if idle; 0.5 quit the
+  recommender's own drivers): the idle timer does, so the page reads that
+  follow a call reuse it. `browser.close()` quits it now.
 - The library reaps Chrome by itself (first request, every driver start) and
   only Chrome of library processes that died. `DriverManager.reap_orphans()`
   keeps its signature but no longer kills every Chrome whose parent is init
@@ -324,7 +326,11 @@ deliberate changes:
   profile.
 - Track dicts (`bpm.extract_track_info`, `get_preview_for_item`,
   `items.preview_from_tralbum`) carry an absolute `url` (was the
-  page-relative link) and the new keys; a missing `track_num` is None (was 0).
+  page-relative link) and the new keys; a missing `track_num` is None (was
+  0) and a missing `title` is None (was `""`).
+- `http.get_page(url, fallback=False)` no longer remembers a bot challenge
+  for 60 s, so a later call with the fallback still gets the page through
+  the browser.
 - Page tags are read from the tag block and de-duplicated ignoring case
   (identical output on every real page tested).
 - `diversify="stratified"` compares artists with `artist_tokens` (collabs
@@ -345,8 +351,8 @@ The codebase is organized into modular components:
 - `bandcamp_recommender/recommendations/intensity.py` - Audio energy / texture feature extraction (librosa)
 - `bandcamp_recommender/recommendations/bpm.py` - BPM detection (Joe Sullivan + librosa backends) + `_load_audio_segment` shared decode
 - `bandcamp_recommender/http.py` - The paced, validated plain-HTTP client and page policy (`get_page`), request counters
-- `bandcamp_recommender/browser.py` - The one shared fallback browser (idle close, `close`, `reap_orphans`)
-- `bandcamp_recommender/chrome_procs.py` - Owned Chrome profiles and the owner-aware reaper
+- `bandcamp_recommender/browser.py` - The one shared fallback browser (idle close, `close`)
+- `bandcamp_recommender/chrome_procs.py` - Owned Chrome profiles and the owner-aware reaper (`reap_orphans`)
 - `bandcamp_recommender/cache.py` - The sqlite disk cache
 - `bandcamp_recommender/recommendations/driver_manager.py` - Selenium WebDriver management & pooling
 - `bandcamp_recommender/recommendations/scraper.py` - Web scraping utilities (curl, BeautifulSoup)

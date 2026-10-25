@@ -340,28 +340,23 @@ clear_seed_bpm_cache()
 
 Everything on an album / track page as a plain dict, from one parse
 (`parse_item_html(html, item_url)`, pure and never raising) or from the
-live page (`item_info(item_url)`, through `http.get_page`). `item_info`
-raises `http.FetchError` subclasses when the page can't be read.
+live page (`item_info(item_url)`, one read through `http.get_page`).
+`item_info` raises `http.FetchError` subclasses when the page can't be read.
+The `parse_item_html` docstring lists every key.
 
 ```python
 from bandcamp_recommender import items
 
 info = items.item_info("https://label.bandcamp.com/album/x")
-# item_url, item_type ("album" | "track"), item_id, title,
-# artist      the release's artist ("by ..."), also on a label's page
-# page_name   the Bandcamp page (data-band): the artist's or the label's
-# album_url   a track page's album, else None
-# tracks      [{track_id, title, artist, track_num, duration, url, files,
-#               audio_path, playable}, ...] every track, in order
-# featured_track_id, preview (featured if playable, else first playable;
-#             None when nothing streams, e.g. a preorder)
-# tags        genre tags; location: the location tag ("Berlin") or None
-# description full text (a track page takes its album's: one more read,
-#             skip with follow_album_description=False)
-# art_id      -> items.art_url(art_id, size=10)  (10 = 1200 px, 2 = 700 px)
-# og_image_url the page's og:image as given (a last-resort picture)
-# release_date ISO date or None
+info["artist"]            # the release's artist ("by ..."), also on a label's page
+info["preview"]           # the track that plays (featured if playable), or None
+info["tags"], info["location"]  # genre tags; the location tag ("Berlin") apart
+items.art_url(info["art_id"], size=10)  # 10 = 1200 px, 2 = 700 px
 items.feature_tags(info)  # tags + location, the tag-feature input
+
+# A track page's own description is usually None; this reads its album's
+# (one more paced read):
+items.item_info("https://artist.bandcamp.com/track/y", follow_album_description=True)
 ```
 
 The location tag stays in the tag-feature input (`feature_tags`,
@@ -514,7 +509,8 @@ detectors, so enabling both costs roughly the same as enabling either.
 
 **Current version: `0.8.0`** (was `0.7.0`). Public signatures are unchanged.
 The new APIs and the few deliberate default changes (fallback Chrome idle
-close, owner-aware Chrome reaping, track dict `url`s) are listed under
+close, which `SupporterRecommender.close()` leaves to the timer now,
+owner-aware Chrome reaping, track dict `url`s) are listed under
 "Upgrading to 0.8.0" in `README.md`.
 
 ### Pick the right command based on how the package was installed
