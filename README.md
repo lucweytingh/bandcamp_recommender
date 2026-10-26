@@ -211,6 +211,22 @@ The full feature universe (each in a documented normalized range):
 Audio features need the `bpm` extra installed; tag features work on
 their own.
 
+For a Bandcamp item, `features_for_item` gives the vector of its featured
+track, cached on disk per (item, track) for 90 days (the stream URL is not
+part of the key, so the cache outlives Bandcamp's daily re-signing):
+
+```python
+from bandcamp_recommender import features, items
+
+vec, preview = features.features_for_item(item_url)   # reads the page if needed
+
+# Already read the page yourself? Hand over its preview: no page read here.
+info = items.parse_item_html(html, item_url)
+vec, preview = features.features_for_item(
+    item_url, items.feature_tags(info), preview=info["preview"],
+)
+```
+
 ### Item pages (`bandcamp_recommender.items`)
 
 One parse of an album or track page, so consumers don't scrape them:
@@ -307,6 +323,9 @@ read).
   across threads for concurrent calls.
 
 ## Upgrading to 0.8.0
+
+0.8.1 adds `features_for_item(..., preview=...)` (see Feature vectors);
+nothing else changes.
 
 Pin `bandcamp-recommender[bpm] @ git+https://github.com/lucweytingh/bandcamp_recommender.git@v0.8.0`.
 New: `items.item_info` / `parse_item_html` / `art_url` / `feature_tags`,

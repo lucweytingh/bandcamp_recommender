@@ -103,6 +103,45 @@ class FeatureCacheTests(unittest.TestCase):
         self.assertIsNone(preview)
         self.assertIsNone(vec["rms_mean"])
 
+    def test_caller_preview_reads_no_page_and_shares_the_cache_key(self):
+        preview = {"track_id": 2, "title": "The Single",
+                   "audio_path": "https://t4.bcbits.com/stream/2"}
+        with patch.object(scraper, "fetch_page_html") as page, \
+             patch.object(bpm, "fetch_page_html") as page2, \
+             patch.object(features, "extract_audio_features", return_value=dict(AUDIO)) as dec:
+            vec, got = features.features_for_item(URL, ["dub"], preview=preview)
+        page.assert_not_called()
+        page2.assert_not_called()
+        self.assertEqual(dec.call_args[0][0], "https://t4.bcbits.com/stream/2")
+        self.assertEqual(vec["bpm"], 120.0)
+        self.assertIsNotNone(vec["tag_mood"])
+        self.assertEqual(got["track_id"], 2)
+        # Same (item, track) entry the metadata path uses: a later call
+        # without a preview finds the audio features warm.
+        with patch.object(scraper, "fetch_page_html", return_value=_page()), \
+             patch.object(features, "extract_audio_features") as dec2:
+            vec2, _ = features.features_for_item(URL)
+        dec2.assert_not_called()
+        self.assertEqual(vec2["rms_mean"], 0.4)
+
+    def test_caller_preview_without_stream_url_reads_the_page_on_a_miss(self):
+        with patch.object(bpm, "fetch_page_html", return_value=_page(featured=1)) as page, \
+             patch.object(features, "extract_audio_features", return_value=dict(AUDIO)) as dec:
+            _, got = features.features_for_item(
+                URL, ["dub"], preview={"track_id": 2, "audio_path": None})
+        page.assert_called_once()
+        self.assertEqual(got["track_id"], 1)  # the page's current featured track
+        self.assertEqual(dec.call_args[0][0], "https://t4.bcbits.com/stream/1")
+        # A caller's preview never rewrites the cached item metadata.
+        self.assertIsNone(cache.get_item_meta("https://a.bandcamp.com/album/x"))
+
+    def test_caller_preview_without_track_id_is_tag_only(self):
+        with patch.object(features, "extract_audio_features") as dec:
+            vec, got = features.features_for_item(URL, ["dub"], preview={"audio_path": "x"})
+        dec.assert_not_called()
+        self.assertIsNone(got)
+        self.assertIsNone(vec["rms_mean"])
+
 
 if __name__ == "__main__":
     unittest.main()
