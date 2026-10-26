@@ -233,6 +233,51 @@ class PacerTests(unittest.TestCase):
             gate.on_success()
         self.assertAlmostEqual(gate.interval, 0.4)
 
+    def _starts(self, gate, n):
+        t0 = time.monotonic()
+        out = []
+        for _ in range(n):
+            gate.acquire()
+            out.append(time.monotonic() - t0)
+            gate.release()
+        return out
+
+    def test_burst_from_idle_then_steady_rate(self):
+        gate = bchttp.Pacer(min_interval=0.1, max_concurrency=10, burst=4)
+        starts = self._starts(gate, 7)
+        self.assertTrue(all(s < 0.05 for s in starts[:4]), starts)
+        gaps = [b - a for a, b in zip(starts[3:], starts[4:])]
+        self.assertTrue(all(g >= 0.09 for g in gaps), starts)
+
+    def test_bucket_refills_while_idle(self):
+        gate = bchttp.Pacer(min_interval=0.05, max_concurrency=10, burst=3)
+        self._starts(gate, 3)
+        time.sleep(0.2)  # > 3 intervals: a full burst again
+        starts = self._starts(gate, 3)
+        self.assertTrue(all(s < 0.04 for s in starts), starts)
+
+    def test_recovery_after_429_is_not_slowed_by_the_burst(self):
+        gate = bchttp.Pacer(min_interval=0.05, max_concurrency=10, burst=20)
+        gate.on_rate_limited(0.0)
+        t0 = time.monotonic()
+        starts = []
+        for _ in range(4):
+            gate.acquire()
+            starts.append(time.monotonic() - t0)
+            gate.release()
+            gate.on_success()
+        gaps = [b - a for a, b in zip(starts, starts[1:])]
+        # interval 0.1 after the 429, easing back to the 0.05 floor
+        self.assertTrue(all(g < 0.12 for g in gaps), starts)
+
+    def test_rate_limit_drains_the_burst(self):
+        gate = bchttp.Pacer(min_interval=0.1, max_concurrency=10, burst=5)
+        gate.on_rate_limited(0.2)
+        starts = self._starts(gate, 3)
+        self.assertGreaterEqual(starts[0], 0.18)
+        gaps = [b - a for a, b in zip(starts, starts[1:])]
+        self.assertTrue(all(g >= 0.13 for g in gaps), starts)  # widened x1.5
+
     def test_retry_after_delays_every_thread(self):
         gate = bchttp.Pacer(min_interval=0.0, max_concurrency=4)
         gate.on_rate_limited(0.5)

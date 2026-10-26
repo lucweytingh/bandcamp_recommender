@@ -176,6 +176,7 @@ def features_for_item(
     item_url: str,
     tags: Optional[list] = None,
     *,
+    preview: Optional[Dict[str, Any]] = None,
     intensity_duration: float = 60.0,
     bpm_duration: float = 60.0,
 ) -> Tuple[Dict[str, Optional[float]], Optional[Dict[str, Any]]]:
@@ -191,7 +192,16 @@ def features_for_item(
     process-wide). So a warm item costs no request at all, and then
     ``audio_path`` is None (stream URLs are signed and expire; read the page
     when you need to play it). ``tags`` overrides the cached tags. Decode
-    failures are not cached (a CDN hiccup must not stick)."""
+    failures are not cached (a CDN hiccup must not stick).
+
+    ``preview`` is the item's preview track as the caller has just read it
+    (``items.parse_item_html(html, item_url)["preview"]``, or any dict with
+    ``track_id`` and ``audio_path``). It replaces the metadata lookup, so a
+    caller that fetched the page itself reads no page here: one cache lookup,
+    plus one download + decode on a miss, cached under the same (item, track)
+    key as without it. Pass the page's ``tags`` with it (without them the tag
+    features are None). Without an ``audio_path``, a miss reads the page for
+    the stream URL as usual."""
     from bandcamp_recommender import cache
     from bandcamp_recommender.items import item_meta, normalize_item_url
     from bandcamp_recommender.recommendations.bpm import get_preview_for_item
@@ -199,7 +209,12 @@ def features_for_item(
         extract_features as extract_tag_features,
     )
 
-    meta = item_meta(item_url) or {}
+    from_caller = preview is not None
+    if from_caller:
+        meta = {"track_id": preview.get("track_id"), "title": preview.get("title"),
+                "audio_path": preview.get("audio_path"), "tags": []}
+    else:
+        meta = item_meta(item_url) or {}
     vector: Dict[str, Optional[float]] = _empty_vector()
     vector["bpm"] = None
     vector.update(extract_tag_features(tags if tags else (meta.get("tags") or [])))
@@ -221,10 +236,13 @@ def features_for_item(
         preview = {"track_id": fresh.get("track_id"), "title": fresh.get("title"),
                    "audio_path": fresh.get("audio_path")}
         if str(preview["track_id"]) != str(track_id):
-            cache.put_item_meta(normalize_item_url(item_url), {
-                "track_id": preview["track_id"], "title": preview["title"],
-                "tags": meta.get("tags") or [],
-            })
+            if not from_caller:
+                # A caller's preview carries no page tags: only metadata read
+                # from the cache is ours to correct.
+                cache.put_item_meta(normalize_item_url(item_url), {
+                    "track_id": preview["track_id"], "title": preview["title"],
+                    "tags": meta.get("tags") or [],
+                })
             key = f"{normalize_item_url(item_url)}#{preview['track_id']}"
             audio = cache.get_audio_features(key)
     if audio is None:
