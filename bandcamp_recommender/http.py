@@ -173,7 +173,9 @@ class Pacer:
         self._paused_until = 0.0
 
     def _burst_window(self) -> float:
-        return (self.burst - 1) * self.interval
+        # On the floor interval: scaled by the AIMD interval, every success
+        # after a 429 would shrink the window and push the next start back.
+        return (self.burst - 1) * self.min_interval
 
     def acquire(self) -> None:
         while True:

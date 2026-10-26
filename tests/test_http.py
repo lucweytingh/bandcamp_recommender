@@ -256,6 +256,20 @@ class PacerTests(unittest.TestCase):
         starts = self._starts(gate, 3)
         self.assertTrue(all(s < 0.04 for s in starts), starts)
 
+    def test_recovery_after_429_is_not_slowed_by_the_burst(self):
+        gate = bchttp.Pacer(min_interval=0.05, max_concurrency=10, burst=20)
+        gate.on_rate_limited(0.0)
+        t0 = time.monotonic()
+        starts = []
+        for _ in range(4):
+            gate.acquire()
+            starts.append(time.monotonic() - t0)
+            gate.release()
+            gate.on_success()
+        gaps = [b - a for a, b in zip(starts, starts[1:])]
+        # interval 0.1 after the 429, easing back to the 0.05 floor
+        self.assertTrue(all(g < 0.12 for g in gaps), starts)
+
     def test_rate_limit_drains_the_burst(self):
         gate = bchttp.Pacer(min_interval=0.1, max_concurrency=10, burst=5)
         gate.on_rate_limited(0.2)
