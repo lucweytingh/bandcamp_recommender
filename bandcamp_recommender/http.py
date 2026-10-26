@@ -57,6 +57,10 @@ _DEFAULT_USER_AGENT = "bandcamp-recommender (+https://github.com/lucweytingh/ban
 _DEFAULT_MIN_INTERVAL_S = 1.0
 _MAX_INTERVAL_S = 3.0
 _DEFAULT_MAX_CONCURRENCY = 3
+# Bandcamp's limiter tolerates bursts: from idle, 60 item pages at ~10/s
+# passed and ~100 within a minute did before `429 Retry-After: 3`
+# (measured 2026-10-26). Sustained, ~1/s holds. 20 keeps a wide margin.
+_DEFAULT_BURST = 20
 _MAX_RETRY_AFTER_S = 10.0
 _MAX_429_ATTEMPTS = 3
 _TRANSPORT_BACKOFF_S = (0.4, 1.2)
@@ -143,12 +147,15 @@ def diff(before: Dict[str, int], after: Optional[Dict[str, int]] = None) -> Dict
 class Pacer:
     """Process-wide politeness gate for Bandcamp.
 
-    * request *starts* spaced at least ``interval`` apart: a reservation on
-      ``next_allowed`` is taken under the lock and slept outside it, BEFORE
+    * request *starts* average at most one per ``interval``, with up to
+      ``burst`` back to back after idle time (a token bucket, kept as GCRA's
+      theoretical arrival time ``tat``; ``burst=1`` spaces every start). The
+      reservation is taken under the lock and slept outside it, BEFORE
       taking a concurrency slot, so a long backoff never idles a slot;
     * at most ``max_concurrency`` requests in flight;
     * AIMD: a 429 widens the interval x1.5 (capped) and pauses every thread
-      until its Retry-After; each success shrinks it additively back toward
+      until its Retry-After, with the burst used up, so traffic resumes at
+      the steady rate; each success shrinks it additively back toward
       the floor (multiplicative easing saw-tooths straight back into the
       limiter; a tiny step strands the pacer at the cap for minutes).
     """
@@ -156,20 +163,25 @@ class Pacer:
     ADDITIVE_DECREASE_S = 0.1
     BACKOFF_FACTOR = 1.5
 
-    def __init__(self, min_interval: float, max_concurrency: int):
+    def __init__(self, min_interval: float, max_concurrency: int, burst: int = 1):
         self.min_interval = max(0.0, min_interval)
         self.interval = self.min_interval
+        self.burst = max(1, int(burst))
         self._slots = threading.BoundedSemaphore(max(1, max_concurrency))
         self._lock = threading.Lock()
-        self._next_allowed = 0.0
+        self._tat = 0.0
         self._paused_until = 0.0
+
+    def _burst_window(self) -> float:
+        return (self.burst - 1) * self.interval
 
     def acquire(self) -> None:
         while True:
             with self._lock:
                 now = time.monotonic()
-                start = max(now, self._next_allowed, self._paused_until)
-                self._next_allowed = start + self.interval
+                tat = max(self._tat, now)
+                start = max(now, tat - self._burst_window(), self._paused_until)
+                self._tat = max(tat, start) + self.interval
             if start > now:
                 time.sleep(start - now)
             self._slots.acquire()
@@ -194,6 +206,7 @@ class Pacer:
                 max(self.interval * self.BACKOFF_FACTOR, self.min_interval, 0.1),
             )
             self._paused_until = max(self._paused_until, time.monotonic() + retry_after)
+            self._tat = max(self._tat, self._paused_until + self._burst_window())
 
 
 _session: Optional[requests.Session] = None
@@ -284,6 +297,7 @@ def _state():
             _pacer = Pacer(
                 _env_float("BANDCAMP_MIN_REQUEST_INTERVAL", _DEFAULT_MIN_INTERVAL_S),
                 concurrency,
+                burst=int(_env_float("BANDCAMP_BURST", _DEFAULT_BURST)),
             )
             _session = session
         state = _session, _pacer

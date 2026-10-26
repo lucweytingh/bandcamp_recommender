@@ -261,10 +261,15 @@ read).
   Chrome UA and was challenged from datacenter IPs. Payloads are validated
   (`get_page(url, expect=...)`), and failures are typed (`Challenged`,
   `RateLimited`, `Timeout`, `HTTPStatus`, `Unexpected`).
-- **Paced to ~1 request/second** (measured limit; `429 Retry-After: 3`
-  beyond it), at most 3 in flight, AIMD backoff on 429. Interactive callers
-  will feel this on cold calls: an 80-supporter seed costs ~80-110 requests.
-  Tune with `BANDCAMP_MIN_REQUEST_INTERVAL` / `BANDCAMP_MAX_CONCURRENCY`.
+- **Paced to ~1 request/second sustained** (measured limit; `429
+  Retry-After: 3` beyond it), with bursts of up to 20 back to back after
+  idle time (Bandcamp's limiter let ~100 page reads through within a
+  minute from idle), at most 3 in flight, AIMD backoff on 429 (which also
+  uses up the burst). Interactive callers will feel this on cold calls: an
+  80-supporter seed costs ~80-110 requests. Tune with
+  `BANDCAMP_MIN_REQUEST_INTERVAL` / `BANDCAMP_BURST` (1 = evenly spaced) /
+  `BANDCAMP_MAX_CONCURRENCY`. Read other Bandcamp pages through
+  `http.get_page` too, so all of a process's traffic shares one budget.
 - **Disk cache** (`~/.cache/bandcamp_recommender/cache.sqlite`,
   `BANDCAMP_CACHE_PATH`, `BANDCAMP_CACHE_DISABLED=1`): supporter
   collections 7 d, item metadata (featured track, tags) 30 d, audio features
@@ -324,8 +329,9 @@ read).
 
 ## Upgrading to 0.8.0
 
-0.8.1 adds `features_for_item(..., preview=...)` (see Feature vectors);
-nothing else changes.
+0.8.1 adds `features_for_item(..., preview=...)` (see Feature vectors) and
+lets the pacer burst (`BANDCAMP_BURST`, default 20; see Network behaviour).
+Nothing else changes.
 
 Pin `bandcamp-recommender[bpm] @ git+https://github.com/lucweytingh/bandcamp_recommender.git@v0.8.0`.
 New: `items.item_info` / `parse_item_html` / `art_url` / `feature_tags`,
