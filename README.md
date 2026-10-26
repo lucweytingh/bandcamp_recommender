@@ -329,6 +329,10 @@ read).
 
 ## Upgrading to 0.8.0
 
+0.8.2 stops mining Bandcamp's own links as supporters: an item page whose
+supporter data is empty has no supporters (the text fallbacks used to pick
+up tag links under `/discover` and the artist's `/yum`).
+
 0.8.1 adds `features_for_item(..., preview=...)` (see Feature vectors) and
 lets the pacer burst (`BANDCAMP_BURST`, default 20; see Network behaviour).
 Nothing else changes.
