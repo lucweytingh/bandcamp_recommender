@@ -47,6 +47,11 @@ def fetch_page_html(url: str, timeout: int = _DEFAULT_CURL_TIMEOUT,
         return None
 
 
+# A fan's page lives on bandcamp.com itself (https://bandcamp.com/<username>);
+# artist subdomains (x.bandcamp.com/yum) and site paths are never fans.
+_FAN_URL_RE = re.compile(r"^https?://bandcamp\.com/([^/?#]+)")
+
+
 def extract_supporters(item_url: str) -> List[str]:
     """Extract supporter usernames from an item page.
     
@@ -64,7 +69,8 @@ def extract_supporters(item_url: str) -> List[str]:
 
     soup = BeautifulSoup(html, features="html.parser")
     supporters = []
-    
+    blob_read = False
+
     # Extract from collectors-data JSON blob (most reliable)
     collectors_data = soup.find("div", id="collectors-data")
     if collectors_data:
@@ -72,6 +78,7 @@ def extract_supporters(item_url: str) -> List[str]:
         if data_blob:
             try:
                 collectors_json = json.loads(data_blob)
+                blob_read = True
                 # Extract usernames from thumbs array
                 thumbs = collectors_json.get("thumbs", [])
                 _remember_fan_ids(item_url, thumbs)
@@ -82,6 +89,12 @@ def extract_supporters(item_url: str) -> List[str]:
             except (json.JSONDecodeError, KeyError) as e:
                 logger.warning("error parsing collectors-data: %s", e)
     
+    # The blob is authoritative: an empty one means nobody supports the item.
+    # The heuristics below are for page shapes without it; on a page with it
+    # they mistake site links (tags under /discover, /yum) for fans.
+    if blob_read:
+        return supporters
+
     # Fallback - look for links with class "fan pic" or near supporter thumbnails
     if not supporters:
         # Try fan pic links first
@@ -89,7 +102,7 @@ def extract_supporters(item_url: str) -> List[str]:
         for link in fan_links:
             href = link.get("href", "")
             # Extract username from href like https://bandcamp.com/username?from=...
-            match = re.search(r"bandcamp\.com/([^/?]+)", href)
+            match = _FAN_URL_RE.match(href)
             if match:
                 username = match.group(1)
                 if username and username != "compliments":  # Exclude special accounts
@@ -105,13 +118,13 @@ def extract_supporters(item_url: str) -> List[str]:
                     links = elem.find_all("a", href=re.compile(r"bandcamp\.com/[^/?]+"))
                     for link in links:
                         href = link.get("href", "")
-                        match = re.search(r"bandcamp\.com/([^/?]+)", href)
+                        match = _FAN_URL_RE.match(href)
                         if match:
                             username = match.group(1)
                             # Exclude common non-supporter links
                             excluded = ["artists", "music", "merch", "community", "partner", 
                                        "sign", "log", "help", "settings", "compliments", 
-                                       "album", "track", "EmbeddedPlayer"]
+                                       "album", "track", "EmbeddedPlayer", "discover"]
                             if username and username not in excluded:
                                 supporters.append(username)
                     break  # Found the section, no need to continue
@@ -125,7 +138,7 @@ def extract_supporters(item_url: str) -> List[str]:
                 parent = thumb.parent
                 if parent and parent.name == "a":
                     href = parent.get("href", "")
-                    match = re.search(r"bandcamp\.com/([^/?]+)", href)
+                    match = _FAN_URL_RE.match(href)
                     if match:
                         username = match.group(1)
                         # Exclude common non-supporter links

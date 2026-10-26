@@ -185,6 +185,36 @@ class ExtractSupportersFanIdTests(unittest.TestCase):
         self.assertEqual(scraper.supporter_fan_ids("https://x/album/s"), {"a": 1, "b": 2})
 
 
+    def test_empty_blob_means_no_supporters(self):
+        from bandcamp_recommender.recommendations import scraper
+
+        # A track nobody bought yet: the blob is there with no thumbs. The
+        # page around it links tags (bandcamp.com/discover/...) and the
+        # artist's /yum page under a "supported by"-free wrapper; none of
+        # them is a fan (2026-10-26: "discover" and "yum" were mined as
+        # supporters, and the discover fetch started the fallback browser).
+        blob = {"thumbs": []}
+        page = (
+            '<div class="centerWrapper">supported by nobody yet'
+            f'<div id="collectors-data" data-blob="{htmllib.escape(json.dumps(blob))}"></div>'
+            '<a href="https://bandcamp.com/discover/electronic?from=tralbum">electronic</a>'
+            '<a href="https://artist.bandcamp.com/yum">redeem</a></div>'
+        )
+        with patch.object(scraper, "fetch_page_html", return_value=page):
+            self.assertEqual(scraper.extract_supporters("https://x/track/s"), [])
+
+    def test_fallback_takes_only_fan_pages(self):
+        from bandcamp_recommender.recommendations import scraper
+
+        page = (
+            '<div>supported by'
+            '<a href="https://bandcamp.com/realfan?from=tralbum">f</a>'
+            '<a href="https://bandcamp.com/discover/rave">rave</a>'
+            '<a href="https://artist.bandcamp.com/yum">redeem</a></div>'
+        )
+        with patch.object(scraper, "fetch_page_html", return_value=page):
+            self.assertEqual(scraper.extract_supporters("https://x/track/s"), ["realfan"])
+
 class CandidateFilterTests(unittest.TestCase):
     def test_filter_applies_before_the_pool_is_cut(self):
         from bandcamp_recommender.recommendations import supporter_recommender as sr
